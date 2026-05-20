@@ -26,7 +26,7 @@ export default function Sidebar({ role, open, onClose }) {
       />
 
       <aside
-        className={'fixed inset-y-0 left-0 z-50 flex h-screen w-60 flex-col bg-[#0a1731] text-slate-300 transition-transform md:static md:translate-x-0 ' + (open ? 'translate-x-0' : '-translate-x-full md:translate-x-0')}
+        className={'fixed inset-y-0 left-0 z-50 flex h-screen w-60 flex-col bg-[#0a1731] text-slate-300 transition-transform md:sticky md:top-0 md:self-start md:shrink-0 md:translate-x-0 ' + (open ? 'translate-x-0' : '-translate-x-full md:translate-x-0')}
       >
         {/* Brand */}
         <div className="flex items-center gap-2.5 px-5 py-5">

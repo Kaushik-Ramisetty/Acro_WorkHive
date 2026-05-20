@@ -493,9 +493,10 @@ export default function BenchResourceManagementPage() {
   }
 
   return (
-    <div className="space-y-5 p-6">
+    <div className="-ml-2 -mr-2 -mt-6 flex h-[calc(100vh-5rem)] flex-col gap-3 overflow-hidden pb-1 pt-4 md:-ml-4 md:-mr-4 md:-mt-8 md:h-[calc(100vh-6.25rem)] md:pb-1 md:pt-5">
       {toasts.node}
 
+      <div className="-mx-1 shrink-0 space-y-4 bg-slate-50 px-1 pb-3">
       {/* Header */}
       <div>
         <h1 className="text-xl font-bold text-slate-800">Bench &amp; Resource Management</h1>
@@ -540,14 +541,24 @@ export default function BenchResourceManagementPage() {
         />
       </div>
 
+      </div>
+
       {/* Table */}
-      <div className="bg-white rounded-xl border border-slate-100 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
+      <div className="flex-1 min-h-0 overflow-hidden rounded-xl border border-slate-100 bg-white shadow-sm">
+        <div className="h-full overflow-auto">
           <table className="w-full text-sm">
             <thead className="bg-slate-50">
               <tr>
                 {["Employee", "Designation", "Experience", "Department", "Skills", "Project", "Manager", "On Bench", "Actions"].map((h) => (
-                  <th key={h} className="px-4 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-slate-500">{h}</th>
+                  <th
+                    key={h}
+                    className={
+                      "px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-slate-500 " +
+                      (h === "Actions" ? "text-left" : "text-left")
+                    }
+                  >
+                    {h}
+                  </th>
                 ))}
               </tr>
             </thead>
@@ -579,7 +590,12 @@ export default function BenchResourceManagementPage() {
                     <td className="px-4 py-3 max-w-[200px]">
                       <div className="flex flex-wrap gap-1">
                         {(e.skills || []).slice(0, 4).map((s) => (
-                          <span key={s} className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{s}</span>
+                          <span
+                            key={s}
+                            className="inline-flex items-center px-1 py-px text-[9px] font-semibold leading-4 text-slate-600"
+                          >
+                            {s}
+                          </span>
                         ))}
                         {(e.skills || []).length > 4 && (
                           <span className="text-[10px] text-slate-400">+{e.skills.length - 4}</span>
@@ -592,7 +608,7 @@ export default function BenchResourceManagementPage() {
                       {e.has_active_allocation ? "—" : (typeof benchDays === "number" ? `${benchDays} day(s)` : "—")}
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex gap-1.5">
+                      <div className="flex flex-col items-start gap-1.5">
                         <button onClick={() => setEditTarget(e)}
                                 className="rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
                           Edit

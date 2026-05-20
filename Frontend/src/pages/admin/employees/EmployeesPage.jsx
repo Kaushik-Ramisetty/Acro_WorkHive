@@ -63,7 +63,8 @@ export default function EmployeesPage() {
   }, {});
 
   return (
-    <div className="space-y-6">
+    <div className="-mb-4 flex h-[calc(100vh-8rem)] flex-col gap-4 overflow-hidden md:-mb-6 md:h-[calc(100vh-7rem)]">
+      <div className="shrink-0 space-y-4">
       <PageHeader
         title="Employees"
         subtitle="Manage everyone in the workspace — edit and deactivate accounts."
@@ -125,13 +126,16 @@ export default function EmployeesPage() {
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
       )}
+      </div>
 
-      <EmployeeTable
-        employees={employees}
-        loading={loading}
-        onEdit={openEdit}
-        onDelete={askDelete}
-      />
+      <div className="min-h-0 flex-1">
+        <EmployeeTable
+          employees={employees}
+          loading={loading}
+          onEdit={openEdit}
+          onDelete={askDelete}
+        />
+      </div>
 
       <EmployeeForm
         open={formOpen}

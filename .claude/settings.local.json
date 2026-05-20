@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\KaushikRamisetty\\\\OneDrive - Acronotics Inc\\\\Desktop\\\\hrms_integrated\\\\hrms_integrated\" -Directory)",
+      "Bash(Select-Object Name)",
+      "PowerShell(Head -30)"
+    ]
+  }
+}

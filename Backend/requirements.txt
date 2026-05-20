@@ -1,0 +1,50 @@
+# Merged dependency tree for the unified HRMS project.
+# Versions follow the more recent pin where the two projects disagreed,
+# unless the older pin is required by a transitive (none was here).
+
+# ── Web framework ───────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.0
+
+# ── ORM ─────────────────────────────────────────────────────────
+sqlalchemy==2.0.43
+alembic==1.13.3
+# Malware scanning for leave-document uploads (Phase 4)
+clamd==1.0.2
+
+# ── Pydantic / settings ────────────────────────────────────────
+pydantic==2.10.6
+pydantic-settings==2.7.1
+email-validator==2.2.0
+
+# ── Auth (bcrypt + JWT) ────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.20
+
+# ── DB drivers ─────────────────────────────────────────────────
+# Production target: SQL Server. pyodbc is skipped on Linux because pip
+# can't build it without unixODBC headers; on Linux, build pymssql instead.
+pyodbc==5.2.0 ; sys_platform != "linux"
+# pymssql==2.3.2
+
+# ── Background workers (Core's OTP delivery + audit jobs) ──────
+celery==5.4.0
+redis==5.0.8
+
+# ── PDF generation (Onboarding offer letters) ──────────────────
+reportlab==4.1.0
+
+# ── Utilities ──────────────────────────────────────────────────
+python-dotenv==1.0.1
+openpyxl==3.1.5
+
+# ── Cryptography (Fernet PII encryption — Onboarding) ──────────
+# Already pulled by python-jose[cryptography], pinned here for clarity.
+cryptography>=41.0.0
+
+# ── Testing (dev/CI only) ─────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.27.2

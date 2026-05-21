@@ -60,6 +60,10 @@ def _user_payload(db: Session, user: Employee) -> UserOut:
         nationality=user.nationality,
         marital_status=user.marital_status,
         time_zone=user.time_zone,
+        # Employment type + client billing fields
+        employee_type=user.employee_type,
+        client_manager_name=user.client_manager_name,
+        client_manager_email=user.client_manager_email,
     )
 
 

@@ -124,6 +124,8 @@ export function AuthProvider({ children }) {
       user,
       isAuthenticated: !!user,
       role: user?.role || null,
+      // Expose employee_type so pages can gate UI without reading user directly
+      employee_type: user?.employee_type || null,
       loading,
       login,
       verifyOtp,
@@ -151,6 +153,7 @@ export function dashboardPathForRole(role) {
     case 'employee':  return '/employee-dashboard';
     // Candidate portal route was added during the Onboarding-module merge.
     case 'candidate': return '/candidate-dashboard';
+    case 'finance':   return '/finance-dashboard';
     // Fallback: a user with no role (e.g. an older converted employee whose
     // role_id was never set) should still land on the employee dashboard
     // rather than bouncing back to /login. The backend now self-heals this

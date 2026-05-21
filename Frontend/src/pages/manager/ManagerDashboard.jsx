@@ -14,7 +14,9 @@ import ManagerApprovalsPage from './approvals/ManagerApprovalsPage';
 import ManagerTimesheetReviewPage from './timesheets/ManagerTimesheetReviewPage';
 import { holidays as holidaysApi } from '../../services/holidays';
 import UnderConstruction from '../../components/UnderConstruction';
-import { attendance as attendanceApi } from '../../services/attendance';
+import { attendance as attendanceApi, managerApi, triggerCsvDownload } from '../../services/attendance';
+import { utilizationApi } from '../../services/utilization';
+import AttendanceGrid, { cycleNextStatus, startOfWeek, fmtIso } from '../../components/attendance/AttendanceGrid';
 import { employeesApi } from '../../services/employees';
 import ManagerCompOffPage from './compoff/ManagerCompOffPage';
 import PoliciesPage from '../admin/policies/PoliciesPage';
@@ -1130,50 +1132,328 @@ function MyTeam({ onNav }) {
   );
 }
 
+// ── Export Attendance Modal ────────────────────────────────────────
+function managerWeekRangeFromLog(weekLog) {
+  const firstWeek = Array.isArray(weekLog) && weekLog.length > 0 ? weekLog[0]?.days || [] : [];
+  if (firstWeek.length >= 7) {
+    return { startDate: firstWeek[0].date, endDate: firstWeek[firstWeek.length - 1].date };
+  }
+  const today = new Date();
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - ((today.getDay() + 6) % 7));
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  const toIso = (value) => value.toISOString().slice(0, 10);
+  return { startDate: toIso(monday), endDate: toIso(sunday) };
+}
+
+function ExportAttendanceModal({ onClose, defaultWeekRange }) {
+  const today = new Date();
+  const [mode, setMode] = useState('weekly');
+  const [startDate, setStartDate]   = useState(defaultWeekRange?.startDate || today.toISOString().slice(0, 10));
+  const [endDate, setEndDate]       = useState(defaultWeekRange?.endDate   || today.toISOString().slice(0, 10));
+  const [monthVal, setMonthVal]     = useState(`${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState(null);
+
+  const handleDownload = async () => {
+    setBusy(true); setErr(null);
+    try {
+      let csvText, filename;
+      if (mode === 'weekly') {
+        const params = { start_date: startDate, end_date: endDate };
+        if (statusFilter) params.attendance_status = statusFilter;
+        csvText  = await managerApi.exportWeekly(params);
+        filename = `attendance_${startDate}_${endDate}.csv`;
+      } else {
+        const [yr, mo] = monthVal.split('-');
+        const params = { year: yr, month: mo };
+        if (statusFilter) params.attendance_status = statusFilter;
+        csvText  = await managerApi.exportMonthly(params);
+        filename = `attendance_${yr}_${mo}.csv`;
+      }
+      triggerCsvDownload(typeof csvText === 'string' ? csvText : '', filename);
+      onClose();
+    } catch (e) {
+      setErr(e?.data?.detail || e?.message || 'Export failed, please retry.');
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div
+      style={{ position:'fixed', inset:0, zIndex:1000, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center' }}
+      onClick={onClose}
+    >
+      <div
+        style={{ background:'var(--hrms-surface)', borderRadius:12, padding:28, width:400, maxWidth:'calc(100vw - 32px)', boxShadow:'0 20px 60px rgba(0,0,0,0.18)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:20 }}>
+          <h3 style={{ fontSize:16, fontWeight:700, color:'var(--hrms-text)', margin:0 }}>Export Attendance Data</h3>
+          <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', color:C.muted, padding:4 }}><X size={18}/></button>
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:18 }}>
+          {[['weekly','Weekly Attendance Data'],['monthly','Monthly Attendance Data']].map(([val, label]) => (
+            <label key={val} style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', fontSize:13, color:'var(--hrms-text)' }}>
+              <input type="radio" name="export-mode" value={val} checked={mode === val} onChange={() => setMode(val)}
+                style={{ accentColor:C.primary, width:16, height:16 }} />
+              {label}
+            </label>
+          ))}
+        </div>
+        {mode === 'weekly' ? (
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:14 }}>
+            {[['Start Date', startDate, setStartDate],['End Date', endDate, setEndDate]].map(([lbl, val, setter]) => (
+              <label key={lbl} style={{ display:'flex', flexDirection:'column', gap:4, fontSize:12, color:C.muted, fontWeight:600 }}>
+                {lbl}
+                <input type="date" value={val} onChange={(e) => setter(e.target.value)}
+                  style={{ padding:'7px 10px', border:`1px solid ${C.border}`, borderRadius:7, fontSize:13, color:'var(--hrms-text)', background:'var(--hrms-surface)', fontFamily:"'DM Sans',sans-serif" }} />
+              </label>
+            ))}
+          </div>
+        ) : (
+          <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:12, color:C.muted, fontWeight:600, marginBottom:14 }}>
+            Month
+            <input type="month" value={monthVal} onChange={(e) => setMonthVal(e.target.value)}
+              style={{ padding:'7px 10px', border:`1px solid ${C.border}`, borderRadius:7, fontSize:13, color:'var(--hrms-text)', background:'var(--hrms-surface)', fontFamily:"'DM Sans',sans-serif" }} />
+          </label>
+        )}
+        <label style={{ display:'flex', flexDirection:'column', gap:4, fontSize:12, color:C.muted, fontWeight:600, marginBottom:20 }}>
+          Attendance Status <span style={{ fontWeight:400, color:'#94a3b8' }}>(optional)</span>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
+            style={{ padding:'7px 10px', border:`1px solid ${C.border}`, borderRadius:7, fontSize:13, color:'var(--hrms-text)', background:'var(--hrms-surface)', fontFamily:"'DM Sans',sans-serif" }}>
+            <option value="">All statuses</option>
+            <option value="present">Present</option>
+            <option value="late">Late</option>
+            <option value="absent">Absent</option>
+            <option value="on_leave">On Leave</option>
+            <option value="wfh">WFH</option>
+            <option value="half_day">Half Day</option>
+          </select>
+        </label>
+        {err && (
+          <div style={{ background:'#FEE2E2', color:'#991b1b', padding:'8px 12px', borderRadius:6, fontSize:12, marginBottom:14 }}>{err}</div>
+        )}
+        <div style={{ display:'flex', justifyContent:'flex-end', gap:10 }}>
+          <button onClick={onClose}
+            style={{ padding:'9px 18px', borderRadius:8, border:`1px solid ${C.border}`, background:'var(--hrms-surface)', fontSize:13, fontWeight:600, color:C.muted, cursor:'pointer', fontFamily:"'DM Sans',sans-serif" }}>
+            Cancel
+          </button>
+          <button onClick={handleDownload} disabled={busy}
+            style={{ padding:'9px 18px', borderRadius:8, border:'none', background: busy ? '#A7F3D0' : C.primary, fontSize:13, fontWeight:700, color:'#fff', cursor: busy ? 'wait' : 'pointer', display:'inline-flex', alignItems:'center', gap:8, fontFamily:"'DM Sans',sans-serif" }}>
+            <Download size={14} />
+            {busy ? 'Downloading…' : 'Download CSV'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Attendance (now hosts both Attendance + Timesheets via sub-tabs) ──
 function Attendance({ onNav, defaultTab = 'attendance' }) {
-  // Sub-tab state: 'attendance' | 'timesheets'. Honors defaultTab so the
-  // legacy /manager-dashboard/timesheets URL deep-links into the right tab.
-  // Re-syncs whenever the URL switches between /attendance and /timesheets
-  // (otherwise React would reuse the same Attendance instance and the tab
-  // state would stick on the previous value).
   const [tab, setTab] = useState(defaultTab);
   useEffect(() => { setTab(defaultTab); }, [defaultTab]);
+
+  // ── Dashboard analytics (summary stats, check-ins, trend) ────────
+  const [dashData, setDashData]       = useState(null);
+  const [dashLoading, setDashLoading] = useState(false);
+  const [dashError, setDashError]     = useState(null);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
+
+  // Read-only analytics view by default; edit mode unlocked by button
+  const [isEditing, setIsEditing] = useState(false);
+
+  const loadDashboard = () => {
+    setDashLoading(true);
+    setDashError(null);
+    managerApi.attendanceDashboard()
+      .then((data) => setDashData(data))
+      .catch((err) => setDashError(err?.data?.detail || err?.message || 'Failed to load attendance data'))
+      .finally(() => setDashLoading(false));
+  };
+
+  // ── Interactive grid state ────────────────────────────────────────
+  const [employees, setEmployees]     = useState([]);
+  const [gridRows, setGridRows]       = useState([]);
+  const [weekStart, setWeekStart]     = useState(() => startOfWeek(new Date()));
+  const [gridLoading, setGridLoading] = useState(false);
+  const [gridError, setGridError]     = useState(null);
+  const [busyCell, setBusyCell]       = useState(null);
+  const [toast, setToast]             = useState(null);
+
+  // Team utilization
+  const [util, setUtil]               = useState(null);
+  const [utilLoading, setUtilLoading] = useState(false);
+  const [utilStart, setUtilStart]     = useState(() => { const d = new Date(); d.setDate(1); return fmtIso(d); });
+  const [utilEnd, setUtilEnd]         = useState(() => fmtIso(new Date()));
+
+  const flash = (ok, msg) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 2500); };
+
+  const days = useMemo(() => {
+    const out = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(weekStart);
+      d.setDate(d.getDate() + i);
+      out.push(d);
+    }
+    return out;
+  }, [weekStart]);
+
+  const loadGrid = async () => {
+    setGridLoading(true);
+    setGridError(null);
+    try {
+      const start = fmtIso(days[0]);
+      const end   = fmtIso(days[6]);
+      const [team, atts] = await Promise.all([
+        managerApi.team(),
+        attendanceApi.records({ start, end }),
+      ]);
+      setEmployees(
+        Array.isArray(team)
+          ? team.map((m) => ({
+              id: m.id,
+              full_name: m.full_name || m.name,
+              employee_code: m.employee_code,
+              employment_status: m.employment_status || 'active',
+            }))
+          : []
+      );
+      setGridRows(Array.isArray(atts) ? atts : []);
+    } catch (e) {
+      setGridError(e?.data?.detail || e?.message || 'Failed to load grid data.');
+    } finally {
+      setGridLoading(false);
+    }
+  };
+
+  const loadUtilization = async () => {
+    if (!utilStart || !utilEnd) return;
+    setUtilLoading(true);
+    try {
+      const data = await utilizationApi.team({ start: utilStart, end: utilEnd });
+      setUtil(data);
+    } catch (e) {
+      flash(false, e?.data?.detail || e?.message || 'Could not load utilization');
+    } finally { setUtilLoading(false); }
+  };
+
+  const gridMap = useMemo(() => {
+    const m = new Map();
+    for (const r of gridRows) m.set(r.employee_id + '-' + r.date, r.status);
+    return m;
+  }, [gridRows]);
+
+  const cellStatus = (empId, dateIso) => gridMap.get(empId + '-' + dateIso) || 'unmarked';
+
+  const handleCellClick = async (empId, dateIso) => {
+    const current = cellStatus(empId, dateIso);
+    const next    = cycleNextStatus(current);
+    const cellKey = empId + '-' + dateIso;
+    setGridRows((prev) => {
+      const clone = prev.filter((r) => !(r.employee_id === empId && r.date === dateIso));
+      if (next !== null) clone.push({ employee_id: empId, date: dateIso, status: next });
+      return clone;
+    });
+    setBusyCell(cellKey);
+    try {
+      await attendanceApi.adminOverride({ employee_id: empId, date: dateIso, status: next });
+    } catch {
+      setGridRows((prev) => {
+        const clone = prev.filter((r) => !(r.employee_id === empId && r.date === dateIso));
+        if (current !== 'unmarked') clone.push({ employee_id: empId, date: dateIso, status: current });
+        return clone;
+      });
+      flash(false, 'Failed to save — please retry');
+    } finally {
+      setBusyCell(null);
+    }
+  };
+
+  const shiftWeek = (delta) => {
+    const d = new Date(weekStart);
+    d.setDate(d.getDate() + 7 * delta);
+    setWeekStart(d);
+  };
+
+  useEffect(() => {
+    if (tab === 'attendance') {
+      loadDashboard();
+      loadGrid();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
+  useEffect(() => {
+    if (tab === 'attendance') loadGrid();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [weekStart]);
+
+  useEffect(() => {
+    if (tab !== 'attendance') return;
+    const id = setInterval(loadDashboard, 60_000);
+    return () => clearInterval(id);
+  }, [tab]);
+
+  useEffect(() => {
+    if (tab === 'attendance') loadUtilization();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
+  // ── Derived dashboard values ──────────────────────────────────────
+  const summary  = dashData?.summary         || {};
+  const checkins = dashData?.todays_checkins || [];
+  const trend    = dashData?.weekly_trend    || [];
+  const weekLog  = dashData?.week_log        || [];
+  const teamSize = summary.team_size ?? 0;
+  const weekRange = managerWeekRangeFromLog(weekLog);
+  const trendMax  = Math.max(...trend.map((t) => t.present), 1);
+
+  const ATT_ABB = {
+    present:  { label: 'P',   title: 'Present',   color: '#047857', bg: '#D1FAE5' },
+    late:     { label: 'L',   title: 'Late',      color: '#B45309', bg: '#FEF3C7' },
+    wfh:      { label: 'WFH', title: 'WFH',       color: '#0369A1', bg: '#E0F2FE' },
+    on_leave: { label: 'OL',  title: 'On Leave',  color: '#6D28D9', bg: '#EDE9FE' },
+    half_day: { label: 'HD',  title: 'Half Day',  color: '#C2410C', bg: '#FFEDD5' },
+    holiday:  { label: 'H',   title: 'Holiday',   color: '#0E7490', bg: '#CFFAFE' },
+    absent:   { label: 'A',   title: 'Absent',    color: '#B91C1C', bg: '#FEE2E2' },
+  };
+  const attAbb = (s) => ATT_ABB[(s || '').toLowerCase()] || { label: '–', title: 'Unknown', color: '#94A3B8', bg: 'var(--hrms-surface-2)' };
+
+  const STATUS_META = {
+    present:  { label:'P',  color: C.primary },
+    late:     { label:'L',  color: C.yellow  },
+    half_day: { label:'HD', color: C.accent  },
+    on_leave: { label:'OL', color: C.purple  },
+    holiday:  { label:'H',  color: C.blue    },
+    wfh:      { label:'WF', color: C.blue    },
+    absent:   { label:'A',  color: C.red     },
+  };
+  const statusMeta = (s) => STATUS_META[s] || { label:'—', color: C.muted };
+
   return (
     <div>
       <Topbar
         title="Attendance"
         sub={tab === 'timesheets'
           ? "Review your team's submitted timesheets"
-          : "Track your team's attendance and working hours"}
+          : isEditing
+            ? "Editing team attendance — click any cell to cycle its status"
+            : "Team attendance overview — your direct reports only"}
         onNav={onNav}
       />
 
-      {/* Sub-tab strip — Attendance + Timesheets live side-by-side here. */}
+      {/* Sub-tab strip */}
       <div style={{ display:'flex', gap:4, marginBottom:18, borderBottom:`1px solid ${C.border}` }}>
-        {[
-          ['attendance', 'Attendance'],
-          ['timesheets', 'Timesheets'],
-        ].map(([id, label]) => {
+        {[['attendance','Attendance'],['timesheets','Timesheets']].map(([id, label]) => {
           const active = tab === id;
           return (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setTab(id)}
-              style={{
-                padding:'10px 18px',
-                fontSize:13,
-                fontWeight:600,
-                background:'transparent',
-                border:'none',
+            <button key={id} type="button" onClick={() => setTab(id)}
+              style={{ padding:'10px 18px', fontSize:13, fontWeight:600, background:'transparent', border:'none',
                 borderBottom: active ? `2px solid ${C.primary}` : '2px solid transparent',
-                color: active ? C.primary : C.muted,
-                cursor:'pointer',
-                fontFamily:"'DM Sans',sans-serif",
-                marginBottom:-1,
-              }}
-            >
+                color: active ? C.primary : C.muted, cursor:'pointer', fontFamily:"'DM Sans',sans-serif", marginBottom:-1 }}>
               {label}
             </button>
           );
@@ -1184,62 +1464,418 @@ function Attendance({ onNav, defaultTab = 'attendance' }) {
 
       {tab === 'attendance' && (
       <>
-      <div style={{ display:'flex', gap:14, marginBottom:24 }}>
-        <Stat icon={UserCheck} label="Present Today" value="19" sub="of 24 members" />
-        <Stat icon={Home}      label="On Leave"      value="3"  sub="Approved leaves" subColor={C.yellow} />
-        <Stat icon={Activity}  label="WFH"           value="2"  sub="Remote today" subColor={C.blue} />
-        <Stat icon={X}         label="Absent"        value="1"  sub="Unplanned" subColor={C.red} />
-      </div>
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 280px', gap:20 }}>
-        <Card style={{ padding:0, overflow:'hidden' }}>
-          <div style={{ padding:'14px 18px', borderBottom:`1px solid ${C.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-            <span style={{ fontWeight:700, fontSize:15 }}>Attendance Log – This Week</span>
-            <Btn variant="outline" size="sm"><Download size={12}/>Export</Btn>
+        {/* Edit mode banner */}
+        {isEditing && (
+          <div data-testid="edit-mode-banner" style={{
+            background: 'linear-gradient(135deg,#FFFBEB,#FEF3C7)',
+            border: '1px solid #FDE68A', borderRadius: 10,
+            padding: '12px 18px', marginBottom: 20, color: '#92400E',
+            display: 'flex', alignItems: 'center', gap: 10,
+          }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'center',
+              width:28, height:28, borderRadius:8, background:'#FDE68A', flexShrink:0 }}>
+              <Edit size={14} />
+            </div>
+            <div>
+              <div style={{ fontWeight:700, fontSize:13 }}>Editing Team Attendance</div>
+              <div style={{ fontSize:11, color:'#B45309', marginTop:1 }}>
+                Click any cell to cycle its status · changes apply to your direct reports only
+              </div>
+            </div>
           </div>
-          <table style={{ width:'100%', borderCollapse:'collapse' }}>
-            <thead><tr style={{ background:C.light }}>{['Employee','Mon','Tue','Wed','Thu','Fri','Total','Status'].map(h=><th key={h} style={{ padding:'9px 12px', textAlign:'center', fontSize:11, fontWeight:700, color:C.muted }}>{h}</th>)}</tr></thead>
-            <tbody>
-              {MEMBERS.map((m,i)=>(
-                <tr key={m.id} style={{ borderTop:`1px solid ${C.border}`, background:i%2===0?'#fff':C.bg }}>
-                  <td style={{ padding:'10px 12px' }}><div style={{ display:'flex', alignItems:'center', gap:8 }}><Av init={m.av} size={28}/><span style={{ fontSize:12, fontWeight:600 }}>{m.name}</span></div></td>
-                  {['P','P','P','A','P'].map((d,j)=><td key={j} style={{ padding:'10px 12px', textAlign:'center', fontSize:12, fontWeight:700, color:d==='P'?C.primary:C.red }}>{d}</td>)}
-                  <td style={{ padding:'10px 12px', textAlign:'center', fontSize:12, fontWeight:700 }}>38h</td>
-                  <td style={{ padding:'10px 12px', textAlign:'center' }}><Badge color={C.primary} bg="#D1FAE5">Active</Badge></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Card>
-        <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-          <Card>
-            <div style={{ fontWeight:700, fontSize:14, marginBottom:12 }}>Weekly Summary</div>
-            {ATTENDANCE_TREND.map(d=>(
-              <div key={d.day} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
-                <span style={{ fontSize:11, color:C.muted, width:46 }}>{d.day}</span>
-                <Bar value={(d.n/24)*100}/>
-                <span style={{ fontSize:11, fontWeight:700, width:20 }}>{d.n}</span>
-              </div>
-            ))}
-          </Card>
-          <Card>
-            <div style={{ fontWeight:700, fontSize:14, marginBottom:12 }}>Today's Check-ins</div>
-            {MEMBERS.slice(0,5).map(m=>(
-              <div key={m.id} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:10 }}>
-                <Av init={m.av} size={28}/>
-                <div style={{ flex:1 }}>
-                  <div style={{ fontSize:12, fontWeight:600 }}>{m.name}</div>
-                  <div style={{ fontSize:10, color:C.muted }}>9:0{m.id} AM</div>
+        )}
+
+        {/* Dashboard error */}
+        {dashError && (
+          <div style={{ background:'#FEE2E2', color:C.red, padding:'10px 16px', borderRadius:8, marginBottom:16, fontSize:13 }}>
+            {dashError} — <button onClick={loadDashboard} style={{ background:'none', border:'none', color:C.red, cursor:'pointer', fontWeight:600, textDecoration:'underline' }}>Retry</button>
+          </div>
+        )}
+
+        {/* Toast */}
+        {toast && (
+          <div style={{ background: toast.ok ? '#ECFDF5' : '#FEE2E2', color: toast.ok ? '#065F46' : C.red,
+            padding:'10px 16px', borderRadius:8, marginBottom:16, fontSize:13 }}>
+            {toast.msg}
+          </div>
+        )}
+
+        {/* Summary stats */}
+        <div style={{ display:'flex', gap:16, marginBottom:28, flexWrap:'wrap' }}>
+          <Stat icon={UserCheck} label="Present Today"
+            value={dashLoading ? '…' : `${summary.present ?? 0}/${teamSize}`}
+            sub={teamSize ? `${Math.round(((summary.present??0)/Math.max(teamSize,1))*100)}% of team` : 'Loading…'} />
+          <Stat icon={Home} label="On Leave"
+            value={dashLoading ? '…' : String(summary.on_leave ?? 0)}
+            sub="Approved leaves" subColor={C.yellow} />
+          <Stat icon={Activity} label="WFH"
+            value={dashLoading ? '…' : String(summary.wfh ?? 0)}
+            sub="Working remotely" subColor={C.blue} />
+          <Stat icon={X} label="Absent"
+            value={dashLoading ? '…' : String(summary.absent ?? 0)}
+            sub="Unplanned absence" subColor={C.red} />
+          {(summary.half_day ?? 0) > 0 && (
+            <Stat icon={Clock} label="Half Day"
+              value={String(summary.half_day)}
+              sub="Short sessions" subColor={C.accent} />
+          )}
+        </div>
+
+        {/* Week navigation + Edit toggle + Export */}
+        <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:20, flexWrap:'wrap' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+            <button type="button" onClick={() => shiftWeek(-1)}
+              style={{ display:'inline-flex', alignItems:'center', gap:4, height:36,
+                padding:'0 14px', fontSize:12, fontWeight:600, border:`1px solid ${C.border}`,
+                borderRadius:8, background:'var(--hrms-surface)', cursor:'pointer', color:C.text,
+                fontFamily:"'DM Sans',sans-serif", whiteSpace:'nowrap' }}>
+              ← Prev
+            </button>
+            <button type="button" onClick={() => setWeekStart(startOfWeek(new Date()))}
+              style={{ display:'inline-flex', alignItems:'center', height:36,
+                padding:'0 14px', fontSize:12, fontWeight:700, border:`1px solid ${C.primary}`,
+                borderRadius:8, background:`${C.primary}10`, cursor:'pointer', color:C.primary,
+                fontFamily:"'DM Sans',sans-serif" }}>
+              Today
+            </button>
+            <button type="button" onClick={() => shiftWeek(1)}
+              style={{ display:'inline-flex', alignItems:'center', gap:4, height:36,
+                padding:'0 14px', fontSize:12, fontWeight:600, border:`1px solid ${C.border}`,
+                borderRadius:8, background:'var(--hrms-surface)', cursor:'pointer', color:C.text,
+                fontFamily:"'DM Sans',sans-serif", whiteSpace:'nowrap' }}>
+              Next →
+            </button>
+          </div>
+          <span style={{ fontSize:12, color:C.muted, fontWeight:500, paddingLeft:4 }}>
+            {days[0] && days[6] && (
+              <>
+                {days[0].toLocaleDateString('en-IN', { day:'2-digit', month:'short' })}
+                {' — '}
+                {days[6].toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' })}
+              </>
+            )}
+          </span>
+          <div style={{ flex:1 }} />
+          {(dashLoading || gridLoading) && (
+            <span style={{ fontSize:11, color:C.muted, fontStyle:'italic' }}>Refreshing…</span>
+          )}
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            <button type="button" data-testid="edit-attendance-toggle"
+              onClick={() => setIsEditing((v) => !v)}
+              style={{ display:'inline-flex', alignItems:'center', gap:6, height:36,
+                border: isEditing ? `1px solid ${C.red}` : `1px solid ${C.primary}`,
+                borderRadius:8, background: isEditing ? '#FEF2F2' : '#ECFDF5',
+                color: isEditing ? C.red : C.primaryDark,
+                padding:'0 16px', fontSize:12, fontWeight:700,
+                cursor:'pointer', fontFamily:"'DM Sans',sans-serif", whiteSpace:'nowrap' }}>
+              <Edit size={13} />
+              {isEditing ? 'Done Editing' : 'Edit Attendance'}
+            </button>
+            <button type="button" onClick={() => setExportModalOpen(true)}
+              aria-label="Export attendance data as CSV"
+              style={{ display:'inline-flex', alignItems:'center', gap:6, height:36,
+                border:'1px solid #A7F3D0', borderRadius:8, background:'#ECFDF5',
+                color:'#065F46', padding:'0 14px', fontSize:12, fontWeight:700,
+                cursor:'pointer', fontFamily:"'DM Sans',sans-serif", whiteSpace:'nowrap' }}>
+              <Download size={14} />
+              Export CSV
+            </button>
+          </div>
+        </div>
+
+        {/* Read-only analytics: week attendance log */}
+        {!isEditing && (
+          <div data-testid="analytics-view">
+            <Card style={{ padding:0, overflow:'hidden', marginBottom:20 }}>
+              <div style={{ padding:'14px 20px', borderBottom:`1px solid ${C.border}`,
+                display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                <div>
+                  <div style={{ fontWeight:700, fontSize:15, color:C.text }}>Week Attendance Log</div>
+                  <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
+                    Your direct reports · read-only view
+                  </div>
                 </div>
-                <Badge color={C.primary} bg="#D1FAE5">In</Badge>
+                {!dashLoading && weekLog.length > 0 && (
+                  <span style={{ fontSize:11, color:C.muted, background:C.light,
+                    padding:'3px 10px', borderRadius:999, fontWeight:600 }}>
+                    {weekLog.length} member{weekLog.length !== 1 ? 's' : ''}
+                  </span>
+                )}
               </div>
-            ))}
+              {dashLoading && weekLog.length === 0 ? (
+                <div style={{ padding:'24px 20px', color:C.muted, fontSize:13 }}>Loading…</div>
+              ) : weekLog.length === 0 ? (
+                <div style={{ padding:'24px 20px', color:C.muted, fontSize:13 }}>No team members found.</div>
+              ) : (
+                <div style={{ overflowX:'auto' }}>
+                  <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+                    <thead>
+                      <tr style={{ background:C.light, borderBottom:`1px solid ${C.border}` }}>
+                        <th style={{ padding:'10px 20px', textAlign:'left', fontWeight:700,
+                          fontSize:10, color:C.muted, textTransform:'uppercase', letterSpacing:'0.05em',
+                          minWidth:160 }}>Employee</th>
+                        {weekLog[0]?.days.map((d) => {
+                          const dt = new Date(d.date + 'T00:00:00');
+                          const isToday = d.date === new Date().toISOString().slice(0,10);
+                          return (
+                            <th key={d.date} style={{ padding:'8px 6px', textAlign:'center',
+                              minWidth:60, background: isToday ? '#F0FDF4' : 'transparent' }}>
+                              <div style={{ fontWeight:700, fontSize:10, color: isToday ? C.primary : C.muted,
+                                textTransform:'uppercase', letterSpacing:'0.04em' }}>
+                                {dt.toLocaleDateString('en-IN', { weekday:'short' })}
+                              </div>
+                              <div style={{ fontWeight:500, fontSize:10, color: isToday ? C.primaryDark : '#94A3B8',
+                                marginTop:1 }}>
+                                {dt.toLocaleDateString('en-IN', { day:'2-digit', month:'short' })}
+                              </div>
+                            </th>
+                          );
+                        })}
+                        <th style={{ padding:'10px 20px', textAlign:'right', fontWeight:700,
+                          fontSize:10, color:C.muted, textTransform:'uppercase', letterSpacing:'0.05em' }}>Hrs</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {weekLog.map((row) => (
+                        <tr key={row.employee_id} style={{ borderTop:`1px solid ${C.border}` }}>
+                          <td style={{ padding:'10px 20px', fontWeight:600, fontSize:13, color:C.text }}>{row.name}</td>
+                          {row.days.map((d) => {
+                            const a = attAbb(d.status);
+                            const isToday = d.date === new Date().toISOString().slice(0,10);
+                            return (
+                              <td key={d.date} style={{ padding:'8px 6px', textAlign:'center',
+                                background: isToday ? '#F0FDF4' : 'transparent' }}>
+                                <span title={a.title}
+                                  style={{
+                                    display:'inline-flex', alignItems:'center', justifyContent:'center',
+                                    minWidth:32, padding:'3px 7px', borderRadius:6, fontSize:10, fontWeight:700,
+                                    color: a.color, background: a.bg,
+                                    letterSpacing:'0.02em', cursor:'default',
+                                  }}>{a.label}</span>
+                              </td>
+                            );
+                          })}
+                          <td style={{ padding:'10px 20px', textAlign:'right', fontWeight:700,
+                            fontSize:12, color:C.text }}>{row.total_hours}h</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {/* Edit mode: interactive attendance grid */}
+        {isEditing && (
+          <>
+            {gridError && (
+              <div style={{ background:'#FEE2E2', color:C.red, padding:'10px 16px', borderRadius:8, marginBottom:16, fontSize:13 }}>
+                {gridError} — <button onClick={loadGrid} style={{ background:'none', border:'none', color:C.red, cursor:'pointer', fontWeight:600, textDecoration:'underline' }}>Retry</button>
+              </div>
+            )}
+            <AttendanceGrid
+              employees={employees}
+              days={days}
+              cellStatus={cellStatus}
+              busyCell={busyCell}
+              onCellClick={handleCellClick}
+              loading={gridLoading}
+              readOnly={false}
+            />
+          </>
+        )}
+
+        {/* Below: Weekly trend + Today's check-ins */}
+        <div style={{ display:'flex', gap:16, marginTop:24, flexWrap:'wrap' }}>
+          <Card style={{ flex:1, minWidth:240, padding:20 }}>
+            <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:4 }}>Weekly Summary</div>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:16 }}>Daily present count — last 7 days</div>
+            {trend.length === 0 && dashLoading
+              ? <div style={{ color:C.muted, fontSize:12 }}>Loading…</div>
+              : trend.length === 0
+                ? <div style={{ color:C.muted, fontSize:12 }}>No trend data available.</div>
+                : trend.map((d) => {
+                    const label = new Date(d.date).toLocaleDateString('en-IN', { day:'2-digit', month:'short' });
+                    const pct   = Math.round((d.present / trendMax) * 100);
+                    return (
+                      <div key={d.date} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10 }}>
+                        <span style={{ fontSize:11, color:C.muted, width:56, flexShrink:0, fontWeight:500 }}>{label}</span>
+                        <div style={{ flex:1, height:8, background:C.light, borderRadius:99, overflow:'hidden' }}>
+                          <div style={{ width:`${pct}%`, height:'100%',
+                            background:`linear-gradient(90deg,${C.primary},${C.primaryDark})`,
+                            borderRadius:99, transition:'width 0.4s ease' }} />
+                        </div>
+                        <span style={{ fontSize:11, fontWeight:700, color:C.text, width:24, textAlign:'right' }}>{d.present}</span>
+                      </div>
+                    );
+                  })
+            }
+          </Card>
+
+          <Card style={{ flex:1, minWidth:240, padding:20 }}>
+            <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:4 }}>Today's Check-ins</div>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:16 }}>
+              {checkins.length > 0 ? `${checkins.length} checked in so far` : 'Check-in activity'}
+            </div>
+            {checkins.length === 0 && !dashLoading && (
+              <div style={{ color:C.muted, fontSize:12, padding:'12px 0' }}>No check-ins recorded yet today.</div>
+            )}
+            {dashLoading && checkins.length === 0 && (
+              <div style={{ color:C.muted, fontSize:12 }}>Loading…</div>
+            )}
+            {checkins.slice(0, 6).map((c) => {
+              const initials = c.name.split(' ').filter(Boolean).map((s) => s[0]).slice(0,2).join('').toUpperCase();
+              const m = statusMeta(c.status);
+              return (
+                <div key={c.employee_id} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:12,
+                  paddingBottom:12, borderBottom:`1px solid ${C.border}` }}>
+                  <Av init={initials} size={32} />
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:12, fontWeight:600, color:C.text, overflow:'hidden',
+                      textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{c.name}</div>
+                    <div style={{ fontSize:10, color:C.muted, marginTop:1 }}>Checked in at {c.check_in_time}</div>
+                  </div>
+                  <Badge color={m.color} bg={`${m.color}18`}>{c.status === 'late' ? 'Late' : 'Present'}</Badge>
+                </div>
+              );
+            })}
+            {checkins.length > 6 && (
+              <div style={{ fontSize:11, color:C.muted, textAlign:'center', paddingTop:4 }}>
+                +{checkins.length - 6} more
+              </div>
+            )}
           </Card>
         </div>
-      </div>
+
+        {/* Team Utilization */}
+        <Card style={{ padding:0, overflow:'hidden', marginTop:20 }}>
+          <div style={{ padding:'14px 20px', borderBottom:`1px solid ${C.border}`,
+            display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:10 }}>
+            <div>
+              <div style={{ fontWeight:700, fontSize:15, color:C.text }}>Team Utilization</div>
+              <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>Billable hours and availability for your direct reports</div>
+            </div>
+            <div style={{ display:'flex', gap:8, alignItems:'flex-end', flexWrap:'wrap' }}>
+              <div>
+                <label style={{ fontSize:10, fontWeight:700, color:C.muted, display:'block', marginBottom:4,
+                  textTransform:'uppercase', letterSpacing:'0.05em' }}>From</label>
+                <input type="date" value={utilStart} onChange={(e) => setUtilStart(e.target.value)}
+                  style={{ padding:'6px 10px', border:`1px solid ${C.border}`, borderRadius:8,
+                    fontSize:12, background:'var(--hrms-surface)', color:C.text, fontFamily:"'DM Sans',sans-serif" }} />
+              </div>
+              <div>
+                <label style={{ fontSize:10, fontWeight:700, color:C.muted, display:'block', marginBottom:4,
+                  textTransform:'uppercase', letterSpacing:'0.05em' }}>To</label>
+                <input type="date" value={utilEnd} onChange={(e) => setUtilEnd(e.target.value)}
+                  style={{ padding:'6px 10px', border:`1px solid ${C.border}`, borderRadius:8,
+                    fontSize:12, background:'var(--hrms-surface)', color:C.text, fontFamily:"'DM Sans',sans-serif" }} />
+              </div>
+              <button onClick={loadUtilization} disabled={utilLoading}
+                style={{ padding:'7px 16px', background:C.blue, color:'#fff', border:'none',
+                  borderRadius:8, fontSize:12, fontWeight:700, cursor:'pointer',
+                  fontFamily:"'DM Sans',sans-serif", height:34 }}>
+                {utilLoading ? 'Loading…' : 'Refresh'}
+              </button>
+            </div>
+          </div>
+
+          {util ? (
+            <>
+              <div style={{ display:'flex', gap:12, padding:'16px 20px', flexWrap:'wrap', borderBottom:`1px solid ${C.border}` }}>
+                {[
+                  { label:'Employees',      value: util.total_employees,                   color:C.blue,    bg:'#EFF6FF' },
+                  { label:'Billable Hours', value: util.billable_hours.toFixed(1) + ' h',  color:'#047857', bg:'#ECFDF5' },
+                  { label:'Utilization %',  value: util.utilization_pct.toFixed(1) + '%',  color:C.purple,  bg:'#EDE9FE' },
+                  { label:'Underutilized',  value: util.underutilized,                      color:C.yellow,  bg:'#FEF3C7' },
+                  { label:'Missing TS',     value: util.missing_submissions,                color:C.red,     bg:'#FEE2E2' },
+                ].map((s) => (
+                  <div key={s.label} style={{ flex:1, minWidth:100, padding:'12px 14px', borderRadius:10,
+                    background:s.bg, textAlign:'center' }}>
+                    <div style={{ fontSize:20, fontWeight:800, color:s.color }}>{s.value}</div>
+                    <div style={{ fontSize:10, color:C.muted, marginTop:2, fontWeight:600 }}>{s.label}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ overflowX:'auto' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead>
+                    <tr style={{ background:C.light, borderBottom:`1px solid ${C.border}` }}>
+                      {['Employee','Department','Available','Logged','Billable','Non-Bill','Utilization','Status'].map((h) => (
+                        <th key={h} style={{ padding:'10px 14px', textAlign:'left',
+                          fontSize:10, fontWeight:700, color:C.muted,
+                          textTransform:'uppercase', letterSpacing:'0.04em', whiteSpace:'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(util.employees || []).map((emp) => {
+                      const pct      = emp.utilization_pct;
+                      const barColor = pct >= 80 ? C.primary : pct >= 60 ? C.yellow : C.red;
+                      const alert    = pct > 100 ? '🔴 Overallocated' : pct < 60 ? '🟡 Underutilized' : '🟢 On track';
+                      return (
+                        <tr key={emp.employee_id} style={{ borderTop:`1px solid ${C.border}` }}>
+                          <td style={{ padding:'10px 14px' }}>
+                            <div style={{ fontWeight:600, fontSize:13, color:C.text }}>{emp.employee_name}</div>
+                            {emp.designation && <div style={{ fontSize:10, color:'#94A3B8', marginTop:1 }}>{emp.designation}</div>}
+                            {emp.missing_timesheet && (
+                              <span style={{ fontSize:9, fontWeight:700, background:'#FEE2E2', color:C.red,
+                                padding:'1px 5px', borderRadius:4, display:'inline-block', marginTop:2 }}>No TS</span>
+                            )}
+                          </td>
+                          <td style={{ padding:'10px 14px', fontSize:12, color:C.muted }}>{emp.department || '—'}</td>
+                          <td style={{ padding:'10px 14px', fontSize:12, color:C.muted }}>{emp.available_hours.toFixed(0)}h</td>
+                          <td style={{ padding:'10px 14px', fontSize:12, fontWeight:600, color:C.text }}>{emp.total_logged_hours.toFixed(1)}h</td>
+                          <td style={{ padding:'10px 14px', fontSize:12, fontWeight:700, color:'#047857' }}>{emp.billable_hours.toFixed(1)}h</td>
+                          <td style={{ padding:'10px 14px', fontSize:12, color:'#B45309' }}>{emp.non_billable_hours.toFixed(1)}h</td>
+                          <td style={{ padding:'10px 14px', minWidth:120 }}>
+                            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                              <div style={{ flex:1, height:6, background:C.light, borderRadius:3, overflow:'hidden' }}>
+                                <div style={{ height:'100%', width:`${Math.min(pct,100)}%`,
+                                  background:barColor, borderRadius:3, transition:'width 0.4s' }} />
+                              </div>
+                              <span style={{ fontSize:11, fontWeight:700, color:barColor, minWidth:36 }}>
+                                {pct.toFixed(0)}%
+                              </span>
+                            </div>
+                          </td>
+                          <td style={{ padding:'10px 14px', fontSize:11 }}>{alert}</td>
+                        </tr>
+                      );
+                    })}
+                    {(util.employees || []).length === 0 && (
+                      <tr>
+                        <td colSpan={8} style={{ padding:24, textAlign:'center', color:C.muted, fontSize:13 }}>
+                          No employees found for this period.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : utilLoading ? (
+            <div style={{ padding:'32px 20px', textAlign:'center', color:C.muted, fontSize:13 }}>
+              Loading utilization data…
+            </div>
+          ) : (
+            <div style={{ padding:'32px 20px', textAlign:'center', color:C.muted, fontSize:13 }}>
+              Select a date range and click Refresh to load team utilization data.
+            </div>
+          )}
+        </Card>
       </>
       )}
+
+      {exportModalOpen && (
+        <ExportAttendanceModal
+          onClose={() => setExportModalOpen(false)}
+          defaultWeekRange={weekRange}
+        />
+      )}
     </div>
-  )
+  );
 }
 
 // ── Leave Requests ────────────────────────────────────────────────

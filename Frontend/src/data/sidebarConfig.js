@@ -64,10 +64,25 @@ export const SIDEBAR_CONFIG = {
       { label: 'Policies',      icon: 'doc',        path: 'policies' },
     ],
   },
+  finance: {
+    base: '/finance-dashboard',
+    title: 'Acronotics WorkHive',
+    subtitle: 'Human Intelligence In Action',
+    items: [
+      { label: 'Dashboard',       icon: 'dashboard',  path: '' },
+      { label: 'Client Billing',  icon: 'money',      path: 'billing' },
+      { label: 'Utilization',     icon: 'chart',      path: 'utilization' },
+      { label: 'Project Costing', icon: 'briefcase',  path: 'project-costing' },
+      { label: 'Payroll',         icon: 'money',      path: 'payroll' },
+      { label: 'Reports',         icon: 'doc',        path: 'reports' },
+      { label: 'Exports',         icon: 'doc',        path: 'exports' },
+    ],
+  },
 };
 
 export const ROLE_LABEL = {
   admin: 'Admin',
   manager: 'Manager',
   employee: 'Employee',
+  finance: 'Finance',
 };

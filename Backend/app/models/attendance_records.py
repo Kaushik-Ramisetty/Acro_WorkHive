@@ -124,6 +124,17 @@ class RegularizationRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    # The list/review screens (admin + dashboard quick approvals) need the
+    # employee's display name. Without this relationship the API surfaces only
+    # `employee_id`, and the UI was falling back to "Employee #3" / initials
+    # "E#". Pydantic's `from_attributes=True` picks up the @property below so
+    # the schema gets `employee_name` for free.
+    employee: Mapped["Employee"] = relationship(foreign_keys=[employee_id])  # type: ignore[name-defined]
+
+    @property
+    def employee_name(self) -> str | None:
+        return self.employee.full_name if self.employee else None
+
 
 class RegularizationAttachment(Base):
     __tablename__ = "regularization_attachments"
@@ -202,3 +213,30 @@ class PayrollAttendanceSummary(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class WeeklyOffChangeRequest(Base):
+    """Employee request to change their weekly-off day(s).
+
+    Workflow: pending → approved (takes effect on effective_from) or rejected.
+    Approved requests trigger a shift update (weekly_off_days) for the employee.
+    """
+    __tablename__ = "weekly_off_change_requests"
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True)        # e.g. WO0001
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+
+    current_weekly_off: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    requested_weekly_off: Mapped[str] = mapped_column(String(60), nullable=False)
+    effective_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    review_comment: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    employee: Mapped["Employee"] = relationship(foreign_keys=[employee_id])  # type: ignore[name-defined]

@@ -18,13 +18,16 @@ System rules respected:
 """
 from __future__ import annotations
 
+import logging
+import uuid
+from dataclasses import dataclass
 from datetime import date as date_t, datetime, time, timedelta
 from typing import Optional
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from utils.time_utils import now_utc
+from utils.time_utils import now_utc, to_local
 
 from app.models import (
     AttendanceException,
@@ -35,9 +38,31 @@ from app.models import (
     EmployeeShift,
     Holiday,
     LeaveRequest,
+    OvertimeRecord,
     Shift,
     ValidationError,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# ── Thresholds (production-configurable) ─────────────────────────────
+
+DEFAULT_FULL_DAY_HOURS: float = 8.0
+DEFAULT_HALF_DAY_HOURS: float = 4.0
+DEFAULT_LATE_THRESHOLD_MINS: int = 30
+MIN_CHECKOUT_HOURS: float = 6.0   # minimum work duration before checkout is allowed
+
+
+# ── Data container for status determination ───────────────────────────
+
+@dataclass
+class AttendanceStatusResult:
+    attendance_status: str        # present | half_day | absent | late | on_leave | holiday
+    attendance_state: str         # checked_in | checked_out | absent | on_leave | holiday
+    worked_hours: float
+    lop_applied: bool
+    lop_type: Optional[str]       # absent_without_leave | no_checkout | zero_hours | None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -60,13 +85,44 @@ def _next_record_id(db: Session) -> str:
     return candidate
 
 
-def _next_exception_id(db: Session) -> str:
-    n = db.query(AttendanceException).count() + 1
-    candidate = f"AE{n:04d}"
-    while db.get(AttendanceException, candidate) is not None:
+def generate_attendance_exception_id() -> str:
+    """UUID4-based primary key to avoid UNIQUE violations on concurrent exceptions."""
+    return f"AE{uuid.uuid4().hex[:18]}"
+
+
+def _next_exception_id(db: Session) -> str:  # noqa: ARG001
+    return generate_attendance_exception_id()
+
+
+def _next_overtime_id(db: Session) -> str:
+    n = db.query(OvertimeRecord).count() + 1
+    candidate = f"OT{n:05d}"
+    while db.get(OvertimeRecord, candidate) is not None:
         n += 1
-        candidate = f"AE{n:04d}"
+        candidate = f"OT{n:05d}"
     return candidate
+
+
+def _upsert_overtime_record(
+    db: Session, rec: "AttendanceRecord", overtime_hours: float,
+) -> None:
+    existing = (
+        db.query(OvertimeRecord)
+        .filter(OvertimeRecord.attendance_record_id == rec.id)
+        .first()
+    )
+    if existing:
+        existing.overtime_hours = overtime_hours
+    else:
+        db.add(OvertimeRecord(
+            id=_next_overtime_id(db),
+            employee_id=rec.employee_id,
+            attendance_record_id=rec.id,
+            date=rec.date,
+            overtime_hours=overtime_hours,
+            overtime_type="daily",
+            status="pending",
+        ))
 
 
 def _next_validation_error_id(db: Session) -> str:
@@ -366,8 +422,14 @@ def compute_record_for_day(
         rec.lop_type = "absent_without_leave"
         return rec
 
-    first_in = check_ins[0].punch_timestamp.time()
-    last_out = check_outs[-1].punch_timestamp.time() if check_outs else None
+    # punch_timestamp is naive UTC (see utils/time_utils.now_utc). Convert to
+    # the employee's local tz before extracting the wall-clock time so that
+    # AttendanceRecord.check_in_time / check_out_time match the actual time
+    # the employee punched in their own zone (Bug fix: an 11:32 IST punch was
+    # being stored / displayed as 06:02 UTC).
+    tz_name = getattr(emp, "time_zone", None)
+    first_in = to_local(check_ins[0].punch_timestamp, tz_name).time()
+    last_out = to_local(check_outs[-1].punch_timestamp, tz_name).time() if check_outs else None
 
     rec.check_in_time = first_in
     rec.check_out_time = last_out
@@ -492,3 +554,164 @@ def process_day(
     if with_exceptions and rec is not None:
         detect_exceptions_for_record(db, rec)
     return rec
+
+
+def determine_attendance_status(
+    *,
+    check_in: Optional[time],
+    check_out: Optional[time],
+    shift: Optional[Shift],
+    approved_leave: Optional[LeaveRequest],
+    wfh_status: bool = False,
+    holidays: bool = False,
+    is_today: bool = False,
+    policy: Optional[AttendancePolicy] = None,
+    break_duration_mins: int = 0,
+) -> AttendanceStatusResult:
+    """Pure function: determine status from inputs with no DB access.
+
+    Rules (evaluated in order):
+      A. No check-in at all              → absent, LOP=absent_without_leave
+      B. Check-in, no checkout, today    → present/late (in-progress), no LOP
+      C. Check-in, no checkout, past day → absent, LOP=no_checkout
+      D. worked_hours <= 0               → absent, LOP=zero_hours
+      E. 0 < hours < HALF_DAY_HOURS     → half_day, no LOP
+      F. HALF_DAY_HOURS <= hours < FULL  → half_day, no LOP
+      G. hours >= FULL_DAY_HOURS         → present (or late), no LOP
+    """
+    full_day = (
+        (policy.min_working_hours_full_day if policy else None) or DEFAULT_FULL_DAY_HOURS
+    )
+    half_day_thr = (
+        (policy.min_working_hours_half_day if policy else None) or DEFAULT_HALF_DAY_HOURS
+    )
+    late_thr = (
+        (policy.late_deduction_after_mins if policy else None) or DEFAULT_LATE_THRESHOLD_MINS
+    )
+
+    if check_in is None:
+        return AttendanceStatusResult(
+            attendance_status="absent",
+            attendance_state="absent",
+            worked_hours=0.0,
+            lop_applied=True,
+            lop_type="absent_without_leave",
+        )
+
+    if check_out is None:
+        if is_today:
+            late_mins = 0
+            if shift and shift.start_time:
+                grace = shift.grace_period_mins or 0
+                late_mins = max(0, _minutes_between(shift.start_time, check_in) - grace)
+            status = "late" if late_mins > late_thr else "present"
+            return AttendanceStatusResult(
+                attendance_status=status,
+                attendance_state="checked_in",
+                worked_hours=0.0,
+                lop_applied=False,
+                lop_type=None,
+            )
+        else:
+            return AttendanceStatusResult(
+                attendance_status="absent",
+                attendance_state="absent",
+                worked_hours=0.0,
+                lop_applied=True,
+                lop_type="no_checkout",
+            )
+
+    raw_hours = _hours_between(check_in, check_out)
+    if break_duration_mins and raw_hours > 0:
+        raw_hours = max(0.0, raw_hours - (break_duration_mins / 60.0))
+    hours = round(raw_hours, 2)
+
+    if hours <= 0.0:
+        return AttendanceStatusResult(
+            attendance_status="absent",
+            attendance_state="checked_out",
+            worked_hours=0.0,
+            lop_applied=True,
+            lop_type="zero_hours",
+        )
+
+    if hours < half_day_thr:
+        return AttendanceStatusResult(
+            attendance_status="half_day",
+            attendance_state="checked_out",
+            worked_hours=hours,
+            lop_applied=False,
+            lop_type=None,
+        )
+
+    if hours < full_day:
+        return AttendanceStatusResult(
+            attendance_status="half_day",
+            attendance_state="checked_out",
+            worked_hours=hours,
+            lop_applied=False,
+            lop_type=None,
+        )
+
+    late_mins = 0
+    if shift and shift.start_time:
+        grace = shift.grace_period_mins or 0
+        late_mins = max(0, _minutes_between(shift.start_time, check_in) - grace)
+    status = "late" if late_mins > late_thr else "present"
+    return AttendanceStatusResult(
+        attendance_status=status,
+        attendance_state="checked_out",
+        worked_hours=hours,
+        lop_applied=False,
+        lop_type=None,
+    )
+
+
+def recompute_from_check_times(
+    db: Session,
+    rec: AttendanceRecord,
+) -> None:
+    """Recalculate derived fields from rec.check_in_time / check_out_time.
+
+    Used by regularization approval — attendance_logs are NOT re-read.
+    """
+    shift  = get_employee_shift(db, rec.employee_id, rec.date)
+    policy = get_policy_for_shift(db, shift.id if shift else None)
+
+    check_in  = rec.check_in_time
+    check_out = rec.check_out_time
+    is_today  = (rec.date == date_t.today())
+
+    result = determine_attendance_status(
+        check_in=check_in,
+        check_out=check_out,
+        shift=shift,
+        approved_leave=None,
+        is_today=is_today,
+        policy=policy,
+        break_duration_mins=shift.break_duration_mins if shift else 0,
+    )
+
+    rec.working_hours = result.worked_hours
+    rec.status        = result.attendance_status
+    rec.lop_applied   = result.lop_applied
+    rec.lop_type      = result.lop_type
+
+    late_mins = 0
+    if shift and shift.start_time and check_in:
+        grace = shift.grace_period_mins or 0
+        late_mins = max(0, _minutes_between(shift.start_time, check_in) - grace)
+    rec.late_minutes = late_mins
+
+    early_mins = 0
+    if shift and shift.end_time and check_out:
+        early_mins = max(0, _minutes_between(check_out, shift.end_time))
+    rec.early_checkout_mins = early_mins
+
+    overtime = 0.0
+    if policy and policy.overtime_threshold_hours and result.worked_hours > policy.overtime_threshold_hours:
+        overtime = round(result.worked_hours - policy.overtime_threshold_hours, 2)
+    rec.overtime_hours = overtime
+
+    if overtime > 0:
+        _upsert_overtime_record(db, rec, overtime)

@@ -83,6 +83,11 @@ class UserOut(BaseModel):
     marital_status: Optional[str] = None
     time_zone: Optional[str] = None
 
+    # Employment type + client billing (added in v3)
+    employee_type: Optional[str] = None           # wfh / wfo / client_site
+    client_manager_name: Optional[str] = None
+    client_manager_email: Optional[str] = None
+
     class Config:
         from_attributes = True
 

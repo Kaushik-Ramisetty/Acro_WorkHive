@@ -47,20 +47,36 @@ def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
 
+_GLOBAL_TOKENS = {"all", "*", "global", "any", "india"}
+
+
 def _filter_by_location(rows: list[Holiday], location: str) -> list[Holiday]:
     """Exact-token match. A holiday is in scope when:
       - applicable_locations is NULL / empty (global), or
+      - the token set contains a global wildcard ("all", "*", "global",
+        "any", "india") — these signal pan-India / multi-office holidays
+        like Republic Day, Diwali, Christmas, and must surface to every
+        office regardless of which specific cities are also listed, or
       - one of its comma-separated tokens (case-insensitive, trimmed)
         equals the caller's location.
+
+    The wildcard handling is what closes the Bangalore visibility gap:
+    seed data stores national holidays as e.g. `"all,Pune"`, and the prior
+    pure exact-match logic hid them from Bangalore (the caller's token
+    "bangalore" was absent). Treating "all" as global is consistent with
+    how a human reads the field.
     """
     loc = _norm(location)
     out = []
     for h in rows:
         raw = (h.applicable_locations or "").strip()
         if not raw:
-            out.append(h)  # global
+            out.append(h)  # global (NULL/empty)
             continue
         tokens = {_norm(t) for t in raw.split(",") if t.strip()}
+        if tokens & _GLOBAL_TOKENS:
+            out.append(h)  # global (wildcard token present)
+            continue
         if loc and loc in tokens:
             out.append(h)
     return out

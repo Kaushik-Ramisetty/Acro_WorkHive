@@ -172,7 +172,7 @@ export default function AdminHome() {
     const lv = (pendingLeaves || []).map((r) => ({
       kind: r.status === 'cancel_pending' ? 'cancel' : 'leave',
       key: 'L-' + r.id, id: r.id,
-      name: r.employee_name || ('Employee #' + r.employee_id),
+      name: r.employee_name || 'Unknown Employee',
       type: r.status === 'cancel_pending' ? 'Cancellation' : (r.leave_type_name || 'Leave'),
       detail: `${r.total_days || 0}d · ${r.start_date || ''} → ${r.end_date || ''}`,
       created_at: r.created_at,
@@ -180,7 +180,7 @@ export default function AdminHome() {
     const co = (pendingCompOffs || []).map((c) => ({
       kind: 'compoff',
       key: 'C-' + c.id, id: c.id,
-      name: c.employee_name || ('Employee #' + c.employee_id),
+      name: c.employee_name || 'Unknown Employee',
       type: 'Comp-Off',
       detail: `${c.days || 0}d · worked ${c.worked_on || ''}`,
       created_at: c.created_at,
@@ -188,7 +188,7 @@ export default function AdminHome() {
     const rg = (pendingRegs || []).map((r) => ({
       kind: 'regular',
       key: 'R-' + r.id, id: r.id,
-      name: r.employee?.full_name || r.employee_name || ('Employee #' + r.employee_id),
+      name: r.employee?.full_name || r.employee_name || 'Unknown Employee',
       type: 'Regularization',
       detail: `${r.regularization_type || 'attendance'} · ${r.date || ''}`,
       created_at: r.created_at,

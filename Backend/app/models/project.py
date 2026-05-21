@@ -1,14 +1,16 @@
 """Project / task / timesheet models (timesheet module).
 
 Mirrors the `projects`, `tasks`, `timesheets`, `timesheet_entries`,
-`timesheet_payroll_sync` sheets in hrms_schema_complete.xlsx.
+`timesheet_payroll_sync`, `timesheet_workflow_steps` sheets in
+hrms_schema_complete.xlsx.
 """
 from __future__ import annotations
 
 from datetime import date, datetime
 
 from sqlalchemy import (
-    Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, func,
+    Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text,
+    UniqueConstraint, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,6 +32,7 @@ class Project(Base):
     end_date: Mapped[date | None]   = mapped_column(Date, nullable=True)
     status: Mapped[str | None] = mapped_column(String(30), nullable=True)
     is_billable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    billing_rate: Mapped[float | None] = mapped_column(Float, nullable=True)  # hourly rate charged to client
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -59,6 +62,11 @@ class Task(Base):
 
 class Timesheet(Base):
     __tablename__ = "timesheets"
+    __table_args__ = (
+        # One active timesheet per employee per pay period — prevents duplicates
+        # from concurrent scheduler runs or double-punch events.
+        UniqueConstraint("employee_id", "period_start", "period_end", name="uq_timesheet_emp_period"),
+    )
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True)        # e.g. TS000001
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
@@ -77,6 +85,20 @@ class Timesheet(Base):
 
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Client-approval columns (T&M billing flow)
+    client_manager_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    client_manager_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    client_manager_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    client_token: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    client_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    client_email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    client_email_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    client_approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    client_rejected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    client_review_comment: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    reminder_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    has_mismatch: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -97,6 +119,7 @@ class TimesheetEntry(Base):
     task_id: Mapped[str | None]      = mapped_column(ForeignKey("tasks.id"), nullable=True)
 
     logged_hours: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_billable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     source: Mapped[str | None]      = mapped_column(String(30), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_manual_entry: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -132,3 +155,47 @@ class TimesheetPayrollSync(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TimesheetWorkflowStep(Base):
+    """Audit trail for every step action in the multi-stage timesheet workflow.
+
+    One row per step action (approve / reject / resubmit) per timesheet.
+    Provides a complete, immutable history for compliance, audit, and UI rendering.
+
+    sequence_order values:
+        1 = Employee submission
+        2 = Client Manager review
+        3 = Reporting Manager review
+        4 = HR review
+        5 = Finance approval
+        6 = Payroll / billing processing
+    """
+    __tablename__ = "timesheet_workflow_steps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    timesheet_id: Mapped[str] = mapped_column(
+        ForeignKey("timesheets.id"), nullable=False, index=True
+    )
+
+    # Role key — matches WORKFLOW_STEPS[].key in the frontend statuses.js
+    # Values: 'employee' | 'client' | 'rm' | 'hr' | 'finance' | 'payroll'
+    step_role: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Step outcome: 'pending' | 'approved' | 'rejected' | 'skipped'
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+
+    acted_by: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id"), nullable=True, index=True
+    )
+    acted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Mandatory on rejection; optional otherwise
+    comments: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    sequence_order: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )

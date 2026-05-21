@@ -109,7 +109,8 @@ def _set_otp_redis(user_id: int, otp_code: str) -> None:
     key = otp_key(user_id)
     pipe = redis_client.pipeline()
     pipe.delete(key)
-    pipe.hset(key, mapping={"otp_code": otp_code, "attempts": 0})
+    pipe.hset(key, "otp_code", otp_code)
+    pipe.hset(key, "attempts", 0)
     pipe.expire(key, OTP_TTL_SECONDS)
     pipe.execute()
 

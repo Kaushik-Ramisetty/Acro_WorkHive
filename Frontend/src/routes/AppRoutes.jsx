@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth, dashboardPathForRole } from '../context/AuthContext';
 import ProtectedRoute from '../components/ProtectedRoute';
 import DashboardLayout from '../layouts/DashboardLayout';
+import FinanceLayout from '../layouts/FinanceLayout';
 import LoginPage from '../pages/LoginPage';
 import NotFoundPage from '../pages/NotFoundPage';
 
@@ -9,6 +10,8 @@ import AdminHome from '../pages/admin/AdminHome';
 import * as Admin from '../pages/admin/index.jsx';
 import AdminProfile from '../pages/admin/AdminProfile';
 import NotificationsPage from '../pages/shared/NotificationsPage';
+
+import * as Finance from '../pages/finance/index.jsx';
 
 import ManagerDashboard from '../pages/manager/ManagerDashboard';
 import EmployeeDashboard from '../pages/employee/EmployeeDashboard';
@@ -91,6 +94,24 @@ export default function AppRoutes() {
             </ProtectedRoute>
           }
         />
+
+        {/* Finance Dashboard — isolated role, owns billing/utilization/costing/payroll */}
+        <Route
+          path="/finance-dashboard"
+          element={
+            <ProtectedRoute allowedRoles={['finance']}>
+              <FinanceLayout />
+            </ProtectedRoute>
+          }
+        >
+          <Route index                  element={<Finance.Home />} />
+          <Route path="billing"         element={<Finance.Billing />} />
+          <Route path="utilization"     element={<Finance.Utilization />} />
+          <Route path="project-costing" element={<Finance.ProjectCosting />} />
+          <Route path="payroll"         element={<Finance.Payroll />} />
+          <Route path="reports"         element={<Finance.Reports />} />
+          <Route path="exports"         element={<Finance.Reports />} />
+        </Route>
 
         {/* BGV vendor review portal — public, token-based (no login required) */}
         <Route path="/vendor/bgv-review/:token" element={<VendorBGVReview />} />

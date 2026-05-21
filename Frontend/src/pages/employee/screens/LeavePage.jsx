@@ -47,6 +47,7 @@ const TYPE_COLORS = {
 };
 
 const STATUS_TONE = {
+  draft:          { bg: '#f1f5f9', color: '#475569', label: 'Draft' },
   pending:        { bg: '#fff7ed', color: '#f97316', label: 'Pending' },
   approved:       { bg: '#f0fdf4', color: '#22c55e', label: 'Approved' },
   rejected:       { bg: '#fef2f2', color: '#ef4444', label: 'Rejected' },
@@ -108,6 +109,26 @@ const LeavePage = () => {
     if (!confirm('Cancel this leave request?')) return;
     try { await cancel(id); }
     catch (e) { alert(e?.data?.detail || 'Cancel failed'); }
+  };
+
+  const handleSubmitDraft = async (id) => {
+    if (!confirm('Submit this draft for approval? You will not be able to edit it after submission.')) return;
+    try {
+      await leaveApi.draftSubmit(id);
+      await refresh();
+    } catch (e) {
+      alert(e?.data?.detail || 'Submit failed');
+    }
+  };
+
+  const handleDiscardDraft = async (id) => {
+    if (!confirm('Discard this draft? This cannot be undone.')) return;
+    try {
+      await leaveApi.draftDelete(id);
+      await refresh();
+    } catch (e) {
+      alert(e?.data?.detail || 'Discard failed');
+    }
   };
 
   // When the user picks the comp-off tab, just render CompOffPage in-place.
@@ -322,7 +343,18 @@ const LeavePage = () => {
                     </td>
                     <td className="px-4 py-3 text-slate-400 text-xs">{fmtDate(r.created_at)}</td>
                     <td className="px-4 py-3">
-                      {canCancel ? (
+                      {r.status === 'draft' ? (
+                        <div className="flex items-center gap-1.5">
+                          <button onClick={() => handleSubmitDraft(r.id)}
+                            className="rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-700 hover:bg-teal-100">
+                            Submit
+                          </button>
+                          <button onClick={() => handleDiscardDraft(r.id)}
+                            className="rounded-md border border-rose-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-50">
+                            Discard
+                          </button>
+                        </div>
+                      ) : canCancel ? (
                         <button onClick={() => handleCancel(r.id)}
                           className="rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
                           {r.status === 'approved' ? 'Request cancel' : 'Cancel'}

@@ -38,6 +38,7 @@ from app.models.attendance_records import (
     OvertimeRecord,
     AttendanceReport,
     PayrollAttendanceSummary,
+    WeeklyOffChangeRequest,
 )
 from app.models.audit_log import AuditLog
 from app.models.secure_upload import SecureUpload
@@ -54,6 +55,7 @@ from app.models.project import (
     Timesheet,
     TimesheetEntry,
     TimesheetPayrollSync,
+    TimesheetWorkflowStep,
 )
 
 # Onboarding domain
@@ -88,10 +90,12 @@ __all__ = [
     "AttendanceLog", "ValidationError", "AttendanceRecord",
     "AttendanceException", "RegularizationRequest", "RegularizationAttachment",
     "OvertimeRecord", "AttendanceReport", "PayrollAttendanceSummary",
+    "WeeklyOffChangeRequest",
     "AuditLog", "SecureUpload",
     "Announcement", "AnnouncementTarget", "AnnouncementRead",
     "Policy", "PolicyVersion", "PolicyCategory", "PolicyAcknowledgement",
     "Project", "Task", "Timesheet", "TimesheetEntry", "TimesheetPayrollSync",
+    "TimesheetWorkflowStep",
     "CandidateStatus", "CANDIDATE_TRANSITIONS",
     "Candidate", "CandidateDocument", "DocumentStatus",
     "BGVStatus", "BGVCheck", "BGVToken",

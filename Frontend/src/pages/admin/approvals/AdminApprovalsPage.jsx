@@ -131,7 +131,7 @@ export default function AdminApprovalsPage() {
       kind: 'regular',
       key: 'R-' + r.id,
       id: r.id,
-      name: r.employee?.full_name || r.employee_name || ('Employee #' + r.employee_id),
+      name: r.employee?.full_name || r.employee_name || 'Unknown Employee',
       primary: 'Regularization',
       secondary: `${r.regularization_type || 'attendance'} · ${fmtDate(r.date)}`,
       reason: r.reason,

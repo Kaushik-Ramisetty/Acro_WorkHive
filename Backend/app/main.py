@@ -83,6 +83,29 @@ def _run_onboarding_migrations() -> None:
         # Working-day engine — half-day boundary markers on a leave request.
         "ALTER TABLE leave_requests ADD COLUMN start_half_day VARCHAR(10)",
         "ALTER TABLE leave_requests ADD COLUMN end_half_day   VARCHAR(10)",
+        # Attendance integration — new columns on existing tables.
+        "ALTER TABLE projects ADD COLUMN billing_rate REAL",
+        # Timesheet client-approval flow columns.
+        "ALTER TABLE timesheets ADD COLUMN client_manager_id INTEGER",
+        "ALTER TABLE timesheets ADD COLUMN client_manager_name VARCHAR(200)",
+        "ALTER TABLE timesheets ADD COLUMN client_manager_email VARCHAR(255)",
+        "ALTER TABLE timesheets ADD COLUMN client_token VARCHAR(500)",
+        "ALTER TABLE timesheets ADD COLUMN client_token_expires_at DATETIME",
+        "ALTER TABLE timesheets ADD COLUMN client_email_sent_at DATETIME",
+        "ALTER TABLE timesheets ADD COLUMN client_email_status VARCHAR(50)",
+        "ALTER TABLE timesheets ADD COLUMN client_approved_at DATETIME",
+        "ALTER TABLE timesheets ADD COLUMN client_rejected_at DATETIME",
+        "ALTER TABLE timesheets ADD COLUMN client_review_comment VARCHAR(1000)",
+        "ALTER TABLE timesheets ADD COLUMN reminder_count INTEGER DEFAULT 0",
+        "ALTER TABLE timesheets ADD COLUMN has_mismatch INTEGER DEFAULT 0",
+        # Timesheet entry billability flag.
+        "ALTER TABLE timesheet_entries ADD COLUMN is_billable INTEGER DEFAULT 1",
+        # Employee T&M / timesheet type fields.
+        "ALTER TABLE employees ADD COLUMN employee_type VARCHAR(20) DEFAULT 'wfh'",
+        "ALTER TABLE employees ADD COLUMN is_tm INTEGER DEFAULT 0",
+        "ALTER TABLE employees ADD COLUMN hourly_cost_rate REAL",
+        "ALTER TABLE employees ADD COLUMN client_manager_name VARCHAR(200)",
+        "ALTER TABLE employees ADD COLUMN client_manager_email VARCHAR(255)",
     ]
     with engine.connect() as conn:
         for stmt in safe_alters:
@@ -701,6 +724,9 @@ from app.routes import search as search_routes
 from app.routes import announcements as announcements_routes
 from app.routes import policies as policies_routes
 from app.routes import secure_uploads as secure_uploads_routes
+from app.routes import billing as billing_routes
+from app.routes import hr as hr_routes
+from app.routes import utilization as utilization_routes
 
 app.include_router(auth_routes.router)
 
@@ -743,6 +769,9 @@ app.include_router(announcements_routes.router)
 app.include_router(policies_routes.router)
 app.include_router(secure_uploads_routes.router)
 app.include_router(secure_uploads_routes.admin_router)
+app.include_router(billing_routes.router)
+app.include_router(hr_routes.router)
+app.include_router(utilization_routes.router)
 
 
 # Onboarding HR routers

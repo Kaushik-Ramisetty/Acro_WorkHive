@@ -39,6 +39,10 @@ reportlab==4.1.0
 # ── Utilities ──────────────────────────────────────────────────
 python-dotenv==1.0.1
 openpyxl==3.1.5
+# IANA tz database — required by zoneinfo on Windows (Linux/Mac use system
+# tz files). Used by utils.time_utils.to_local to convert UTC punch
+# timestamps into the employee's local zone.
+tzdata==2024.2
 
 # ── Cryptography (Fernet PII encryption — Onboarding) ──────────
 # Already pulled by python-jose[cryptography], pinned here for clarity.

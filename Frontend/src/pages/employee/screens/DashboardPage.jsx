@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { formatUsdAsInr } from '../../../utils/formatCurrency';
 import { useApp } from "../AppContext";
 import { useAuth } from "../../../context/AuthContext";
@@ -6,6 +6,7 @@ import { holidays as holidaysApi } from "../../../services/holidays";
 import { leaveApi } from "../../../services/leave";
 import { regularization } from "../../../services/attendance";
 import { attendance as attendanceApi } from "../../../services/attendance";
+import RegularizeModal from "../../../components/RegularizeModal";
 
 const statCards = [
   {
@@ -81,6 +82,10 @@ const quickActions = [
   },
   {
     label: "Regularize Attendance",
+    // `local` keeps the action inside this page (opens the shared
+    // RegularizeModal) instead of routing through the app-level openModal
+    // registry or navigating to the Attendance page.
+    local: "regularize",
     icon: (
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
@@ -320,6 +325,15 @@ const DashboardPage = () => {
   const [kpiAttn, setKpiAttn] = useState(null);
   const [kpiLeave, setKpiLeave] = useState(null);
   const [kpiPending, setKpiPending] = useState(null);
+  // Regularize-attendance modal — opened from the Quick Actions tile.
+  const [regOpen, setRegOpen] = useState(false);
+  // Refetcher used both on mount and after a regularize submit so the
+  // "Pending Requests" KPI tile reflects the just-created row.
+  const refreshPendingRegs = useCallback(() => {
+    regularization.list({ status: 'pending' })
+      .then((rows) => setKpiPending(Array.isArray(rows) ? rows.length : 0))
+      .catch(() => setKpiPending(null));
+  }, []);
   useEffect(() => {
     const t = new Date();
     const y = t.getFullYear(), m = t.getMonth();
@@ -346,10 +360,8 @@ const DashboardPage = () => {
         );
       })
       .catch(() => { setKpiLeave(null); setLeaveBalanceItems([]); });
-    regularization.list({ status: 'pending' })
-      .then((rows) => setKpiPending(Array.isArray(rows) ? rows.length : 0))
-      .catch(() => setKpiPending(null));
-  }, []);
+    refreshPendingRegs();
+  }, [refreshPendingRegs]);
   // Live leave balances for the "My Leave Balance" card. Populated by the same
   // /leave/balance/me call that drives the KPI tile above.
   const [leaveBalanceItems, setLeaveBalanceItems] = useState([]);
@@ -535,6 +547,7 @@ const DashboardPage = () => {
           {quickActions.map((a) => (
             <button key={a.label}
               onClick={() => {
+                if (a.local === 'regularize') return setRegOpen(true);
                 if (a.action) return openModal(a.action);
                 if (a.navTo) return appNavigate(a.navTo);
               }}
@@ -711,6 +724,15 @@ const DashboardPage = () => {
           </div>
         </div>
       )}
+
+      {/* Regularize Attendance modal — opened from the Quick Actions tile
+          without leaving the dashboard. Reuses the same component the
+          Attendance page hosts, so styling + behaviour are identical. */}
+      <RegularizeModal
+        open={regOpen}
+        onClose={() => setRegOpen(false)}
+        onSubmitted={refreshPendingRegs}
+      />
     </div>
   );
 };

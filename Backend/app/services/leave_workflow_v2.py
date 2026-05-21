@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     Employee, LeaveAuditLog, LeaveRequest, LedgerTxn, Notification, Role,
 )
+from app.services.email_dispatcher import dispatch_for_recipient
 from app.services.leave_ledger import LedgerError, post_ledger_entry, adjust_pending
 from app.services.leave_state_machine import (
     InvalidTransition, LeaveStatus, transition,
@@ -103,6 +104,12 @@ def _notify(db: Session, *, recipient_id: int, type_: str, title: str,
         reference_table="leave_requests",
         reference_id=leave_request_id,
     ))
+    # Best-effort email — mirrors leave_engine._notify so v2 approvals
+    # produce the same outbound mail as v1 apply/reject paths. Never raises.
+    try:
+        dispatch_for_recipient(db, recipient_id, title, body)
+    except Exception:
+        logger.exception("email dispatch failed for recipient=%s", recipient_id)
 
 
 def _hr_user_ids(db: Session) -> list[int]:

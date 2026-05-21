@@ -505,12 +505,17 @@ def approve_leave(db: Session, actor: Employee, req: LeaveRequest) -> LeaveReque
     if not _can_approve_at_stage(actor, req, stage, db):
         raise LeaveEngineError(403, "You are not authorized to approve this leave.")
 
-    # Delegate to v2.
+    # Delegate to v2. approve_hybrid() documents that commit() is the
+    # caller's responsibility — without these two lines every manager
+    # approval is silently rolled back at request end.
     from app.services.leave_workflow_v2 import approve_hybrid, WorkflowError
     try:
-        return approve_hybrid(db, actor, req)
+        result = approve_hybrid(db, actor, req)
     except WorkflowError as exc:
         raise LeaveEngineError(exc.status_code, exc.detail)
+    db.commit()
+    db.refresh(result)
+    return result
     # NOTE: the v1 body below is intentionally kept disabled so a quick
     # `git revert` of THIS edit returns the system to the prior behavior
     # without touching any callers.

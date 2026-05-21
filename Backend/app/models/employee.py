@@ -67,6 +67,15 @@ class Employee(Base):
     experience_years: Mapped[int | None] = mapped_column(Integer, nullable=True)
     certifications: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # T&M / timesheet fields
+    employee_type: Mapped[str | None] = mapped_column(String(20), default="wfh", nullable=True)  # wfh / wfo / client_site
+    is_tm: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    hourly_cost_rate: Mapped[float | None] = mapped_column(nullable=True)
+
+    # Client-manager contact (used when submitting T&M monthly reports)
+    client_manager_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    client_manager_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     # Onboarding workflow fields
     official_email: Mapped[str | None] = mapped_column(String(150), nullable=True, index=True)
     is_activated: Mapped[bool]         = mapped_column(Boolean, default=False, nullable=False)

@@ -113,7 +113,7 @@ export default function RegularizationApprovalsPage() {
           <div onClick={(e) => e.stopPropagation()} className="bg-white w-[480px] rounded-xl shadow-xl p-5">
             <h3 className="text-sm font-bold text-slate-800 mb-2">Review {reviewing.id}</h3>
             <div className="text-xs space-y-1.5 text-slate-600 mb-3">
-              <div><strong>Employee:</strong> #{reviewing.employee_id}</div>
+              <div><strong>Employee:</strong> {reviewing.employee_name || 'Unknown Employee'}</div>
               <div><strong>Date:</strong> {reviewing.date}</div>
               <div><strong>Type:</strong> {reviewing.regularization_type}</div>
               <div><strong>Requested check-in:</strong> {reviewing.requested_check_in?.slice(0,5) || "-"}</div>

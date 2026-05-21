@@ -22,11 +22,11 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
   const [submitting, setSubmitting] = useState(false);
   const [serverError, setServerError] = useState('');
 
-  // Re-seed when the modal opens / initial changes
   useEffect(() => {
     if (!open) return;
     setServerError('');
     setErrors({});
+
     if (mode === 'edit' && initial) {
       setForm({
         name: initial.full_name || '',
@@ -40,30 +40,41 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
         reporting_manager_id: initial.reporting_manager_id ?? '',
         password: '',
       });
-    } else {
-      setForm({
-        name: '', email: '', role: 'employee',
-        department_id: '', designation_id: '',
-        password: '', phone: '', employee_code: '',
-        location: '', reporting_manager_id: '',
-      });
+      return;
     }
+
+    setForm({
+      name: '',
+      email: '',
+      role: 'employee',
+      department_id: '',
+      designation_id: '',
+      password: '',
+      phone: '',
+      employee_code: '',
+      location: '',
+      reporting_manager_id: '',
+    });
   }, [open, mode, initial]);
 
   if (!open) return null;
 
-  const update = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const update = (key) => (e) => setForm((prev) => ({ ...prev, [key]: e.target.value }));
 
   function validate() {
     const next = {};
     if (!form.name.trim()) next.name = 'Name is required.';
+
     if (mode === 'create') {
       if (!form.email.trim()) next.email = 'Email is required.';
       else if (!/^\S+@\S+\.\S+$/.test(form.email.trim())) next.email = 'Enter a valid email.';
+
       if (!form.password) next.password = 'Temporary password is required.';
       else if (form.password.length < 4) next.password = 'Password is too short.';
     }
+
     if (!ROLES.includes(form.role)) next.role = 'Pick a role.';
+
     setErrors(next);
     return Object.keys(next).length === 0;
   }
@@ -71,10 +82,11 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
   async function handleSubmit(e) {
     e.preventDefault();
     if (!validate()) return;
+
     setSubmitting(true);
     setServerError('');
+
     try {
-      // For edit, only send the fields the API accepts on PUT.
       const payload = mode === 'edit'
         ? {
             name: form.name,
@@ -84,8 +96,7 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
             phone: form.phone || null,
             employee_code: form.employee_code || null,
             location: form.location || null,
-            // Empty string → null (detach). The backend interprets null as
-            // "remove the reporting manager."
+            // Empty string maps to null so the backend removes the reporting manager.
             reporting_manager_id:
               form.reporting_manager_id === '' ? null : Number(form.reporting_manager_id),
           }
@@ -99,6 +110,7 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
             phone: form.phone || null,
             employee_code: form.employee_code || null,
           };
+
       await onSubmit(payload);
     } catch (err) {
       setServerError(err?.data?.detail || err?.message || 'Something went wrong.');
@@ -114,11 +126,20 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
           <div>
             <h3 className="text-lg font-bold text-slate-900">{mode === 'edit' ? 'Edit Employee' : 'Add Employee'}</h3>
             <p className="text-xs text-slate-500">
-              {mode === 'edit' ? 'Update role, department, designation, or contact details.' : 'Create a new employee account. They can sign in with the temporary password.'}
+              {mode === 'edit'
+                ? 'Update role, department, designation, or contact details.'
+                : 'Create a new employee account. They can sign in with the temporary password.'}
             </p>
           </div>
-          <button onClick={onCancel} className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700" aria-label="Close">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+          <button
+            onClick={onCancel}
+            className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+            aria-label="Close"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
           </button>
         </div>
 
@@ -136,7 +157,10 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
           <div>
             <label className="block text-xs font-semibold text-slate-700">Email<span className="ml-0.5 text-red-500">*</span></label>
             <input
-              type="email" className={FIELD_BASE} value={form.email} onChange={update('email')}
+              type="email"
+              className={FIELD_BASE}
+              value={form.email}
+              onChange={update('email')}
               placeholder="jane.doe@acronotics.com"
               disabled={mode === 'edit'}
             />
@@ -147,7 +171,7 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
           <div>
             <label className="block text-xs font-semibold text-slate-700">Role<span className="ml-0.5 text-red-500">*</span></label>
             <select className={FIELD_BASE} value={form.role} onChange={update('role')}>
-              {ROLES.map((r) => <option key={r} value={r}>{r[0].toUpperCase() + r.slice(1)}</option>)}
+              {ROLES.map((role) => <option key={role} value={role}>{role[0].toUpperCase() + role.slice(1)}</option>)}
             </select>
             {errors.role && <p className="mt-1 text-xs text-red-600">{errors.role}</p>}
           </div>
@@ -155,16 +179,20 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
           <div>
             <label className="block text-xs font-semibold text-slate-700">Department</label>
             <select className={FIELD_BASE} value={form.department_id} onChange={update('department_id')}>
-              <option value="">— Select department —</option>
-              {(reference?.departments || []).map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              <option value="">- Select department -</option>
+              {(reference?.departments || []).map((department) => (
+                <option key={department.id} value={department.id}>{department.name}</option>
+              ))}
             </select>
           </div>
 
           <div>
             <label className="block text-xs font-semibold text-slate-700">Designation</label>
             <select className={FIELD_BASE} value={form.designation_id} onChange={update('designation_id')}>
-              <option value="">— Select designation —</option>
-              {(reference?.designations || []).map((d) => <option key={d.id} value={d.id}>{d.title}</option>)}
+              <option value="">- Select designation -</option>
+              {(reference?.designations || []).map((designation) => (
+                <option key={designation.id} value={designation.id}>{designation.title}</option>
+              ))}
             </select>
           </div>
 
@@ -189,8 +217,6 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
                   onChange={update('location')}
                   placeholder="e.g. Bangalore, Pune"
                 />
-                {/* Hint list — admins can still type any value (e.g. a new
-                    office) but the common ones are one click away. */}
                 <datalist id="employee-location-options">
                   <option value="Bangalore" />
                   <option value="Pune" />
@@ -207,15 +233,11 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
                   value={form.reporting_manager_id}
                   onChange={update('reporting_manager_id')}
                 >
-                  <option value="">— No reporting manager —</option>
+                  <option value="">- No reporting manager -</option>
                   {(reference?.managers || [])
-                    .filter((m) => !initial || m.id !== initial.id /* avoid self-report */)
-                    .map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.full_name}
-                        {m.designation ? ` — ${m.designation}` : ''}
-                        {m.role ? ` (${m.role})` : ''}
-                      </option>
+                    .filter((manager) => !initial || manager.id !== initial.id)
+                    .map((manager) => (
+                      <option key={manager.id} value={manager.id}>{manager.full_name}</option>
                     ))}
                 </select>
                 {initial?.reporting_manager_name && (
@@ -238,16 +260,19 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
 
           <div className="sm:col-span-2 mt-2 flex justify-end gap-2 border-t border-slate-100 pt-4">
             <button
-              type="button" onClick={onCancel} disabled={submitting}
+              type="button"
+              onClick={onCancel}
+              disabled={submitting}
               className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
             >
               Cancel
             </button>
             <button
-              type="submit" disabled={submitting}
+              type="submit"
+              disabled={submitting}
               className="rounded-lg bg-[#1e3acb] px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-[#1a31b3] disabled:opacity-60"
             >
-              {submitting ? 'Saving…' : mode === 'edit' ? 'Save Changes' : 'Create Employee'}
+              {submitting ? 'Saving...' : mode === 'edit' ? 'Save Changes' : 'Create Employee'}
             </button>
           </div>
         </form>

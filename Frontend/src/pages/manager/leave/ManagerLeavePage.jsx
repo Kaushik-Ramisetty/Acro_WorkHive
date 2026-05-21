@@ -67,7 +67,18 @@ export default function ManagerLeavePage() {
     catch (e) { alert(e?.data?.detail || 'Failed'); }
   };
 
-  const C = { primary: '#10B981', yellow: '#F59E0B', red: '#EF4444', blue: '#1D4ED8', muted: '#64748B', border: '#E2E8F0', light: '#F1F5F9' };
+  const C = {
+    primary: '#10B981',
+    yellow: '#F59E0B',
+    red: '#EF4444',
+    blue: '#1D4ED8',
+    text: 'var(--hrms-text)',
+    text2: 'var(--hrms-text-2)',
+    muted: 'var(--hrms-text-muted)',
+    border: 'var(--hrms-border)',
+    light: 'var(--hrms-surface-2)',
+    surface: 'var(--hrms-surface)',
+  };
 
   const selectedFull = selected ? requests.find((x) => x.id === selected.id) || selected : null;
   const capabilities = selectedFull ? {
@@ -79,7 +90,7 @@ export default function ManagerLeavePage() {
 
   // Tab strip rendered above whichever section is active.
   const SectionTabs = (
-    <div style={{ display: 'flex', gap: 8, marginBottom: 18, borderBottom: '1px solid #E5E7EB', paddingBottom: 8 }}>
+    <div style={{ display: 'flex', gap: 8, marginBottom: 18, borderBottom: `1px solid ${C.border}`, paddingBottom: 8 }}>
       {[
         { id: 'leave',   label: 'Leave Requests' },
         { id: 'apply',   label: 'Apply Leave' },
@@ -94,7 +105,7 @@ export default function ManagerLeavePage() {
             style={{
               padding: '6px 14px', borderRadius: 8, border: 'none',
               background: active ? '#1e3acb' : 'transparent',
-              color: active ? '#fff' : '#64748B',
+              color: active ? '#fff' : C.text2,
               fontSize: 12, fontWeight: 600, cursor: 'pointer',
               fontFamily: "'DM Sans', sans-serif",
             }}
@@ -129,7 +140,7 @@ export default function ManagerLeavePage() {
       {SectionTabs}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: '#0F172A' }}>Leave Requests</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text }}>Leave Requests</h1>
           <p style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>Manage team leave applications</p>
         </div>
         {/* Apply Leave moved to its own sub-section tab; WFH lives on the
@@ -144,7 +155,7 @@ export default function ManagerLeavePage() {
           ['Approved', counts.approved, C.primary],
           ['Rejected', counts.rejected, C.red],
         ].map(([l, v, c]) => (
-          <div key={l} style={{ flex: 1, background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
+          <div key={l} style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: c }}>{v}</div>
             <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{l}</div>
           </div>
@@ -157,7 +168,7 @@ export default function ManagerLeavePage() {
         </div>
       )}
 
-      <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
         <div style={{ display: 'flex', gap: 4, padding: '14px 18px', borderBottom: `1px solid ${C.border}` }}>
           {['all', 'pending', 'approved', 'rejected'].map((t) => (
             <button key={t} onClick={() => setTab(t)}
@@ -196,14 +207,14 @@ export default function ManagerLeavePage() {
                       {(r.employee_name || 'U').split(' ').filter(Boolean).map((s) => s[0]).slice(0, 2).join('').toUpperCase()}
                     </div>
                     <div>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: '#0F172A' }}>{r.employee_name}</div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{r.employee_name}</div>
                       {r.employee_code && <div style={{ fontSize: 10, color: C.muted }}>{r.employee_code}</div>}
                     </div>
                   </div>
                 </td>
-                <td style={{ padding: '12px 14px', fontSize: 12 }}>{r.leave_type_name}</td>
+                <td style={{ padding: '12px 14px', fontSize: 12, color: C.text }}>{r.leave_type_name}</td>
                 <td style={{ padding: '12px 14px', fontSize: 12, color: C.muted }}>{fmt(r.start_date)} → {fmt(r.end_date)}</td>
-                <td style={{ padding: '12px 14px', fontSize: 12, fontWeight: 700 }}>{r.total_days}d</td>
+                <td style={{ padding: '12px 14px', fontSize: 12, fontWeight: 700, color: C.text }}>{r.total_days}d</td>
                 <td style={{ padding: '12px 14px', fontSize: 12, color: C.muted, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.reason || '—'}</td>
                 <td style={{ padding: '12px 14px' }}><StatusBadge status={r.status} /></td>
                 <td style={{ padding: '12px 14px' }} onClick={(e) => e.stopPropagation()}>

@@ -189,6 +189,8 @@ html.dark .text-slate-700          { color: var(--hrms-text-2) !important; }
 html.dark .text-slate-600          { color: var(--hrms-text-2) !important; }
 html.dark .text-slate-500          { color: var(--hrms-text-muted) !important; }
 html.dark .text-slate-400          { color: var(--hrms-text-faint) !important; }
+html.dark .text-slate-300          { color: var(--hrms-text-faint) !important; }
+html.dark .text-slate-200          { color: var(--hrms-text-faint) !important; }
 html.dark .text-gray-900           { color: var(--hrms-text) !important; }
 html.dark .text-gray-800           { color: var(--hrms-text) !important; }
 html.dark .text-gray-700           { color: var(--hrms-text-2) !important; }
@@ -198,9 +200,13 @@ html.dark .text-gray-400           { color: var(--hrms-text-faint) !important; }
 html.dark .text-neutral-900        { color: var(--hrms-text) !important; }
 html.dark .text-neutral-800        { color: var(--hrms-text) !important; }
 html.dark .text-neutral-700        { color: var(--hrms-text-2) !important; }
+html.dark .text-neutral-600        { color: var(--hrms-text-2) !important; }
+html.dark .text-neutral-500        { color: var(--hrms-text-muted) !important; }
 html.dark .text-black              { color: var(--hrms-text) !important; }
 html.dark .text-zinc-900           { color: var(--hrms-text) !important; }
 html.dark .text-zinc-700           { color: var(--hrms-text-2) !important; }
+html.dark .text-zinc-600           { color: var(--hrms-text-2) !important; }
+html.dark .text-zinc-500           { color: var(--hrms-text-muted) !important; }
 
 /* Keep white-on-colored-button text white */
 

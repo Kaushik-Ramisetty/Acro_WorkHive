@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAuth, DEMO_ACCOUNTS } from '../context/AuthContext';
+import { useAuth } from '../context/AuthContext';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -48,14 +48,6 @@ export default function LoginForm({ onSuccess }) {
     } finally {
       setSubmitting(false);
     }
-  }
-
-  function fillDemo(role) {
-    const u = DEMO_ACCOUNTS.find((x) => x.role === role);
-    if (!u) return;
-    setEmail(u.email);
-    setPassword(u.password);
-    setErrors({ email: '', password: '', form: '' });
   }
 
   return (
@@ -127,7 +119,7 @@ export default function LoginForm({ onSuccess }) {
           </button>
         </form>
 
-        <div className="mt-7 border-t border-slate-100 pt-4">
+        {/* <div className="mt-7 border-t border-slate-100 pt-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold">Quick demo</p>
           <div className="mt-2 flex flex-wrap gap-2">
             {DEMO_ACCOUNTS.map((u) => (
@@ -141,7 +133,7 @@ export default function LoginForm({ onSuccess }) {
               </button>
             ))}
           </div>
-        </div>
+        </div> */}
       </div>
 
       <p className="mt-6 text-center text-[11px] text-slate-400">

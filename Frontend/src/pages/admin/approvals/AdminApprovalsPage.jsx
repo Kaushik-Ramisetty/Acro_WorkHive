@@ -16,9 +16,11 @@ const C = {
   red:     '#EF4444',
   blue:    '#1D4ED8',
   violet:  '#8B5CF6',
+  text:    'var(--hrms-text)',
   muted:   'var(--hrms-text-muted)',
   border:  'var(--hrms-border)',
   light:   'var(--hrms-surface-2)',
+  surface: 'var(--hrms-surface)',
 };
 
 function Av({ init, size = 42 }) {
@@ -176,7 +178,7 @@ export default function AdminApprovalsPage() {
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: '#0F172A' }}>Approvals</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text }}>Approvals</h1>
           <p style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>HR-stage queue: leave, cancellations, comp-off, and regularizations awaiting your decision.</p>
         </div>
       </div>
@@ -238,7 +240,7 @@ export default function AdminApprovalsPage() {
             <div key={it.key} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 0', borderBottom: `1px solid ${C.border}` }}>
               <Av init={initialsOf(it.name)} size={42} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 14, color: '#0F172A' }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: C.text }}>
                   {it.name}
                   {isCancel && <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: C.red, background: '#FEE2E2', padding: '2px 6px', borderRadius: 4 }}>CANCELLATION</span>}
                   {it.kind === 'compoff' && <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: '#6D28D9', background: '#EDE9FE', padding: '2px 6px', borderRadius: 4 }}>COMP-OFF</span>}

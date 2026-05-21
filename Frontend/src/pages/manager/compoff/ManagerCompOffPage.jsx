@@ -4,7 +4,9 @@ import { leaveApi } from '../../../services/leave';
 
 const C = {
   primary: '#10B981', yellow: '#F59E0B', red: '#EF4444', blue: '#1D4ED8',
-  muted: '#64748B', border: '#E2E8F0', light: '#F1F5F9',
+  text: 'var(--hrms-text)', text2: 'var(--hrms-text-2)',
+  muted: 'var(--hrms-text-muted)', border: 'var(--hrms-border)',
+  light: 'var(--hrms-surface-2)', surface: 'var(--hrms-surface)',
 };
 
 function Av({ init, size = 42 }) {
@@ -86,11 +88,11 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
       <form
         onSubmit={submit}
         onClick={(e) => e.stopPropagation()}
-        style={{ background:'#fff', borderRadius:16, width:'100%', maxWidth:520, margin:'0 16px', boxShadow:'0 20px 50px rgba(15,23,42,0.25)', overflow:'hidden' }}
+        style={{ background:C.surface, borderRadius:16, width:'100%', maxWidth:520, margin:'0 16px', boxShadow:'0 20px 50px rgba(15,23,42,0.25)', overflow:'hidden' }}
       >
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'18px 22px', borderBottom:`1px solid ${C.border}` }}>
           <div>
-            <h2 style={{ margin:0, fontSize:16, fontWeight:700, color:'#0F172A' }}>Request Comp-Off</h2>
+            <h2 style={{ margin:0, fontSize:16, fontWeight:700, color:C.text }}>Request Comp-Off</h2>
             <p style={{ margin:'4px 0 0', fontSize:12, color:C.muted }}>For days you worked on a holiday or weekend.</p>
           </div>
           <button type="button" onClick={onClose} style={{ width:32, height:32, borderRadius:'50%', background:C.light, border:'none', cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -112,7 +114,7 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
               <input
                 type="date" required max={today}
                 value={form.worked_on} onChange={(e) => set({ worked_on: e.target.value })}
-                style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none' }}
+                style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none', background:C.surface, color:C.text }}
               />
             </div>
             <div>
@@ -120,7 +122,7 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
               <input
                 type="number" required min="1" max="5"
                 value={form.days} onChange={(e) => set({ days: e.target.value })}
-                style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none' }}
+                style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none', background:C.surface, color:C.text }}
               />
             </div>
           </div>
@@ -131,7 +133,7 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
               required rows={3}
               value={form.reason} onChange={(e) => set({ reason: e.target.value })}
               placeholder="Why you're requesting comp-off (e.g. Worked on the Diwali holiday)…"
-              style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none', resize:'vertical' }}
+              style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none', resize:'vertical', background:C.surface, color:C.text }}
             />
           </div>
 
@@ -141,7 +143,7 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
               type="url"
               value={form.proof_url} onChange={(e) => set({ proof_url: e.target.value })}
               placeholder="https://… (link to commit, jira ticket, anything)"
-              style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none' }}
+              style={{ width:'100%', padding:'9px 12px', border:`1px solid ${C.border}`, borderRadius:8, fontSize:13, outline:'none', background:C.surface, color:C.text }}
             />
           </div>
 
@@ -151,7 +153,7 @@ function RequestCompOffModal({ open, onClose, onSubmit }) {
         <div style={{ display:'flex', gap:10, padding:'14px 22px', borderTop:`1px solid ${C.border}` }}>
           <button
             type="button" onClick={onClose} disabled={busy}
-            style={{ flex:1, padding:'10px 0', borderRadius:8, border:`1px solid ${C.border}`, background:'#fff', color:C.muted, fontSize:13, fontWeight:600, cursor:'pointer', opacity:busy?0.6:1 }}
+            style={{ flex:1, padding:'10px 0', borderRadius:8, border:`1px solid ${C.border}`, background:C.surface, color:C.text2, fontSize:13, fontWeight:600, cursor:'pointer', opacity:busy?0.6:1 }}
           >Cancel</button>
           <button
             type="submit" disabled={busy}
@@ -224,7 +226,7 @@ export default function ManagerCompOffPage() {
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, gap: 14, flexWrap: 'wrap' }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: '#0F172A' }}>Comp-Off</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text }}>Comp-Off</h1>
           <p style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>Review your team's comp-off requests, or submit your own.</p>
         </div>
         <button
@@ -265,14 +267,14 @@ export default function ManagerCompOffPage() {
           ['Approved',      counts.approved,   C.primary],
           ['Rejected',      counts.rejected,   C.red],
         ].map(([l, v, c]) => (
-          <div key={l} style={{ flex: 1, background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
+          <div key={l} style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: c }}>{v}</div>
             <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{l}</div>
           </div>
         ))}
       </div>
 
-      <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
         <div style={{ display: 'flex', gap: 4, marginBottom: 18, borderBottom: `1px solid ${C.border}`, paddingBottom: 10 }}>
           {['pending', 'all'].map((t) => (
             <button key={t} onClick={() => setTab(t)}
@@ -301,7 +303,7 @@ export default function ManagerCompOffPage() {
             <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 0', borderBottom: `1px solid ${C.border}` }}>
               <Av init={initials} size={42} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 14, color: '#0F172A' }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: C.text }}>
                   {c.employee_name}
                   <span style={{
                     marginLeft: 8, fontSize: 10, fontWeight: 700, padding: '2px 8px',

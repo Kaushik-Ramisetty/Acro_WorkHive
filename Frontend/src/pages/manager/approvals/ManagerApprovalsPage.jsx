@@ -5,7 +5,9 @@ import { regularization } from '../../../services/attendance';
 
 const C = {
   primary: '#10B981', yellow: '#F59E0B', red: '#EF4444', blue: '#1D4ED8',
-  muted: '#64748B', border: '#E2E8F0', light: '#F1F5F9',
+  text: 'var(--hrms-text)', text2: 'var(--hrms-text-2)',
+  muted: 'var(--hrms-text-muted)', border: 'var(--hrms-border)',
+  light: 'var(--hrms-surface-2)', surface: 'var(--hrms-surface)',
 };
 
 function Av({ init, size = 42 }) {
@@ -167,7 +169,7 @@ export default function ManagerApprovalsPage() {
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: '#0F172A' }}>Approvals</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text }}>Approvals</h1>
           <p style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>Pending leave, cancellation, comp-off, and regularization requests from your team.</p>
         </div>
       </div>
@@ -195,14 +197,14 @@ export default function ManagerApprovalsPage() {
           ['Comp-Off',       counts.compoff,  '#8B5CF6'],
           ['Regularization', counts.regular,  C.primary],
         ].map(([l, v, c]) => (
-          <div key={l} style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
+          <div key={l} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, textAlign: 'center' }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: c }}>{v}</div>
             <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{l}</div>
           </div>
         ))}
       </div>
 
-      <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
         <div style={{ display: 'flex', gap: 4, marginBottom: 18, borderBottom: `1px solid ${C.border}`, paddingBottom: 10, flexWrap: 'wrap' }}>
           {TABS.map((t) => {
             const count = t.key === 'all' ? allCount : counts[t.key];
@@ -232,7 +234,7 @@ export default function ManagerApprovalsPage() {
             <div key={it.key} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 0', borderBottom: `1px solid ${C.border}` }}>
               <Av init={initialsOf(it.name)} size={42} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 14, color: '#0F172A' }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: C.text }}>
                   {it.name}
                   {isCancel && <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: C.red, background: '#FEE2E2', padding: '2px 6px', borderRadius: 4 }}>CANCELLATION</span>}
                   {it.kind === 'compoff'  && <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: '#6D28D9', background: '#EDE9FE', padding: '2px 6px', borderRadius: 4 }}>COMP-OFF</span>}

@@ -396,7 +396,7 @@ export default function AdminHome() {
                 }}>
                   {a.icon}
                 </span>
-                <span style={{ fontSize: 13, fontWeight: 600, color: '#0F172A' }}>{a.label}</span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>{a.label}</span>
               </button>
             ))}
           </div>
@@ -414,13 +414,13 @@ export default function AdminHome() {
             <button
               type="button"
               onClick={() => goto('approvals')}
-              style={{ background: 'none', border: 'none', color: '#3B5BDB', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+              style={{ background: 'none', border: 'none', color: 'var(--blue-bright)', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
             >
               View All →
             </button>
           </div>
           {quickApprovals.length === 0 && (
-            <p style={{ color: '#94A3B8', fontSize: 13, padding: '8px 4px', margin: 0 }}>
+            <p style={{ color: 'var(--text-muted)', fontSize: 13, padding: '8px 4px', margin: 0 }}>
               Nothing waiting on you right now.
             </p>
           )}
@@ -433,7 +433,7 @@ export default function AdminHome() {
                           it.kind === 'regular' ? '#047857' : '#1E40AF';
             return (
               <div key={it.key}
-                style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderTop: '1px solid #E5E7EB' }}>
+                style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderTop: '1px solid var(--border)' }}>
                 <div style={{
                   width: 36, height: 36, borderRadius: '50%',
                   background: 'linear-gradient(135deg,#3B82F6,#6366F1)', color: '#fff',
@@ -441,13 +441,13 @@ export default function AdminHome() {
                   fontSize: 11, fontWeight: 700, flexShrink: 0,
                 }}>{initialsOf(it.name)}</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#0F172A' }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
                     {it.name}
                     <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: tagBg, color: tagFg }}>
                       {it.type}
                     </span>
                   </div>
-                  <div style={{ fontSize: 11, color: '#64748B', marginTop: 2 }}>{it.detail}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>{it.detail}</div>
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button
@@ -482,7 +482,7 @@ export default function AdminHome() {
             </div>
             <div className="dash-job-list">
               {upcomingHolidays.length === 0 && (
-                <p style={{ color: '#94A3B8', fontSize: 13, padding: '8px 4px' }}>No upcoming holidays in the next 12 months.</p>
+                <p style={{ color: 'var(--text-muted)', fontSize: 13, padding: '8px 4px' }}>No upcoming holidays in the next 12 months.</p>
               )}
               {upcomingHolidays.map((h) => {
                 const d = new Date(h.date);

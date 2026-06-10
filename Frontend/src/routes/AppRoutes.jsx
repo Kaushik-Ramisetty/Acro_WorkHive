@@ -21,6 +21,10 @@ import CandidateDashboard from '../pages/candidate/CandidateDashboard';
 import VendorBGVReview from '../pages/vendor/VendorBGVReview';
 import ChangePasswordPage from '../pages/employee/ChangePasswordPage';
 
+// Finance and Finance Head are employees with additional payroll permissions.
+// All three roles share /employee-dashboard — payroll pages are role-gated.
+const EMPLOYEE_DASHBOARD_ROLES = ['employee', 'finance', 'finance_head'];
+
 function RootRedirect() {
   const { isAuthenticated, role } = useAuth();
   return <Navigate to={isAuthenticated ? dashboardPathForRole(role) : '/login'} replace />;
@@ -52,7 +56,21 @@ export default function AppRoutes() {
           <Route path="comp-off"       element={<Admin.CompOff />} />
           <Route path="regularization" element={<Admin.Regularization />} />
           <Route path="approvals"      element={<Admin.Approvals />} />
-          <Route path="payroll"        element={<Admin.Payroll />} />
+          {/* Payroll — nested sub-routes (Finance payroll suite) */}
+          <Route path="payroll">
+            <Route index                       element={<Finance.PayrollHome />} />
+            <Route path="payroll-runs"         element={<Finance.PayrollRunManagement />} />
+            <Route path="summary"              element={<Finance.PayrollSummary />} />
+            <Route path="review"               element={<Finance.FinanceReview />} />
+            <Route path="errors"               element={<Finance.PayrollErrors />} />
+            <Route path="approval"             element={<Finance.FinalApproval />} />
+            <Route path="payslips"             element={<Finance.PayslipBankAdvice />} />
+            <Route path="analytics"            element={<Finance.PayrollAnalytics />} />
+            <Route path="salary-structures"    element={<Finance.SalaryStructures />} />
+            <Route path="salary-revisions"     element={<Finance.SalaryRevisionHistory />} />
+            <Route path="reimbursements"       element={<Finance.Reimbursements />} />
+            <Route path="ff"                   element={<Finance.FinalSettlement />} />
+          </Route>
           <Route path="performance"    element={<Admin.Performance />} />
           <Route path="recruitment"    element={<Admin.Recruitment />} />
           <Route path="onboarding"     element={<Admin.Onboarding />} />
@@ -75,11 +93,11 @@ export default function AppRoutes() {
           }
         />
 
-        {/* Employee — full ZIP shell, drives sub-routes internally */}
+        {/* Employee — also used by Finance and Finance Head for payroll access */}
         <Route
           path="/employee-dashboard/*"
           element={
-            <ProtectedRoute allowedRoles={['employee']}>
+            <ProtectedRoute allowedRoles={EMPLOYEE_DASHBOARD_ROLES}>
               <EmployeeDashboard />
             </ProtectedRoute>
           }

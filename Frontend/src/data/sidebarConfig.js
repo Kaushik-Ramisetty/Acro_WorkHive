@@ -65,24 +65,37 @@ export const SIDEBAR_CONFIG = {
     ],
   },
   finance: {
-    base: '/finance-dashboard',
+    base: '/employee-dashboard',
     title: 'Acronotics WorkHive',
     subtitle: 'Human Intelligence In Action',
     items: [
       { label: 'Dashboard',       icon: 'dashboard',  path: '' },
-      { label: 'Client Billing',  icon: 'money',      path: 'billing' },
-      { label: 'Utilization',     icon: 'chart',      path: 'utilization' },
-      { label: 'Project Costing', icon: 'briefcase',  path: 'project-costing' },
+      { label: 'My Profile',      icon: 'user',       path: 'profile' },
+      { label: 'Attendance',      icon: 'calendar',   path: 'attendance' },
+      { label: 'Leave',           icon: 'leave',      path: 'leave' },
       { label: 'Payroll',         icon: 'money',      path: 'payroll' },
-      { label: 'Reports',         icon: 'doc',        path: 'reports' },
-      { label: 'Exports',         icon: 'doc',        path: 'exports' },
+      { label: 'Finance Payroll', icon: 'money',      path: 'finance-payroll' },
+    ],
+  },
+  finance_head: {
+    base: '/employee-dashboard',
+    title: 'Acronotics WorkHive',
+    subtitle: 'Human Intelligence In Action',
+    items: [
+      { label: 'Dashboard',            icon: 'dashboard',  path: '' },
+      { label: 'My Profile',           icon: 'user',       path: 'profile' },
+      { label: 'Attendance',           icon: 'calendar',   path: 'attendance' },
+      { label: 'Leave',                icon: 'leave',      path: 'leave' },
+      { label: 'Payroll',              icon: 'money',      path: 'payroll' },
+      { label: 'Finance Head Payroll', icon: 'money',      path: 'finance-head-payroll' },
     ],
   },
 };
 
 export const ROLE_LABEL = {
-  admin: 'Admin',
-  manager: 'Manager',
-  employee: 'Employee',
-  finance: 'Finance',
+  admin:        'Admin',
+  manager:      'Manager',
+  employee:     'Employee',
+  finance:      'Finance',
+  finance_head: 'Finance Head',
 };

@@ -74,6 +74,38 @@ from app.models.onboarding import (
     User,
 )
 
+# Finance / Payroll domain
+from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
+from app.models.salary_revision import SalaryRevisionLog
+from app.models.salary_hike_request import SalaryHikeRequest
+from app.models.payroll import (
+    SalaryStructure,
+    PayrollRun,
+    PayrollRunEmployee,
+    PayrollApproval,
+    PayrollError,
+    PayrollLockHistory,
+)
+from app.models.payroll_extended import (
+    StatutorySettings,
+    PayrollAdjustment,
+    EmployeeTaxDeclaration,
+    Payslip,
+    PayrollAuditLog,
+    FinalSettlement,
+    SalaryComponent,
+    EmployeeSalary,
+    TaxDeduction,
+    StatutoryDeduction,
+    EmployeeSalaryAssignment,
+    Reimbursement,
+    PayslipDownloadAudit,
+    TdsAnnualSummary,
+    TdsMonthlyBreakup,
+    PayrollVarianceLog,
+    DeclarationAuditLog,
+)
+
 
 __all__ = [
     "Role", "Department", "Designation", "Employee",
@@ -101,4 +133,15 @@ __all__ = [
     "BGVStatus", "BGVCheck", "BGVToken",
     "OnboardedEmployeeStatus", "OnboardedEmployee",
     "UserRole", "User",
+    # Payroll
+    "MonthlyAttendanceSummary",
+    "SalaryRevisionLog", "SalaryHikeRequest",
+    "SalaryStructure", "PayrollRun", "PayrollRunEmployee",
+    "PayrollApproval", "PayrollError", "PayrollLockHistory",
+    "StatutorySettings", "PayrollAdjustment", "EmployeeTaxDeclaration",
+    "Payslip", "PayrollAuditLog", "FinalSettlement",
+    "SalaryComponent", "EmployeeSalary", "TaxDeduction",
+    "StatutoryDeduction", "EmployeeSalaryAssignment", "Reimbursement",
+    "PayslipDownloadAudit", "TdsAnnualSummary", "TdsMonthlyBreakup",
+    "PayrollVarianceLog", "DeclarationAuditLog",
 ]

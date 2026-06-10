@@ -150,14 +150,17 @@ export function dashboardPathForRole(role) {
   switch (r) {
     case 'admin':     return '/admin-dashboard';
     case 'manager':   return '/manager-dashboard';
-    case 'employee':  return '/employee-dashboard';
+    case 'employee':      return '/employee-dashboard';
     // Candidate portal route was added during the Onboarding-module merge.
-    case 'candidate': return '/candidate-dashboard';
-    case 'finance':   return '/finance-dashboard';
+    case 'candidate':     return '/candidate-dashboard';
+    // Finance and Finance Head are employees with additional payroll permissions.
+    // They log into the employee dashboard — payroll sections are gated by role.
+    case 'finance':       return '/employee-dashboard';
+    case 'finance_head':  return '/employee-dashboard';
     // Fallback: a user with no role (e.g. an older converted employee whose
     // role_id was never set) should still land on the employee dashboard
     // rather than bouncing back to /login. The backend now self-heals this
     // on login, but the FE default keeps already-issued sessions usable.
-    default:          return '/employee-dashboard';
+    default:              return '/employee-dashboard';
   }
 }

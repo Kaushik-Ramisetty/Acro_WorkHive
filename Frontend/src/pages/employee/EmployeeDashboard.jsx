@@ -26,6 +26,11 @@ import PoliciesPage from "../admin/policies/PoliciesPage";
 import SelfServicePage from "../shared/SelfServicePage";
 import NotificationsPage from "../shared/NotificationsPage";
 
+// Finance payroll pages — imported lazily to avoid loading for non-finance users.
+// These are only rendered when role === 'finance' or 'finance_head'.
+import PayrollHome    from "../finance/PayrollHome";
+import FinanceHeadHome from "../finance/FinanceHeadHome";
+
 // Context so Topbar's hamburger button can open the mobile sidebar.
 export const SidebarCtx = createContext({ open: false, setOpen: () => {} });
 export const useSidebar = () => useContext(SidebarCtx);
@@ -59,6 +64,9 @@ function Shell({ onLogout }) {
     policies:      <PoliciesPage />,
     settings:      <SettingsPage />,
     notifications: <NotificationsPage />,
+    // Finance payroll pages — only rendered for finance / finance_head roles
+    "finance-payroll":       <PayrollHome />,
+    "finance-head-payroll":  <FinanceHeadHome />,
   }), [isClientSite]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (

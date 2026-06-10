@@ -179,6 +179,150 @@ td   {{ font-family: Arial, sans-serif; mso-line-height-rule: exactly; }}
 </html>"""
 
 
+def send_hike_request_email(
+    to_email: str,
+    employee_name: str,
+    employee_code: str,
+    old_ctc: float,
+    new_ctc: float,
+    hike_type: str,
+    hike_value: float,
+    effective_from: str,
+    reason: str,
+    requested_by: str,
+) -> bool:
+    """Notify finance when admin creates a salary hike request. Never raises."""
+    if not settings.SMTP_HOST or not settings.SMTP_USERNAME or not settings.SMTP_PASSWORD:
+        logger.warning("[EMAIL] SMTP not configured — skipping hike request email to %s", to_email)
+        return False
+
+    hike_display = f"{hike_value}%" if hike_type == "percentage" else f"₹{hike_value:,.0f}"
+    old_fmt = f"₹{old_ctc:,.0f}" if old_ctc else "—"
+    new_fmt = f"₹{new_ctc:,.0f}"
+    subject = f"Salary Hike Request Pending Review — {employee_name}"
+    plain = (
+        f"Salary Hike Request Pending Finance Review\n\nEmployee: {employee_name} ({employee_code})\n"
+        f"Current CTC: {old_fmt}\nProposed CTC: {new_fmt}\nHike: {hike_display}\n"
+        f"Effective From: {effective_from}\nReason: {reason or '—'}\nRequested By: {requested_by}\n\n"
+        f"Please review in Employee Payroll - Salary Revisions.\n\n— Acronotics HR Team\n"
+    )
+    html = (
+        f'<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;">'
+        f'<p>Salary hike request for <strong>{employee_name}</strong> ({employee_code}) '
+        f'from {old_fmt} → {new_fmt} ({hike_display}) effective {effective_from} '
+        f'is pending finance review.</p></body></html>'
+    )
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = _FROM_DISPLAY
+        msg["To"] = to_email
+        msg.set_content(plain)
+        msg.add_alternative(html, subtype="html")
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as smtp:
+            smtp.ehlo(); smtp.starttls(context=ctx); smtp.ehlo()
+            smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            smtp.send_message(msg)
+        logger.info("[EMAIL] Hike request email sent to %s", to_email)
+        return True
+    except Exception as exc:
+        logger.error("[EMAIL ERROR] Hike request email to %s failed: %s", to_email, exc)
+        return False
+
+
+def send_hike_review_email(
+    to_email: str,
+    employee_name: str,
+    decision: str,
+    reviewed_by: str,
+    remarks: str,
+    effective_from: str,
+    new_ctc: float,
+) -> bool:
+    """Notify admin/requester when finance approves or rejects a hike request. Never raises."""
+    if not settings.SMTP_HOST or not settings.SMTP_USERNAME or not settings.SMTP_PASSWORD:
+        logger.warning("[EMAIL] SMTP not configured — skipping hike review email to %s", to_email)
+        return False
+
+    new_fmt = f"₹{new_ctc:,.0f}"
+    subject = f"Salary Hike Request {decision} — {employee_name}"
+    plain = (
+        f"Salary Hike Request {decision}\n\nEmployee: {employee_name}\nDecision: {decision}\n"
+        f"Reviewed By: {reviewed_by}\nRemarks: {remarks or '—'}\n"
+        + (f"New CTC: {new_fmt}\nEffective From: {effective_from}\n" if decision.lower() == "approved" else "")
+        + "\n— Acronotics HR Team\n"
+    )
+    html = (
+        f'<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;">'
+        f'<p>Salary hike request for <strong>{employee_name}</strong> has been '
+        f'<strong>{decision}</strong> by {reviewed_by}.'
+        + (f' New CTC: {new_fmt}, effective {effective_from}.' if decision.lower() == "approved" else "")
+        + '</p></body></html>'
+    )
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = _FROM_DISPLAY
+        msg["To"] = to_email
+        msg.set_content(plain)
+        msg.add_alternative(html, subtype="html")
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as smtp:
+            smtp.ehlo(); smtp.starttls(context=ctx); smtp.ehlo()
+            smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            smtp.send_message(msg)
+        logger.info("[EMAIL] Hike review email sent to %s", to_email)
+        return True
+    except Exception as exc:
+        logger.error("[EMAIL ERROR] Hike review email to %s failed: %s", to_email, exc)
+        return False
+
+
+def send_payroll_event_email(
+    to_email: str,
+    event: str,
+    run_label: str,
+    actor_name: str,
+    remarks: str = None,
+) -> bool:
+    """Send a payroll workflow notification email. Never raises."""
+    if not settings.SMTP_HOST or not settings.SMTP_USERNAME or not settings.SMTP_PASSWORD:
+        logger.warning("[EMAIL] SMTP not configured — skipping payroll event email to %s", to_email)
+        return False
+
+    subject = f"{event} — {run_label}"
+    plain = (
+        f"Payroll Notification: {event}\n\nPayroll Period: {run_label}\nAction By: {actor_name}\n"
+        + (f"Remarks: {remarks}\n" if remarks else "")
+        + "\nPlease log in to HRMS Employee Payroll for details.\n\n— Acronotics HR Team\n"
+    )
+    html = (
+        f'<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;">'
+        f'<p>Payroll event: <strong>{event}</strong> for period <strong>{run_label}</strong> '
+        f'by {actor_name}.'
+        + (f' Remarks: {remarks}' if remarks else "")
+        + '</p></body></html>'
+    )
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = _FROM_DISPLAY
+        msg["To"] = to_email
+        msg.set_content(plain)
+        msg.add_alternative(html, subtype="html")
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as smtp:
+            smtp.ehlo(); smtp.starttls(context=ctx); smtp.ehlo()
+            smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            smtp.send_message(msg)
+        logger.info("[EMAIL] Payroll event email (%s) sent to %s", event, to_email)
+        return True
+    except Exception as exc:
+        logger.error("[EMAIL ERROR] Payroll event email to %s failed: %s", to_email, exc)
+        return False
+
+
 def send_otp_email(to_email: str, otp: str, full_name: str = "") -> bool:
     """
     Send an OTP verification email via Gmail SMTP / STARTTLS.

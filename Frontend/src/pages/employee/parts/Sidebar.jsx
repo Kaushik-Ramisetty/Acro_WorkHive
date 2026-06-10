@@ -1,6 +1,7 @@
 import logo from "../../../assets/logo.png";
 import { useApp } from "../AppContext";
 import { useSidebar } from "../EmployeeDashboard";
+import { useAuth } from "../../../context/AuthContext";
 
 const navItems = [
   {
@@ -147,9 +148,39 @@ const bottomItems = [
   },
 ];
 
+// Role-specific extra nav items appended after the common navItems
+const FINANCE_ITEMS = [
+  {
+    id: "finance-payroll",
+    label: "Finance Payroll",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="2" y="5" width="20" height="14" rx="2" /><line x1="2" y1="10" x2="22" y2="10" />
+      </svg>
+    ),
+  },
+];
+
+const FINANCE_HEAD_ITEMS = [
+  {
+    id: "finance-head-payroll",
+    label: "Finance Head Payroll",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+      </svg>
+    ),
+  },
+];
+
 const Sidebar = ({ onLogout }) => {
   const { currentPage, navigate } = useApp();
   const { open, setOpen } = useSidebar();
+  const { role } = useAuth();
+
+  const r = (role || "").toLowerCase();
+  const extraItems = r === "finance" ? FINANCE_ITEMS : r === "finance_head" ? FINANCE_HEAD_ITEMS : [];
+  const allItems = [...navItems, ...extraItems];
 
   // Close mobile sidebar after navigating
   const go = (page) => { setOpen(false); navigate(page); };
@@ -174,7 +205,7 @@ const Sidebar = ({ onLogout }) => {
       </div>
 
       <nav className="flex-1 overflow-y-auto py-2 scrollbar-hide">
-        {navItems.map((item) => {
+        {allItems.map((item) => {
           const active = currentPage === item.id;
           return (
             <button

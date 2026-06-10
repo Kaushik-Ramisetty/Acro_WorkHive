@@ -4,3 +4,17 @@ export { default as Utilization }    from './UtilizationPage';
 export { default as ProjectCosting } from './ProjectCostingPage';
 export { default as Payroll }        from './PayrollPage';
 export { default as Reports }        from './ReportsPage';
+// Payroll module pages
+export { default as PayrollHome }           from './PayrollHome';
+export { default as FinanceHeadHome }       from './FinanceHeadHome';
+export { default as PayrollRunManagement }  from './PayrollRunManagement';
+export { default as PayrollSummary }        from './PayrollSummary';
+export { default as FinanceReview }         from './FinanceReview';
+export { default as PayrollErrors }         from './PayrollErrors';
+export { default as FinalApproval }         from './FinalApproval';
+export { default as PayslipBankAdvice }     from './PayslipBankAdvice';
+export { default as PayrollAnalytics }      from './PayrollAnalytics';
+export { default as SalaryStructures }      from './SalaryStructures';
+export { default as SalaryRevisionHistory } from './SalaryRevisionHistory';
+export { default as Reimbursements }        from './Reimbursements';
+export { default as FinalSettlement }       from './FinalSettlement';

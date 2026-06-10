@@ -366,6 +366,234 @@ def apply_leave(db: Session, employee: Employee, leave_type_id: str,
     return req
 
 
+def apply_lop_leave(
+    db: Session, employee: Employee, start: date, end: date, reason: Optional[str],
+    original_leave_type_id: Optional[str] = None,
+) -> LeaveRequest:
+    """Create a Loss-of-Pay leave request when paid leave balance is exhausted.
+
+    Skips the balance check (LOP has no quota). Runs date, overlap,
+    eligibility, blackout, and team-capacity validators. No ledger entry
+    or pending_balance adjustment (nothing to deduct). Routes to manager
+    → HR two-stage approval chain.
+    """
+    from app.services.leave_validation import (
+        run_validation,
+        date_validator,
+        working_day_start_validator,
+        eligibility_validator,
+        overlap_validator,
+        blackout_validator,
+        team_capacity_validator,
+    )
+
+    # Validation: skip balance_validator and document_validator for LOP.
+    lop_pipeline = [
+        date_validator,
+        working_day_start_validator,
+        eligibility_validator,
+        overlap_validator,
+        blackout_validator,
+        team_capacity_validator,
+    ]
+    vctx = run_validation(db, employee, "LT007", start, end, reason, pipeline=lop_pipeline)
+    if vctx.errors:
+        raise LeaveEngineError(400, " | ".join(vctx.errors))
+
+    days = vctx.days
+
+    req = LeaveRequest(
+        id=_next_request_id(db),
+        employee_id=employee.id,
+        leave_type_id="LT007",
+        start_date=start,
+        end_date=end,
+        total_days=days,
+        reason=reason,
+        status=LeaveStatus.PENDING,
+        next_approver_role="manager",
+        is_lop=True,
+    )
+    db.add(req)
+    db.flush()
+
+    # No adjust_pending / ledger entry — LOP has no balance pool.
+
+    note = f"LOP requested for {days} day(s)"
+    if original_leave_type_id:
+        note += f" (converted from {original_leave_type_id})"
+    _audit(db, req, "lop_requested", employee, None, LeaveStatus.PENDING, note=note)
+
+    if _should_auto_approve(employee):
+        # No manager — notify HR directly.
+        _broadcast_hr(
+            db, req,
+            type_="lop_pending_hr_approval",
+            title="LOP leave awaiting HR approval",
+            body=(
+                f"{employee.full_name} has no reporting manager. LOP request "
+                f"({start} → {end}, {days} day(s)) requires HR approval."
+            ),
+        )
+    else:
+        _notify_manager_stage(
+            db,
+            manager_id=employee.reporting_manager_id,
+            type_="lop_pending_manager_approval",
+            title="LOP leave request awaiting your approval",
+            body=(
+                f"{employee.full_name} requested {days} LOP day(s) from {start} to {end}. "
+                "Please review and approve or reject."
+            ),
+            leave_request_id=req.id,
+        )
+
+    _notify(
+        db,
+        recipient_id=employee.id,
+        type_="lop_requested",
+        title="LOP leave request submitted",
+        body=(
+            f"Your Loss-of-Pay request from {start} to {end} ({days} day(s)) "
+            "has been submitted and is pending manager approval."
+        ),
+        leave_request_id=req.id,
+    )
+
+    db.commit()
+    db.refresh(req)
+    return req
+
+
+def _approve_lop(db: Session, actor: Employee, req: LeaveRequest) -> LeaveRequest:
+    """Two-stage LOP approval: manager stamps → pending HR; HR stamps → approved + payroll sync."""
+    stage = req.next_approver_role or "manager"
+    role = _role_name(actor)
+    now = _utcnow()
+
+    if stage == "manager":
+        if not _can_approve_at_stage(actor, req, "manager", db):
+            raise LeaveEngineError(403, "You are not authorized to approve this LOP request.")
+
+        try:
+            transition(req, "advance_to_hr", actor)
+        except InvalidTransition as exc:
+            raise LeaveEngineError(400, str(exc))
+
+        req.manager_approved_by = actor.id
+        req.manager_approved_at = now
+        req.sla_escalation_level = 0
+        req.sla_last_alert_at = None
+        req.approver_override_id = None
+
+        _audit(
+            db, req, "lop_manager_approved", actor,
+            LeaveStatus.PENDING, LeaveStatus.PENDING,
+            note=f"LOP manager approval by {actor.full_name}; routing to HR",
+        )
+
+        _notify(
+            db,
+            recipient_id=req.employee_id,
+            type_="lop_manager_approved",
+            title="LOP request: manager approved",
+            body=(
+                f"Your LOP request ({req.start_date} → {req.end_date}) was approved by your manager "
+                "and is now pending HR review."
+            ),
+            leave_request_id=req.id,
+        )
+
+        _broadcast_hr(
+            db, req,
+            type_="lop_pending_hr_approval",
+            title="LOP leave awaiting HR approval",
+            body=(
+                f"{req.employee.full_name} LOP request ({req.start_date} → {req.end_date}, "
+                f"{req.total_days} day(s)) was manager-approved by {actor.full_name}. "
+                "Please review."
+            ),
+        )
+
+    elif stage == "hr":
+        # Only admins may approve at the HR stage for LOP.
+        if role != "admin":
+            raise LeaveEngineError(403, "Only HR/admin can give final LOP approval.")
+
+        try:
+            transition(req, "approve_hr", actor)
+        except InvalidTransition as exc:
+            raise LeaveEngineError(400, str(exc))
+
+        req.hr_approved_by = actor.id
+        req.hr_approved_at = now
+        req.approved_by = actor.id
+        req.approved_at = now
+
+        _audit(
+            db, req, "lop_hr_approved", actor,
+            LeaveStatus.PENDING, LeaveStatus.APPROVED,
+            note=f"LOP final HR approval by {actor.full_name}",
+        )
+
+        _notify(
+            db,
+            recipient_id=req.employee_id,
+            type_="lop_approved",
+            title="LOP leave fully approved",
+            body=(
+                f"Your LOP leave ({req.start_date} to {req.end_date}, {req.total_days} day(s)) "
+                "has been approved by HR. It will be reflected in your payroll."
+            ),
+            leave_request_id=req.id,
+        )
+
+        # Sync to payroll immediately after HR approval.
+        from app.services.payroll_bridge import sync_lop_to_payroll
+        ok, err = sync_lop_to_payroll(db, req)
+        if not ok:
+            _audit(
+                db, req, "lop_payroll_sync_failed", actor,
+                LeaveStatus.APPROVED, LeaveStatus.APPROVED,
+                note=err,
+            )
+            _broadcast_hr(
+                db, req,
+                type_="payroll_sync_failed",
+                title="LOP payroll sync failed",
+                body=f"LOP {req.id} approved but payroll sync failed: {err}. Manual update required.",
+            )
+        else:
+            req.payroll_sync_status = "synced"
+            _notify(
+                db,
+                recipient_id=req.employee_id,
+                type_="lop_payroll_processed",
+                title="LOP leave payroll updated",
+                body=(
+                    f"Your LOP leave ({req.start_date} to {req.end_date}) has been recorded "
+                    "in payroll and will reflect in your next payslip."
+                ),
+                leave_request_id=req.id,
+            )
+            _broadcast_hr(
+                db, req,
+                type_="lop_approved_hr_info",
+                title="LOP approved — payroll updated",
+                body=(
+                    f"{req.employee.full_name} LOP ({req.start_date} → {req.end_date}, "
+                    f"{req.total_days} day(s)) fully approved and synced to payroll."
+                ),
+            )
+
+    else:
+        raise LeaveEngineError(400, f"Invalid LOP approval stage: '{stage}'.")
+
+    db.commit()
+    db.refresh(req)
+    return req
+
+
 def apply_leave_by_days(
     db: Session,
     employee: Employee,
@@ -498,6 +726,10 @@ def approve_leave(db: Session, actor: Employee, req: LeaveRequest) -> LeaveReque
     """
     if req.status != LeaveStatus.PENDING:
         raise LeaveEngineError(400, f"Cannot approve a request in status '{req.status}'.")
+
+    # LOP requests use a two-stage manager → HR approval chain.
+    if getattr(req, "is_lop", False):
+        return _approve_lop(db, actor, req)
 
     # The only legal stage now is 'manager'; legacy 'hr' rows are picked
     # up by the startup backfill (see leave_ledger_backfill.py).
@@ -773,9 +1005,10 @@ def reject_leave(db: Session, actor: Employee, req: LeaveRequest, reason: Option
         req.rejected_by = actor.id
         req.rejected_at = now
         req.rejection_reason = reason
-        # Release pending_balance — the request never made it past pending.
-        adjust_pending(db, req.employee_id, req.leave_type_id, -req.total_days,
-                       year=req.start_date.year)
+        # Release pending_balance only for regular leaves; LOP has no balance row.
+        if not getattr(req, "is_lop", False):
+            adjust_pending(db, req.employee_id, req.leave_type_id, -req.total_days,
+                           year=req.start_date.year)
         _audit(db, req, "rejected", actor, prev, LeaveStatus.REJECTED, note=reason)
         _notify(
             db,
@@ -814,8 +1047,9 @@ def cancel_leave(db: Session, actor: Employee, req: LeaveRequest) -> LeaveReques
             transition(req, "cancel", actor)
         except InvalidTransition as exc:
             raise LeaveEngineError(400, str(exc))
-        adjust_pending(db, req.employee_id, req.leave_type_id, -req.total_days,
-                       year=req.start_date.year)
+        if not getattr(req, "is_lop", False):
+            adjust_pending(db, req.employee_id, req.leave_type_id, -req.total_days,
+                           year=req.start_date.year)
         _audit(db, req, "cancelled", actor, LeaveStatus.PENDING, LeaveStatus.CANCELLED,
                note="Direct cancel (was pending)")
         _notify(

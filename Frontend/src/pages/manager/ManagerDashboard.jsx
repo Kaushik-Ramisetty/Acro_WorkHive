@@ -24,6 +24,8 @@ import ManagerAnnouncementsPage from './announcements/ManagerAnnouncementsPage';
 import SelfServicePage from '../shared/SelfServicePage';
 import SharedSettingsPage from '../../components/SettingsPage';
 import SharedNotificationsPage from '../shared/NotificationsPage';
+import ManagerPerformancePage from './ManagerPerformancePage';
+import PayrollPage from '../employee/screens/PayrollPage';
 import NotificationBell from '../../components/NotificationBell';
 import SearchBar from '../../components/SearchBar';
 import ProfileMenu from '../../components/ProfileMenu';
@@ -278,6 +280,7 @@ const NAV = [
   { id:'reports',       label:'Reports',        icon:BarChart2 },
   { id:'announcements', label:'Announcements',  icon:Bell },
   { id:'company',       label:'Company',        icon:Home },
+  { id:'payroll',       label:'Payroll',        icon:DollarSign },
   { id:'policies',      label:'Policies',       icon:FileText },
 ]
 
@@ -1946,18 +1949,7 @@ const __mgrIcoDoc   = (<svg width="16" height="16" viewBox="0 0 24 24" fill="non
 
 // ── Performance ───────────────────────────────────────────────────
 function Performance({ onNav: _onNav }) {
-  return (
-    <UnderConstruction
-      accent="teal"
-      title="Team Performance"
-      description="View team-wide goals, individual performance scores, and review-cycle progress."
-      features={[
-        { label: 'Team performance dashboard', icon: __mgrIcoChart },
-        { label: 'Individual review tracking', icon: __mgrIcoStar  },
-        { label: 'Goal completion analytics',  icon: __mgrIcoTarget },
-      ]}
-    />
-  );
+  return <ManagerPerformancePage />;
 }
 
 // ── Timesheets ────────────────────────────────────────────────────
@@ -2600,6 +2592,7 @@ export default function ManagerDashboard() {
     reports:       <Reports         onNav={setPage}/>,
     announcements: <ManagerAnnouncementsPage />,
     company:       <CompanyPage     onNav={setPage}/>,
+    payroll:       <PayrollPage />,
     policies:      <PoliciesPage />,
     settings:      <SharedSettingsPage />,
     notifications: <SharedNotificationsPage />,

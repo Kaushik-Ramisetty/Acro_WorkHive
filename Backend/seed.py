@@ -13,6 +13,7 @@ Usage:
     python seed.py path/to/Employees-updated.xlsx
 """
 import sys
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.security import hash_password
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
+from dept_desig_migration import normalize_department_id, sync_master_data
 from app.models import (
     Attendance, Department, Designation, Employee, Role,
     LeaveType, LeaveBalance, LeaveRequest,
@@ -33,16 +35,41 @@ from app.models import (
     AttendanceReport, PayrollAttendanceSummary,
     AuditLog, Notification,
     Project, Task, Timesheet, TimesheetEntry, TimesheetPayrollSync,
+    User,
 )
 
 
 MANAGER_DESIGNATIONS = {
-    "Senior Manager", "Manager", "Tech Lead", "Engineering Manager",
-    "Director of Product", "VP of Engineering", "CTO", "Senior Product Manager",
-    "Director", "Principal Engineer", "Senior DevOps Engineer", "UI/UX Lead",
+    # Delivery leadership
+    "Delivery Head", "Delivery Manager", "Associate Delivery Manager",
+    "Product Delivery Manager",
+    # Engineering / technical leads
+    "Tech Lead", "Team Lead", "Lead Developer",
+    "Senior AI & Automation Solution Architect",
+    "Senior Solution Architect", "Technical Architect", "Senior Technical Architect",
+    "Solution Architect", "Product Technical Lead",
+    # Project / programme management
+    "Project Manager", "Associate Project Manager", "Program Manager",
+    "Scrum Master",
+    # Product
+    "Product Manager", "Product Architect", "Product Support Manager",
+    # Sales & partnerships
+    "Sales Head", "Sales Manager", "Account Manager",
+    "Business Development Manager", "Manager-Partnerships & Alliances",
+    "Head of Sales and Solutioning", "Engagement Manager",
+    # Finance
+    "Head of Finance", "Finance Manager",
+    # HR & recruitment
+    "HR & Recruitment Manager", "Recruitment Manager", "Lead Recruiter",
+    # IT & operations
+    "IT Manager", "Operations Head", "Operations Manager",
+    # Learning & development
+    "Head of Learning & Development",
+    # Data / analytics
+    "Lead Data Scientist",
 }
-ADMIN_DESIGNATIONS = {"HR", "CEO"}
-ADMIN_DEPARTMENTS = {"DEP003"}
+ADMIN_DESIGNATIONS = {"HR Head", "Leadership"}
+ADMIN_DEPARTMENTS = {"DEP003"}  # HR
 
 
 def derive_role(designation_title: Optional[str], department_id: Optional[str], default: str = "employee") -> str:
@@ -273,6 +300,386 @@ def find_xlsx(arg: Optional[str]) -> Optional[Path]:
     return None
 
 
+def find_backup_db(arg: Optional[str]) -> Optional[Path]:
+    candidates = []
+    backend_root = Path(__file__).resolve().parent
+    project_root = backend_root.parent
+
+    if arg:
+        candidates.append(Path(arg).expanduser())
+
+    import os
+    backup_env = os.getenv("HRMS_BACKUP_DB_PATH")
+    if backup_env:
+        candidates.append(Path(backup_env).expanduser())
+
+    candidates.extend([
+        project_root / "hrms_integrated_v4_backup" / "Backend" / "hrms.db",
+        project_root.parent / "hrms_integrated_v4_backup" / "Backend" / "hrms.db",
+    ])
+
+    seen: set[Path] = set()
+    for p in candidates:
+        try:
+            rp = p.resolve()
+        except Exception:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if rp.is_file():
+            return rp
+    return None
+
+
+def _normalize_user_role(value: Optional[str]) -> str:
+    clean = (str(value or "").strip().upper() or "EMPLOYEE")
+    aliases = {
+        "ADMINISTRATOR": "ADMIN",
+        "CANDIDATES": "CANDIDATE",
+    }
+    clean = aliases.get(clean, clean)
+    return clean if clean in {"ADMIN", "HR", "MANAGER", "EMPLOYEE", "CANDIDATE"} else "EMPLOYEE"
+
+
+def _clean_nullable_fk(value):
+    if value in (None, "", "NULL", "null", "None"):
+        return None
+    return value
+
+
+def _next_prefixed_id(db: Session, model, prefix: str, width: int) -> str:
+    max_num = 0
+    for raw in db.query(model.id).all():
+        value = raw[0] if not isinstance(raw, str) else raw
+        if not isinstance(value, str) or not value.startswith(prefix):
+            continue
+        suffix = value[len(prefix):]
+        if suffix.isdigit():
+            max_num = max(max_num, int(suffix))
+    return f"{prefix}{max_num + 1:0{width}d}"
+
+
+def _import_backup_db_data(db: Session, backup_db_path: Path) -> dict[str, tuple[int, int, int]]:
+    """Import compatible demo data from the backup SQLite DB.
+
+    The main integrated project's schema remains authoritative. We only merge
+    compatible employee, attendance, timesheet, and legacy user data without
+    replacing the current DB wholesale.
+    """
+    from sqlalchemy import text
+
+    counts: dict[str, tuple[int, int, int]] = {}
+    src = sqlite3.connect(str(backup_db_path))
+    src.row_factory = sqlite3.Row
+
+    def _record(name: str, inserted: int, updated: int, skipped: int) -> None:
+        if inserted or updated or skipped:
+            counts[name] = (inserted, updated, skipped)
+
+    def _rows(query: str):
+        return src.execute(query).fetchall()
+
+    attendance_id_map: dict[str, str] = {}
+    timesheet_id_map: dict[str, str] = {}
+
+    try:
+        emp_inserted = emp_updated = emp_skipped = 0
+        for row in _rows("SELECT * FROM employees ORDER BY id"):
+            emp_id = to_int(row["id"])
+            if emp_id is None:
+                emp_skipped += 1
+                continue
+            existing = db.get(Employee, emp_id)
+            if existing is None:
+                db.add(Employee(
+                    id=emp_id,
+                    employee_code=to_str(row["employee_code"]),
+                    first_name=to_str(row["first_name"]) or "",
+                    last_name=to_str(row["last_name"]),
+                    email=to_str(row["email"]),
+                    official_email=to_str(row["official_email"]),
+                    employment_status=(to_str(row["employment_status"]) or "active").lower(),
+                    role_id=to_int(row["role_id"]),
+                    password_hash=to_str(row["password_hash"]),
+                    is_activated=bool(row["is_activated"] if row["is_activated"] is not None else True),
+                    force_password_change=bool(row["force_password_change"] if row["force_password_change"] is not None else False),
+                    is_deleted=bool(row["is_deleted"] if row["is_deleted"] is not None else False),
+                    employee_type=to_str(row["employee_type"]),
+                    is_tm=bool(row["is_tm"] or False),
+                    client_manager_name=to_str(row["client_manager_name"]),
+                    client_manager_email=to_str(row["client_manager_email"]),
+                ))
+                emp_inserted += 1
+                continue
+
+            touched = False
+            for field in ("employment_status", "official_email", "employee_type", "client_manager_name", "client_manager_email"):
+                new_value = row[field]
+                if new_value is None:
+                    continue
+                if getattr(existing, field) != new_value:
+                    setattr(existing, field, new_value)
+                    touched = True
+            new_is_tm = bool(row["is_tm"] or False)
+            if bool(existing.is_tm or False) != new_is_tm:
+                existing.is_tm = new_is_tm
+                touched = True
+            if not getattr(existing, "password_hash", None) and row["password_hash"]:
+                existing.password_hash = row["password_hash"]
+                touched = True
+            if touched:
+                emp_updated += 1
+            else:
+                emp_skipped += 1
+        db.flush()
+        _record("backup_employees", emp_inserted, emp_updated, emp_skipped)
+
+        user_inserted = user_updated = user_skipped = 0
+        for row in _rows("SELECT * FROM users ORDER BY id"):
+            employee_id = to_int(_clean_nullable_fk(row["employee_id"]))
+            candidate_id = to_int(_clean_nullable_fk(row["candidate_id"]))
+            if employee_id is not None and db.get(Employee, employee_id) is None:
+                user_skipped += 1
+                continue
+            if candidate_id is not None:
+                candidate_exists = db.execute(
+                    text("SELECT 1 FROM candidates WHERE id = :candidate_id"),
+                    {"candidate_id": candidate_id},
+                ).fetchone()
+                if candidate_exists is None:
+                    user_skipped += 1
+                    continue
+            existing = db.get(User, to_int(row["id"]))
+            if existing is None:
+                existing = db.query(User).filter(User.email == row["email"]).one_or_none()
+            if existing is None:
+                db.add(User(
+                    id=to_int(row["id"]),
+                    email=to_str(row["email"]) or "",
+                    password_hash=to_str(row["password_hash"]) or "",
+                    role=_normalize_user_role(row["role"]),
+                    is_active=bool(row["is_active"] if row["is_active"] is not None else True),
+                    employee_id=employee_id,
+                    candidate_id=candidate_id,
+                    last_login=to_dt(row["last_login"]),
+                ))
+                user_inserted += 1
+            else:
+                existing.email = to_str(row["email"]) or existing.email
+                existing.password_hash = to_str(row["password_hash"]) or existing.password_hash
+                existing.role = _normalize_user_role(row["role"])
+                existing.is_active = bool(row["is_active"] if row["is_active"] is not None else True)
+                existing.employee_id = employee_id
+                existing.candidate_id = candidate_id
+                existing.last_login = to_dt(row["last_login"])
+                user_updated += 1
+        _record("backup_users", user_inserted, user_updated, user_skipped)
+
+        ar_inserted = ar_updated = ar_skipped = 0
+        for row in _rows("SELECT * FROM attendance_records ORDER BY date, employee_id, id"):
+            employee_id = to_int(row["employee_id"])
+            if employee_id is None or db.get(Employee, employee_id) is None:
+                ar_skipped += 1
+                continue
+            natural = (employee_id, to_date(row["date"]))
+            existing = db.query(AttendanceRecord).filter(
+                AttendanceRecord.employee_id == natural[0],
+                AttendanceRecord.date == natural[1],
+            ).one_or_none()
+            target_id = to_str(row["id"]) or _next_prefixed_id(db, AttendanceRecord, "AR", 6)
+            if existing is None and db.get(AttendanceRecord, target_id) is not None:
+                target_id = _next_prefixed_id(db, AttendanceRecord, "AR", 6)
+            attendance_id_map[to_str(row["id"]) or target_id] = existing.id if existing is not None else target_id
+            if existing is None:
+                db.add(AttendanceRecord(
+                    id=target_id,
+                    employee_id=employee_id,
+                    date=natural[1],
+                    shift_id=to_str(row["shift_id"]),
+                    check_in_time=to_time(row["check_in_time"]),
+                    check_out_time=to_time(row["check_out_time"]),
+                    working_hours=to_float(row["working_hours"]),
+                    status=(to_str(row["status"]) or "absent").lower(),
+                    late_minutes=to_int(row["late_minutes"]),
+                    early_checkout_mins=to_int(row["early_checkout_mins"]),
+                    overtime_hours=to_float(row["overtime_hours"]),
+                    leave_request_id=to_str(row["leave_request_id"]),
+                    is_regularized=bool(row["is_regularized"] or False),
+                    lop_applied=bool(row["lop_applied"] or False),
+                    lop_type=to_str(row["lop_type"]),
+                ))
+                db.flush()
+                ar_inserted += 1
+            else:
+                existing.shift_id = to_str(row["shift_id"])
+                existing.check_in_time = to_time(row["check_in_time"])
+                existing.check_out_time = to_time(row["check_out_time"])
+                existing.working_hours = to_float(row["working_hours"])
+                existing.status = (to_str(row["status"]) or existing.status or "absent").lower()
+                existing.late_minutes = to_int(row["late_minutes"])
+                existing.early_checkout_mins = to_int(row["early_checkout_mins"])
+                existing.overtime_hours = to_float(row["overtime_hours"])
+                existing.leave_request_id = to_str(row["leave_request_id"])
+                existing.is_regularized = bool(row["is_regularized"] or False)
+                existing.lop_applied = bool(row["lop_applied"] or False)
+                existing.lop_type = to_str(row["lop_type"])
+                ar_updated += 1
+        db.flush()
+        _record("backup_attendance_records", ar_inserted, ar_updated, ar_skipped)
+
+        ts_inserted = ts_updated = ts_skipped = 0
+        for row in _rows("SELECT * FROM timesheets ORDER BY period_start, employee_id, id"):
+            employee_id = to_int(row["employee_id"])
+            if employee_id is None or db.get(Employee, employee_id) is None:
+                ts_skipped += 1
+                continue
+            natural = (employee_id, to_date(row["period_start"]), to_date(row["period_end"]))
+            existing = db.query(Timesheet).filter(
+                Timesheet.employee_id == natural[0],
+                Timesheet.period_start == natural[1],
+                Timesheet.period_end == natural[2],
+            ).one_or_none()
+            target_id = to_str(row["id"]) or _next_prefixed_id(db, Timesheet, "TS", 6)
+            if existing is None and db.get(Timesheet, target_id) is not None:
+                target_id = _next_prefixed_id(db, Timesheet, "TS", 6)
+            timesheet_id_map[to_str(row["id"]) or target_id] = existing.id if existing is not None else target_id
+            if existing is None:
+                db.add(Timesheet(
+                    id=target_id,
+                    employee_id=employee_id,
+                    period_type=to_str(row["period_type"]),
+                    period_start=natural[1],
+                    period_end=natural[2],
+                    total_logged_hours=to_float(row["total_logged_hours"]),
+                    status=to_str(row["status"]),
+                    submitted_at=to_dt(row["submitted_at"]),
+                    reviewed_by=to_int(row["reviewed_by"]),
+                    review_comment=to_str(row["review_comment"]),
+                    reviewed_at=to_dt(row["reviewed_at"]),
+                    is_locked=bool(row["is_locked"] or False),
+                    locked_at=to_dt(row["locked_at"]),
+                    client_manager_id=to_int(_clean_nullable_fk(row["client_manager_id"])),
+                    client_manager_name=to_str(row["client_manager_name"]),
+                    client_manager_email=to_str(row["client_manager_email"]),
+                    client_token=to_str(row["client_token"]),
+                    client_token_expires_at=to_dt(row["client_token_expires_at"]),
+                    client_email_sent_at=to_dt(row["client_email_sent_at"]),
+                    client_email_status=to_str(row["client_email_status"]),
+                    client_approved_at=to_dt(row["client_approved_at"]),
+                    client_rejected_at=to_dt(row["client_rejected_at"]),
+                    client_review_comment=to_str(row["client_review_comment"]),
+                    reminder_count=to_int(row["reminder_count"]) or 0,
+                    has_mismatch=bool(row["has_mismatch"] or False),
+                ))
+                db.flush()
+                ts_inserted += 1
+            else:
+                existing.period_type = to_str(row["period_type"])
+                existing.total_logged_hours = to_float(row["total_logged_hours"])
+                existing.status = to_str(row["status"])
+                existing.submitted_at = to_dt(row["submitted_at"])
+                existing.reviewed_by = to_int(row["reviewed_by"])
+                existing.review_comment = to_str(row["review_comment"])
+                existing.reviewed_at = to_dt(row["reviewed_at"])
+                existing.is_locked = bool(row["is_locked"] or False)
+                existing.locked_at = to_dt(row["locked_at"])
+                existing.client_manager_id = to_int(_clean_nullable_fk(row["client_manager_id"]))
+                existing.client_manager_name = to_str(row["client_manager_name"])
+                existing.client_manager_email = to_str(row["client_manager_email"])
+                existing.client_token = to_str(row["client_token"])
+                existing.client_token_expires_at = to_dt(row["client_token_expires_at"])
+                existing.client_email_sent_at = to_dt(row["client_email_sent_at"])
+                existing.client_email_status = to_str(row["client_email_status"])
+                existing.client_approved_at = to_dt(row["client_approved_at"])
+                existing.client_rejected_at = to_dt(row["client_rejected_at"])
+                existing.client_review_comment = to_str(row["client_review_comment"])
+                existing.reminder_count = to_int(row["reminder_count"]) or 0
+                existing.has_mismatch = bool(row["has_mismatch"] or False)
+                ts_updated += 1
+        db.flush()
+        _record("backup_timesheets", ts_inserted, ts_updated, ts_skipped)
+
+        te_inserted = te_updated = te_skipped = 0
+        for row in _rows("SELECT * FROM timesheet_entries ORDER BY timesheet_id, entry_date, id"):
+            source_ts_id = to_str(row["timesheet_id"])
+            if not source_ts_id or source_ts_id not in timesheet_id_map:
+                te_skipped += 1
+                continue
+            employee_id = to_int(row["employee_id"])
+            if employee_id is None or db.get(Employee, employee_id) is None:
+                te_skipped += 1
+                continue
+            mapped_ts_id = timesheet_id_map[source_ts_id]
+            attendance_record_id = attendance_id_map.get(to_str(row["attendance_record_id"]) or "")
+            existing = db.get(TimesheetEntry, to_str(row["id"]))
+            if existing is None:
+                existing = db.query(TimesheetEntry).filter(
+                    TimesheetEntry.timesheet_id == mapped_ts_id,
+                    TimesheetEntry.entry_date == to_date(row["entry_date"]),
+                    TimesheetEntry.project_id == to_str(row["project_id"]),
+                    TimesheetEntry.task_id == to_str(row["task_id"]),
+                ).one_or_none()
+            target_id = to_str(row["id"]) or _next_prefixed_id(db, TimesheetEntry, "TE", 7)
+            if existing is None and db.get(TimesheetEntry, target_id) is not None:
+                target_id = _next_prefixed_id(db, TimesheetEntry, "TE", 7)
+            if existing is None:
+                db.add(TimesheetEntry(
+                    id=target_id,
+                    timesheet_id=mapped_ts_id,
+                    employee_id=employee_id,
+                    entry_date=to_date(row["entry_date"]),
+                    project_id=to_str(row["project_id"]),
+                    task_id=to_str(row["task_id"]),
+                    logged_hours=to_float(row["logged_hours"]),
+                    is_billable=bool(row["is_billable"] or False),
+                    source=to_str(row["source"]),
+                    description=to_str(row["description"]),
+                    is_manual_entry=bool(row["is_manual_entry"] or False),
+                    attendance_record_id=attendance_record_id,
+                ))
+                db.flush()
+                te_inserted += 1
+            else:
+                existing.timesheet_id = mapped_ts_id
+                existing.employee_id = employee_id
+                existing.entry_date = to_date(row["entry_date"])
+                existing.project_id = to_str(row["project_id"])
+                existing.task_id = to_str(row["task_id"])
+                existing.logged_hours = to_float(row["logged_hours"])
+                existing.is_billable = bool(row["is_billable"] or False)
+                existing.source = to_str(row["source"])
+                existing.description = to_str(row["description"])
+                existing.is_manual_entry = bool(row["is_manual_entry"] or False)
+                existing.attendance_record_id = attendance_record_id
+                te_updated += 1
+        _record("backup_timesheet_entries", te_inserted, te_updated, te_skipped)
+    finally:
+        src.close()
+
+    return counts
+
+
+def _parse_args(argv: list[str]) -> tuple[Optional[str], Optional[str]]:
+    xlsx_arg = None
+    backup_arg = None
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--backup-db" and i + 1 < len(argv):
+            backup_arg = argv[i + 1]
+            i += 2
+            continue
+        if token.startswith("--backup-db="):
+            backup_arg = token.split("=", 1)[1]
+            i += 1
+            continue
+        if xlsx_arg is None:
+            xlsx_arg = token
+        i += 1
+    return xlsx_arg, backup_arg
+
+
 def _row_to_employee_fields(row, designations_by_id, roles, password_existing=None):
     """Pad short rows and return (kwargs, role) ready for inserting/updating an Employee."""
     cells = (list(row) + [None] * 35)[:35]
@@ -285,7 +692,7 @@ def _row_to_employee_fields(row, designations_by_id, roles, password_existing=No
     ) = cells
 
     designation_id = to_str(designation_id)
-    department_id  = to_str(department_id)
+    department_id  = normalize_department_id(to_str(department_id))
     designation_title = (
         designations_by_id[designation_id].title
         if designation_id and designation_id in designations_by_id else None
@@ -811,7 +1218,7 @@ def _seed_new_schema_sheets(db: Session, wb) -> dict[str, tuple[int, int]]:
     return counts
 
 
-def seed(xlsx_path: Path):
+def seed(xlsx_path: Path, backup_db_path: Optional[Path] = None):
     print(f"Loading: {xlsx_path}")
     try:
         wb = load_workbook(xlsx_path, data_only=True)
@@ -832,6 +1239,9 @@ def seed(xlsx_path: Path):
     backfill_legacy_chain_fields()
 
     with SessionLocal() as db:
+        sync_master_data(db, overwrite_department_id=True)
+        db.commit()
+
         # 1) Roles
         roles = {
             "admin":    upsert_role(db, "admin",    "Workspace administrator -- full access"),
@@ -839,38 +1249,7 @@ def seed(xlsx_path: Path):
             "employee": upsert_role(db, "employee", "Employee -- personal scope"),
         }
 
-        # 2) Designations
-        if _has_sheet(wb, "designations"):
-            for row in wb["designations"].iter_rows(min_row=2, values_only=True):
-                if not row or not row[0]:
-                    continue
-                d_id, title, level = row[0], row[1], (row[2] if len(row) > 2 else None)
-                obj = db.get(Designation, d_id)
-                if obj is None:
-                    obj = Designation(id=str(d_id), title=str(title or "").strip(), level=to_int(level))
-                    db.add(obj)
-                else:
-                    obj.title = str(title or "").strip()
-                    if level not in (None, ""):
-                        obj.level = to_int(level)
-
-        # 3) Departments (1st pass: no head_id)
-        dept_rows = list(wb["departments"].iter_rows(min_row=2, values_only=True)) if _has_sheet(wb, "departments") else []
-        for row in dept_rows:
-            if not row or not row[0]:
-                continue
-            d_id, name, _head, parent = (list(row) + [None, None, None, None])[:4]
-            obj = db.get(Department, d_id)
-            if obj is None:
-                db.add(Department(
-                    id=str(d_id), name=str(name),
-                    parent_department_id=str(parent) if parent else None,
-                ))
-            else:
-                obj.name = str(name)
-                obj.parent_department_id = str(parent) if parent else None
-
-        # 4) Leave types
+        # 2) Leave types
         if _has_sheet(wb, "leave_types"):
             for row in wb["leave_types"].iter_rows(min_row=2, values_only=True):
                 if not row or not row[0]:
@@ -893,7 +1272,7 @@ def seed(xlsx_path: Path):
 
         db.flush()
 
-        # 5) Employees (full-field upsert)
+        # 3) Employees (full-field upsert)
         designations_by_id = {d.id: d for d in db.query(Designation).all()}
         emps_inserted = emps_updated = 0
         for row in wb["employees"].iter_rows(min_row=2, values_only=True):
@@ -918,19 +1297,9 @@ def seed(xlsx_path: Path):
                     setattr(existing, k, v)
                 emps_updated += 1
 
-        # 6) Department heads (2nd pass once employees exist)
-        for row in dept_rows:
-            if not row or not row[0]:
-                continue
-            d_id, _name, head, _parent = (list(row) + [None, None, None, None])[:4]
-            head_id = to_int(head)
-            dept = db.get(Department, str(d_id))
-            if dept and head_id and db.get(Employee, head_id):
-                dept.head_id = head_id
-
         db.flush()
 
-        # 7) Leave balances.
+        # 4) Leave balances.
         # Comp-off balances are NEVER seeded -- those days only accrue when a
         # manager grants comp-off and HR approves it via /leave/comp-off/grant.
         # If the Excel sheet has a Compensatory_leave row, we deliberately
@@ -967,7 +1336,7 @@ def seed(xlsx_path: Path):
                         setattr(obj, k, v)
                     lb_updated += 1
 
-        # 8) Leave requests -- DISABLED.
+        # 5) Leave requests -- DISABLED.
         # The original Excel `leave_requests` sheet is no longer authoritative;
         # actual leave applications come from the UI through /leave/apply.
         # Setting these to 0 so the summary block below still works.
@@ -1010,6 +1379,9 @@ def seed(xlsx_path: Path):
         # Each loader is gated by _has_sheet() so this same seed.py keeps
         # working against the legacy Employees-updated.xlsx workbook.
         new_counts = _seed_new_schema_sheets(db, wb)
+        backup_counts = {}
+        if backup_db_path and backup_db_path.is_file():
+            backup_counts = _import_backup_db_data(db, backup_db_path)
 
         db.commit()
 
@@ -1027,17 +1399,26 @@ def seed(xlsx_path: Path):
             for sheet_name in sorted(new_counts):
                 ins, upd = new_counts[sheet_name]
                 print(f"  {sheet_name:<28s}: +{ins} new, ~{upd} updated")
+        if backup_counts:
+            print("  -- backup db merge --")
+            for sheet_name in sorted(backup_counts):
+                ins, upd, skipped = backup_counts[sheet_name]
+                print(f"  {sheet_name:<28s}: +{ins} new, ~{upd} updated, {skipped} skipped")
         print("Done.")
 
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    xlsx = find_xlsx(arg)
+    xlsx_arg, backup_arg = _parse_args(sys.argv[1:])
+    xlsx = find_xlsx(xlsx_arg)
     if not xlsx:
         print("ERROR: No xlsx file found.")
         print("   Pass an explicit path:  python seed.py path/to/hrms_schema_complete.xlsx")
         sys.exit(1)
-    seed(xlsx)
+    backup_db = find_backup_db(backup_arg)
+    if backup_arg and not backup_db:
+        print(f"ERROR: Backup db not found: {backup_arg}")
+        sys.exit(1)
+    seed(xlsx, backup_db)
 
 
 if __name__ == "__main__":

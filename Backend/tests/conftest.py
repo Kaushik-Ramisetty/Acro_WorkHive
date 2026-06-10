@@ -106,8 +106,8 @@ def seeded_master_data(db_session):
     """Seed minimal Department + Designation rows for conversion tests."""
     from api.models import Department, Designation
 
-    dept = Department(id="DEP001", name="Engineering")
-    desig = Designation(id="D1", title="Software Engineer", level=3)
+    dept = Department(id="DEP001", name="HR")
+    desig = Designation(id="D1", title="Delivery Head", level=10)
     db_session.add_all([dept, desig])
     db_session.commit()
     return {"department": dept, "designation": desig}

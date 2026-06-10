@@ -119,8 +119,11 @@ def eligibility_validator(ctx: ValidationContext) -> None:
             ctx.fail(f"Leave type '{lt.name}' is restricted to {rule} employees.")
 
     # Probation rule — only block paid leave types during probation window.
+    # Sick/medical leave is exempt so probationers can still apply when unwell.
     join_date = getattr(ctx.employee, "joining_date", None) or getattr(ctx.employee, "date_of_joining", None)
-    if join_date and lt.is_paid:
+    lt_name = (lt.name or "").lower()
+    is_sick = any(token in lt_name for token in ("sick", "medical"))
+    if join_date and lt.is_paid and not is_sick:
         cutoff = join_date + timedelta(days=DEFAULT_PROBATION_DAYS)
         if ctx.start < cutoff:
             ctx.fail(
@@ -132,6 +135,9 @@ def eligibility_validator(ctx: ValidationContext) -> None:
 def balance_validator(ctx: ValidationContext) -> None:
     if ctx.days <= 0 or not ctx.leave_type:
         return  # nothing to check; date/eligibility already failed
+    # LOP / unpaid types have no quota or balance row — skip the check.
+    if not ctx.leave_type.is_paid:
+        return
     year = ctx.start.year if ctx.start else now_utc().year
     bal = (
         ctx.db.query(LeaveBalance)

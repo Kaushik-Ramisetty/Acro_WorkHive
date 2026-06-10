@@ -4,13 +4,16 @@ import { BrowserRouter } from 'react-router-dom'
 import './index.css'
 import AppRoutes from './routes/AppRoutes.jsx'
 import { ThemeProvider } from './context/ThemeContext.jsx'
+import { PayrollPeriodProvider } from './context/PayrollPeriodContext.jsx'
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
     <ThemeProvider>
-      <BrowserRouter>
-        <AppRoutes />
-      </BrowserRouter>
+      <PayrollPeriodProvider>
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </PayrollPeriodProvider>
     </ThemeProvider>
   </StrictMode>,
 )

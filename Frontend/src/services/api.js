@@ -86,6 +86,58 @@ export const api = {
   put:    (p, body, opts)  => request('PUT',    p, { ...(opts || {}), body }),
   patch:  (p, body, opts)  => request('PATCH',  p, { ...(opts || {}), body }),
   delete: (p, opts)        => request('DELETE', p, opts),
+
+  // Authenticated binary download — returns { blob: ArrayBuffer, contentType, filename }.
+  // Use this for any endpoint that responds with PDF or CSV bytes so the
+  // Authorization header is included (bare <a href> links omit it and get 401).
+  downloadBlob: async (path, opts = {}) => {
+    const url = path.startsWith('http') ? path : BASE_URL + path;
+    const tok = getToken();
+    const headers = {
+      ...(tok ? { 'Authorization': 'Bearer ' + tok } : {}),
+      ...(opts.headers || {}),
+    };
+    let res;
+    try {
+      res = await fetch(url, { method: 'GET', headers });
+    } catch (err) {
+      const e = new Error(
+        'Cannot reach backend at ' + BASE_URL + '. Make sure the FastAPI server is running (uvicorn app.main:app --reload --port 8000).'
+      );
+      e.network = true;
+      e.cause = err;
+      throw e;
+    }
+    if (!res.ok) {
+      const ct = res.headers.get('content-type') || '';
+      let data = null;
+      if (ct.includes('application/json')) {
+        try { data = await res.json(); } catch { data = null; }
+      }
+      const err = new Error(
+        (data && data.detail) || (data && data.message) || res.statusText || ('HTTP ' + res.status)
+      );
+      err.status = res.status;
+      err.data = data;
+      if (res.status === 401) {
+        try {
+          localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem(USER_KEY);
+        } catch { /* noop */ }
+        if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+          window.location.assign('/login');
+        }
+      }
+      throw err;
+    }
+    const contentType = res.headers.get('content-type') || 'application/octet-stream';
+    const disposition = res.headers.get('content-disposition') || '';
+    let filename = '';
+    const match = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+    if (match) filename = match[1].replace(/['"]/g, '').trim();
+    const blob = await res.arrayBuffer();
+    return { blob, contentType, filename };
+  },
 };
 
 export const auth = {

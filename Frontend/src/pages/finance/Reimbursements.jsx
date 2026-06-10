@@ -281,7 +281,7 @@ export default function Reimbursements() {
     <div className="space-y-6">
       <button onClick={() => {
           const role_ = (role || '').toLowerCase();
-          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance');
+          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance-payroll');
         }}
         className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800 transition-colors">
         <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>

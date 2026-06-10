@@ -25,6 +25,8 @@ PDF layout:
 """
 from __future__ import annotations
 
+import calendar
+import csv
 import io
 import os
 from datetime import datetime
@@ -33,9 +35,10 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.payroll import PayrollRunEmployee, PayrollRun, SalaryStructure
+from app.models.payroll import PayrollError, PayrollRunEmployee, PayrollRun, SalaryStructure
 from app.models.payroll_extended import Payslip, PayrollAdjustment, PayslipDownloadAudit
 from app.models.employee import Employee
+from app.services import payroll_service
 
 # Optional ReportLab import — service degrades gracefully if not installed
 try:
@@ -52,6 +55,10 @@ except ImportError:
     _REPORTLAB_AVAILABLE = False
 
 PAYSLIP_DIR = Path("payslips")
+
+
+def _payroll_month_label(run: PayrollRun) -> str:
+    return f"{calendar.month_name[run.pay_period_start.month]} {run.pay_period_start.year}"
 
 
 def _ensure_dir() -> None:
@@ -86,6 +93,8 @@ def generate_payslip_pdf(
 
     if not run or not row or not emp:
         return None
+    run_label = _payroll_month_label(run)
+    attendance_summary = payroll_service.payslip_attendance_summary(row)
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -126,7 +135,7 @@ def generate_payslip_pdf(
     elements.append(Paragraph(company_name, h1))
     elements.append(Paragraph(company_address, small))
     elements.append(Spacer(1, 4*mm))
-    elements.append(Paragraph(f"SALARY SLIP — {run.month_label}", h2))
+    elements.append(Paragraph(f"SALARY SLIP — {run_label}", h2))
     elements.append(HRFlowable(width="100%", thickness=1, color=brand))
     elements.append(Spacer(1, 3*mm))
 
@@ -160,11 +169,19 @@ def generate_payslip_pdf(
         [Paragraph("ATTENDANCE SUMMARY", section_hdr), "", "", "", "", ""],
         [
             Paragraph("Working Days", label),
-            Paragraph(str(row.working_days), value),
+            Paragraph(str(attendance_summary["working_days"]), value),
             Paragraph("Present", label),
-            Paragraph(str(row.present_days), value),
+            Paragraph(str(attendance_summary["present_days"]), value),
+            Paragraph("Leave", label),
+            Paragraph(str(attendance_summary["leave_days"]), value),
+        ],
+        [
+            Paragraph("Holidays", label),
+            Paragraph(str(attendance_summary["holiday_days"]), value),
             Paragraph("LOP Days", label),
-            Paragraph(str(row.lop_days), value),
+            Paragraph(str(attendance_summary["lop_days"]), value),
+            Paragraph("Payable Days", label),
+            Paragraph(str(attendance_summary["payable_days"]), value),
         ],
     ]
     att_table = Table(att_data, colWidths=[30*mm, 25*mm, 30*mm, 25*mm, 30*mm, 40*mm])
@@ -181,34 +198,19 @@ def generate_payslip_pdf(
     elements.append(Spacer(1, 4*mm))
 
     # ── Earnings + Deductions side-by-side ──
-    # Read component values directly from SalaryStructure for accuracy;
-    # fall back to row values when structure is unavailable.
-    special_allow   = ss.special_allowance   if ss else 0.0
-    transport_allow = ss.transport_allowance if ss else 0.0
-    medical_allow   = ss.medical_allowance   if ss else 0.0
-    other_allow     = ss.other_allowances    if ss else 0.0
-
     # Query one-time adjustments for this employee in this run
     adjustments = (
         db.query(PayrollAdjustment)
         .filter_by(run_id=run_id, employee_id=employee_id)
         .all()
     )
-    addition_adjs = [(a.adjustment_type.replace("_", " ").title(), a.amount)
-                     for a in adjustments if a.direction == "addition"]
     deduction_adjs = [(a.adjustment_type.replace("_", " ").title(), a.amount)
                       for a in adjustments if a.direction == "deduction"]
 
     earnings_base = [
-        ("Basic",              row.basic_pay),
-        ("HRA",                row.hra),
-        ("Special Allowance",  special_allow),
-        ("Transport Allowance",transport_allow),
-        ("Medical Allowance",  medical_allow),
+        (str(component["label"]), float(component["amount"]))
+        for component in payroll_service.payslip_earning_components(row)
     ]
-    if other_allow > 0:
-        earnings_base.append(("Other Allowances", other_allow))
-    earnings_base.extend(addition_adjs)
 
     # TDS note: show reason when TDS is ₹0 but employee has non-zero salary
     tds_label = "TDS"
@@ -239,7 +241,7 @@ def generate_payslip_pdf(
     sal_rows = [sal_header]
     for (e_label, e_val), (d_label, d_val) in zip(earnings, deductions):
         sal_rows.append([
-            Paragraph(e_label, label), "", Paragraph(_fmt_inr(e_val), value),
+            Paragraph(e_label, label), "", Paragraph(_fmt_inr(e_val) if e_label else "-", value),
             Paragraph(d_label, label), "", Paragraph(_fmt_inr(d_val) if d_val else "—", value),
         ])
 
@@ -415,6 +417,14 @@ def publish_payslip(
         _logger.warning("publish_payslip: no payslip found for run_id=%d emp_id=%d", run_id, employee_id)
         return False
 
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run or not run.payroll_locked or run.status not in (
+        "payslip_generated", "published", "closed", "disbursed"
+    ):
+        raise ValueError(
+            "Payslips can be published only after they are generated following Finance Head final approval."
+        )
+
     if slip.is_published:
         _logger.info("publish_payslip: payslip already published (run=%d emp=%d)", run_id, employee_id)
         return False
@@ -433,16 +443,16 @@ def publish_payslip(
     # ── Email notification ────────────────────────────────────────────────
     if send_email:
         try:
-            run = db.query(PayrollRun).filter_by(id=run_id).first()
             emp = db.query(Employee).filter_by(id=employee_id).first()
             if emp and run:
+                run_label = _payroll_month_label(run)
                 recipient = (getattr(emp, "official_email", None) or emp.email or "").strip()
                 if recipient:
                     from app.services.email_dispatcher import _send_email
-                    subject = f"Your payslip for {run.month_label} is now available"
+                    subject = f"Your payslip for {run_label} is now available"
                     body = (
                         f"Hi {emp.first_name or 'Employee'},\n\n"
-                        f"Your payslip for {run.month_label} has been published in WorkHive HRMS.\n\n"
+                        f"Your payslip for {run_label} has been published in WorkHive HRMS.\n\n"
                         f"Gross Pay:        ₹{slip.gross_salary:,.2f}\n"
                         f"Total Deductions: ₹{slip.total_deductions:,.2f}\n"
                         f"Net Pay:          ₹{slip.net_salary:,.2f}\n\n"
@@ -478,7 +488,17 @@ def bulk_publish_payslips(
     import logging as _log
     _logger = _log.getLogger("hrms.payslip")
 
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run or not run.payroll_locked or run.status not in (
+        "payslip_generated", "published", "closed", "disbursed"
+    ):
+        raise ValueError(
+            "Payslips can be published only after they are generated following Finance Head final approval."
+        )
+
     slips = db.query(Payslip).filter_by(run_id=run_id).all()
+    if not slips:
+        raise ValueError("Generate payslips before publishing to ESS.")
     published = already_published = failed = 0
 
     for slip in slips:
@@ -509,47 +529,90 @@ def bulk_publish_payslips(
     return {"published": published, "already_published": already_published, "failed": failed}
 
 
-def send_payslip_emails_for_run(db: Session, run_id: int) -> dict:
+def send_payslip_emails_for_run(db: Session, run_id: int, force: bool = False) -> dict:
     """Send payslip emails to all published employees in a run.
 
-    Returns {"sent": N, "failed": N, "skipped": N}.
-    Uses the existing WorkHive email dispatcher. Employee email is resolved from
-    employees.official_email first, then employees.email. No payroll email
-    address is stored.
+    Args:
+        force: when True, re-send even if email_sent / emailed_at is already set.
+
+    Returns:
+        total              – published payslips found
+        sent               – SMTP delivery confirmed
+        failed             – delivery attempted but failed (SMTP error, missing email, etc.)
+        skipped            – skipped for a known reason (already emailed, SMTP off, missing PDF)
+        skipped_employees  – [{name, email, reason}] for every skipped employee
+        failed_employees   – [{name, email, reason}] for every failure
     """
     import logging
-    from app.services.email_dispatcher import _send_email
+    from app.services.email_dispatcher import _send_email, _smtp_configured
 
     run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
     if not run:
-        return {"sent": 0, "failed": 0, "skipped": 0}
+        return {
+            "total": 0, "sent": 0, "failed": 0, "skipped": 0,
+            "skipped_employees": [], "failed_employees": [],
+        }
+    run_label = _payroll_month_label(run)
 
     slips = db.query(Payslip).filter_by(run_id=run_id, is_published=True).all()
+    total = len(slips)
     sent = failed = skipped = 0
+    skipped_employees: list[dict] = []
+    failed_employees: list[dict] = []
     logger = logging.getLogger("hrms.payslip")
+
+    smtp_up = _smtp_configured()
 
     for slip in slips:
         emp = slip.employee
+        emp_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() if emp else "Unknown"
         recipient = ""
         if emp:
             recipient = (getattr(emp, "official_email", None) or emp.email or "").strip()
+
+        # ── Missing email address ──────────────────────────────────────────
         if not emp or not recipient:
+            reason = "Missing email address"
+            logger.warning("Payslip email skipped: employee_id=%s run_id=%d — %s",
+                           slip.employee_id, run_id, reason)
+            failed_employees.append({"name": emp_name, "email": recipient or "—", "reason": reason})
+            failed += 1
+            continue
+
+        # ── Already emailed (bypass with force=True) ───────────────────────
+        if not force and (slip.email_sent or slip.emailed_at):
+            logger.info("Payslip email skipped (already sent): employee_id=%d email=%s run_id=%d",
+                        emp.id, recipient, run_id)
+            skipped_employees.append({"name": emp_name, "email": recipient, "reason": "Already emailed"})
             skipped += 1
             continue
-        if slip.email_sent or slip.emailed_at:
+
+        # ── SMTP not configured ────────────────────────────────────────────
+        if not smtp_up:
+            logger.info("Payslip email skipped (no SMTP): employee_id=%d email=%s run_id=%d",
+                        emp.id, recipient, run_id)
+            skipped_employees.append({"name": emp_name, "email": recipient, "reason": "SMTP not configured"})
             skipped += 1
             continue
+
+        # ── Payslip PDF check (informational — email still sent as plain text) ──
+        pdf_available = bool(slip.payslip_url)
+        if not pdf_available:
+            logger.info("Payslip PDF not found for employee_id=%d run_id=%d — sending plain text email",
+                        emp.id, run_id)
+
+        # ── Attempt SMTP delivery ──────────────────────────────────────────
         try:
-            subject = f"Your WorkHive payslip for {run.month_label} is published"
+            subject = f"Your WorkHive payslip for {run_label} is published"
             body = (
                 f"Hi {emp.first_name or ''},\n\n"
-                f"Your payslip for {run.month_label} has been published in WorkHive HRMS.\n\n"
+                f"Your payslip for {run_label} has been published in WorkHive HRMS.\n\n"
                 f"Gross Pay: INR {slip.gross_salary:,.2f}\n"
                 f"Total Deductions: INR {slip.total_deductions:,.2f}\n"
                 f"Net Pay: INR {slip.net_salary:,.2f}\n\n"
                 "Please sign in to WorkHive to view or download the detailed payslip.\n"
             )
-            delivered = _send_email(recipient, subject, body)
+            delivered, err_reason = _send_email(recipient, subject, body)
             if delivered:
                 now = datetime.utcnow()
                 slip.email_sent = True
@@ -557,37 +620,101 @@ def send_payslip_emails_for_run(db: Session, run_id: int) -> dict:
                 slip.emailed_at = now
                 db.commit()
                 sent += 1
+                logger.info(
+                    "Payslip email sent: employee_id=%d email=%s run_id=%d pdf_available=%s",
+                    emp.id, recipient, run_id, pdf_available,
+                )
             else:
-                # Existing dispatcher may run in log-only mode when SMTP is not
-                # configured. Do not fake emailed_at in that case.
-                skipped += 1
+                reason = err_reason or "SMTP delivery failed"
+                logger.error(
+                    "Payslip email SMTP failure: employee_id=%d email=%s run_id=%d reason=%s",
+                    emp.id, recipient, run_id, reason,
+                )
+                failed_employees.append({"name": emp_name, "email": recipient, "reason": reason})
+                failed += 1
         except Exception as exc:
+            reason = f"Unexpected error: {exc}"
             logger.warning(
-                "Failed to send payslip email to %s: %s", recipient or "?", exc
+                "Payslip email exception: employee_id=%d email=%s run_id=%d — %s",
+                emp.id, recipient, run_id, exc,
             )
+            failed_employees.append({"name": emp_name, "email": recipient, "reason": reason})
             failed += 1
 
-    return {"sent": sent, "failed": failed, "skipped": skipped}
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "skipped": skipped,
+        "skipped_employees": skipped_employees,
+        "failed_employees": failed_employees,
+    }
 
 
 def generate_bank_advice_csv(db: Session, run_id: int) -> str:
     """Generate bank advice as CSV string for bulk salary transfer."""
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run or not run.payroll_locked or run.status not in (
+        "approved", "payslip_generated", "published", "closed", "disbursed"
+    ):
+        raise ValueError("Finance Head final approval is required before generating bank advice.")
+
+    open_errors = (
+        db.query(PayrollError)
+        .filter_by(run_id=run_id, is_resolved=False)
+        .count()
+    )
+    if open_errors > 0:
+        raise ValueError("Bank advice generation blocked. Resolve payroll errors before continuing.")
+
     rows = (
         db.query(PayrollRunEmployee)
         .filter_by(run_id=run_id)
         .all()
     )
-    lines = ["Employee Code,Employee Name,Bank Name,Account Number,IFSC Code,Net Salary"]
+
+    from utils.crypto import decrypt_pii_optional
+
+    # Collect and validate bank details for all employees before writing CSV.
+    # Validation must happen first so generation is blocked atomically.
+    missing_bank: list[str] = []
+    employee_rows: list[tuple] = []
     for row in rows:
         emp = row.employee
-        ss = db.query(SalaryStructure).filter_by(employee_id=row.employee_id).first()
+        ss = row.salary_structure or (
+            db.query(SalaryStructure)
+            .filter_by(employee_id=row.employee_id, is_active=True)
+            .order_by(SalaryStructure.effective_from.desc(), SalaryStructure.created_at.desc())
+            .first()
+        )
         if not emp:
             continue
         emp_code = emp.employee_code or f"EMP{emp.id:04d}"
         emp_name = f"{emp.first_name} {emp.last_name or ''}".strip()
-        bank = ss.bank_name if ss else ""
-        acct = ss.account_number if ss else ""
-        ifsc = ss.ifsc_code if ss else ""
+        bank = (ss.bank_name if ss else None) or ""
+        acct = (ss.account_number if ss else None) or ""
+        ifsc = (ss.ifsc_code if ss else None) or ""
+
+        # Fallback to employee-level bank fields set during onboarding.
+        if not acct and getattr(emp, "bank_account_encrypted", None):
+            acct = decrypt_pii_optional(emp.bank_account_encrypted) or ""
+        if not ifsc and getattr(emp, "bank_ifsc", None):
+            ifsc = emp.bank_ifsc or ""
+
+        if not acct or not ifsc:
+            missing_bank.append(emp_name)
         net = f"{row.net_pay:.2f}"
-        lines.append(f"{emp_code},{emp_name},{bank},{acct},{ifsc},{net}")
-    return "\n".join(lines)
+        employee_rows.append((emp_code, emp_name, bank, acct, ifsc, net))
+
+    if missing_bank:
+        raise ValueError(
+            f"Bank details missing for: {', '.join(missing_bank)}. "
+            "Update employee profile/onboarding before generating bank advice."
+        )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Employee Code", "Employee Name", "Bank Name", "Account Number", "IFSC Code", "Net Salary"])
+    for emp_code, emp_name, bank, acct, ifsc, net in employee_rows:
+        writer.writerow([emp_code, emp_name, bank, acct, ifsc, net])
+    return buffer.getvalue()

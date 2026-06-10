@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import date as date_t, datetime
+from datetime import date as date_t
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -30,6 +30,7 @@ from app.models import (
 )
 from app.schemas.timesheet import HRTimesheetEntriesIn, HRTimesheetOut, ProjectOut, TaskOut, TimesheetDetailOut, TimesheetEntryOut
 from app.services.audit_service import write_audit
+from utils.time_utils import now_utc
 
 
 router = APIRouter(prefix="/hr", tags=["hr"])
@@ -215,7 +216,7 @@ def hr_edit_timesheet_entries(
             TimesheetEntry.timesheet_id == ts_id
         ).scalar() or 0.0
         ts.total_logged_hours = round(float(total), 2)
-        ts.updated_at = datetime.now()
+        ts.updated_at = now_utc()
 
         db.flush()
 

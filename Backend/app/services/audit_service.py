@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import json
-import secrets
-import string
+import uuid
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
@@ -11,18 +10,19 @@ from sqlalchemy.orm import Session
 from app.models import AuditLog
 
 
-_ALPHA = string.ascii_uppercase + string.digits
+def _new_audit_id() -> str:
+    """Generate a collision-proof audit ID using UUID4.
 
+    The previous COUNT(*)-based approach caused PRIMARY KEY violations during
+    bulk operations: all write_audit() calls within the same transaction saw the
+    same COUNT value (uncommitted inserts are invisible to COUNT), so every call
+    in the same bulk loop produced an identical ``AUDIT{N+1:05d}`` ID, triggering
+    an IntegrityError → HTTP 500.
 
-def _new_audit_id(db: Session) -> str:
-    """Generate a fresh AUDIT##### id. Uses count + random suffix to avoid PK clash."""
-    count = db.query(AuditLog).count()
-    base = f"AUDIT{count + 1:05d}"
-    if db.get(AuditLog, base) is None:
-        return base
-    # Collision fallback (rare).
-    suffix = "".join(secrets.choice(_ALPHA) for _ in range(4))
-    return f"AUDIT{count + 1:05d}{suffix}"
+    UUID4 hex is statistically unique with no DB read required, making it safe
+    for concurrent / bulk use.
+    """
+    return f"AUDIT{uuid.uuid4().hex[:12].upper()}"
 
 
 def _to_json(v: Any) -> Optional[str]:
@@ -47,10 +47,15 @@ def write_audit(
     new_value: Any = None,
     ip_address: Optional[str] = None,
 ) -> Optional[AuditLog]:
-    """Append a row to audit_logs. Never raises — audit is best-effort."""
+    """Append a row to audit_logs. Never raises — audit is best-effort.
+
+    IMPORTANT: do NOT call db.rollback() here.  Rolling back inside an audit
+    helper would silently undo any enclosing savepoint created by a bulk route
+    handler, corrupting the entire bulk operation.
+    """
     try:
         row = AuditLog(
-            id=_new_audit_id(db),
+            id=_new_audit_id(),
             actor_employee_id=actor_id,
             action=(action or "")[:60],
             target_table=(target_table or "")[:80],
@@ -62,8 +67,7 @@ def write_audit(
         db.add(row)
         return row
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        # Silently swallow — audit failure must never break the calling operation.
+        # Do NOT call db.rollback() here: that would corrupt any enclosing
+        # savepoint or ongoing bulk transaction.
         return None

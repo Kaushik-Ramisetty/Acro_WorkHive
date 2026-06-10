@@ -58,6 +58,10 @@ _ALLOWED: dict[tuple[str, str], str] = {
     (LeaveStatus.PENDING,        "reject"):           LeaveStatus.REJECTED,
     (LeaveStatus.PENDING,        "cancel"):           LeaveStatus.CANCELLED,
 
+    # LOP two-stage: manager approves → HR pending; HR approves → approved
+    (LeaveStatus.PENDING,        "advance_to_hr"):    LeaveStatus.PENDING,
+    (LeaveStatus.PENDING,        "approve_hr"):       LeaveStatus.APPROVED,
+
     (LeaveStatus.APPROVED,       "cancel"):           LeaveStatus.CANCEL_PENDING,
     (LeaveStatus.APPROVED,       "consume"):          LeaveStatus.CONSUMED,        # legacy
     (LeaveStatus.APPROVED,       "complete"):         LeaveStatus.COMPLETED,        # Hybrid v2 — scheduler
@@ -106,7 +110,9 @@ def transition(req: LeaveRequest, action: str, actor: Optional[Employee] = None)
     #   pending          -> 'manager' (single-stage approval after HR removal)
     #   cancel_pending   -> 'manager' (manager approves cancellation, HR notified)
     #   anything else    -> None
-    if target == LeaveStatus.PENDING or target == LeaveStatus.CANCEL_PENDING:
+    if action == "advance_to_hr":
+        req.next_approver_role = "hr"
+    elif target == LeaveStatus.PENDING or target == LeaveStatus.CANCEL_PENDING:
         req.next_approver_role = "manager"
     else:
         req.next_approver_role = None

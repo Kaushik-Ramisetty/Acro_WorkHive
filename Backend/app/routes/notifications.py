@@ -19,7 +19,6 @@ Filtering on the paginated endpoint
 - ``type=...``        — exact type match (advanced)
 - ``q=...``           — case-insensitive substring search across title + body
 """
-from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,6 +30,7 @@ from app.db.session import get_db
 from app.models import Employee, Notification
 from app.schemas.leave import NotificationOut, NotificationListOut
 from app.services.notification_service import derive_action_url
+from utils.time_utils import now_utc
 
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
@@ -151,7 +151,7 @@ def _mark_read(db: Session, user: Employee, notification_id: int) -> Notificatio
         raise HTTPException(status_code=404, detail="Notification not found")
     if not n.is_read:
         n.is_read = True
-        n.read_at = datetime.utcnow()
+        n.read_at = now_utc()
         db.commit()
         db.refresh(n)
     return _serialize(n)
@@ -174,7 +174,7 @@ def _mark_all_read(db: Session, user: Employee) -> dict:
         .filter(Notification.recipient_id == user.id, Notification.is_read.is_(False))
         .all()
     )
-    now = datetime.utcnow()
+    now = now_utc()
     for n in rows:
         n.is_read = True
         n.read_at = now

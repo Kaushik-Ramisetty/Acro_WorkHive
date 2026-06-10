@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.otp_tasks",
         "app.tasks.attendance_jobs",
         "app.tasks.scan_upload",
+        "app.tasks.pms_auto_lock",
     ],
 )
 
@@ -76,5 +77,12 @@ celery_app.conf.beat_schedule = {
     "secure-upload-cleanup-orphans": {
         "task": "secure_upload.cleanup_orphans",
         "schedule": crontab(minute="*/15"),
+    },
+    # PMS auto-lock: runs daily at 01:00 UTC, locks all three phase entities
+    # (GoalAssignment / MidCycleReview / EndCycleAssessment) whose deadline
+    # has elapsed. Auto-locked records are permanently immutable.
+    "pms-auto-lock": {
+        "task": "pms.auto_lock",
+        "schedule": crontab(hour=1, minute=0),
     },
 }

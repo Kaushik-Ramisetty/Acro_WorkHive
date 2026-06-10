@@ -33,6 +33,15 @@ function RunPicker({ runs, selectedId, onChange }) {
 }
 
 function PayslipModal({ emp, runLabel, onClose }) {
+  const earningsRows = (Array.isArray(emp.earnings_components) && emp.earnings_components.length
+    ? emp.earnings_components.map((c) => ({ label: c.label, value: c.amount }))
+    : [
+        { label: 'Basic', value: emp.basic_pay },
+        { label: 'HRA', value: emp.hra },
+        { label: 'Special Allowance', value: Number(emp.gross_earnings || 0) - Number(emp.basic_pay || 0) - Number(emp.hra || 0) },
+      ]
+  ).filter((row) => Number(row.value || 0) > 0);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
       <div className="w-full max-w-lg bg-white rounded-2xl shadow-xl overflow-hidden">
@@ -54,6 +63,8 @@ function PayslipModal({ emp, runLabel, onClose }) {
           <div className="text-right text-xs text-slate-500">
             <p>Working Days: <span className="font-medium text-slate-700">{emp.working_days}</span></p>
             <p>Present: <span className="font-medium text-slate-700">{emp.present_days}</span></p>
+            <p>Leave: <span className="font-medium text-slate-700">{emp.leave_days}</span></p>
+            <p>Holidays: <span className="font-medium text-slate-700">{emp.holiday_days || 0}</span></p>
             <p>LOP: <span className="font-medium text-rose-600">{emp.lop_days}</span></p>
           </div>
         </div>
@@ -63,11 +74,7 @@ function PayslipModal({ emp, runLabel, onClose }) {
           <div>
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Earnings</p>
             <div className="space-y-2 text-sm">
-              {[
-                { label: 'Basic', value: emp.basic_pay },
-                { label: 'HRA',   value: emp.hra },
-                { label: 'Allowances', value: emp.special_allowance },
-              ].map((row) => (
+              {earningsRows.map((row) => (
                 <div key={row.label} className="flex justify-between">
                   <span className="text-slate-600">{row.label}</span>
                   <span className="font-mono text-slate-700">{fmt(row.value)}</span>
@@ -128,9 +135,39 @@ function PayslipModal({ emp, runLabel, onClose }) {
   );
 }
 
+// Build a human-readable toast from a send-payslip-emails API response.
+// Surfaces per-employee skip reasons instead of a generic catch-all message.
+function _emailResultToast(res, isForce = false) {
+  const prefix = isForce ? '[Force Resend] ' : '';
+  if (!res || res.total === 0) return `${prefix}No published payslips found for this run`;
+  if (res.sent > 0 && res.failed === 0 && res.skipped === 0) {
+    return `${prefix}${res.sent} payslip email(s) sent`;
+  }
+  if (res.sent > 0) {
+    return `${prefix}${res.sent} sent, ${res.failed} failed, ${res.skipped} skipped`;
+  }
+  if (res.failed > 0 && res.skipped === 0) {
+    const reasons = [...new Set((res.failed_employees || []).map(e => e.reason))].join('; ');
+    return `${prefix}Delivery failed for ${res.failed} employee(s) — ${reasons || 'check server logs'}`;
+  }
+  // All skipped — group by reason and list counts
+  const counts = {};
+  (res.skipped_employees || []).forEach(e => {
+    const r = e.reason || 'unknown reason';
+    counts[r] = (counts[r] || 0) + 1;
+  });
+  const detail = Object.entries(counts).map(([r, n]) => `${n} ${r.toLowerCase()}`).join(', ');
+  return `${prefix}${res.skipped} skipped — ${detail || 'see server logs'}`;
+}
+
 export default function PayslipBankAdvice() {
   const navigate = useNavigate();
   const { role } = useAuth();
+  const r = (role || '').toLowerCase();
+  // Only Finance team (finance, admin) may trigger write actions — not HR or Finance Head
+  const isFinanceOnly = r === 'finance' || r === 'admin';
+  // Finance Head has read-only access to compliance reports for audit oversight
+  const isFinanceHead = r === 'finance_head' || r === 'financehead';
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [run, setRun] = useState(null);
@@ -142,7 +179,7 @@ export default function PayslipBankAdvice() {
   const [search, setSearch] = useState('');
   const [toast, setToast] = useState('');
 
-  const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 2500); };
+  const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 4000); };
 
   // Uses api.downloadBlob which reads the token from the correct localStorage key
   // (hrms.auth.token) via getToken() — same as all other authenticated requests.
@@ -273,6 +310,7 @@ export default function PayslipBankAdvice() {
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-soft">
           <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Bulk Export</p>
           <div className="flex flex-wrap gap-3">
+            {isFinanceOnly && (
             <button
               onClick={() => downloadWithAuth(
                 `/finance/runs/${selectedId}/bank-advice`,
@@ -284,139 +322,157 @@ export default function PayslipBankAdvice() {
               <span>🏦</span>
               <span>Bank Advice (CSV)</span>
             </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/pf-register`,
-                `pf_register_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="PF register for statutory compliance"
-            >
-              <span>🏛</span>
-              <span>PF Register (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/esi-register`,
-                `esi_register_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="ESI register for statutory compliance"
-            >
-              <span>📊</span>
-              <span>ESI Register (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/pt-register`,
-                `pt_register_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Professional Tax register"
-            >
-              <span>📋</span>
-              <span>PT Register (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/tds-report`,
-                `tds_report_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="TDS report with regime and declaration details"
-            >
-              <span>🧾</span>
-              <span>TDS Report (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/form16-batch`,
-                `form16_batch_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Form 16 annual TDS summary for all employees"
-            >
-              <span>📄</span>
-              <span>Form 16 Batch (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/pf-challan`,
-                `pf_challan_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="PF challan for deposit with EPFO"
-            >
-              <span>🏦</span>
-              <span>PF Challan (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/compliance/esi-filing`,
-                `esi_filing_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="ESI filing format for ESIC portal"
-            >
-              <span>🏥</span>
-              <span>ESI Filing (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/payroll-register`,
-                `payroll_register_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Full payroll register with all components"
-            >
-              <span>📑</span>
-              <span>Payroll Register (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/bonus-report`,
-                `bonus_report_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Bonus adjustments for this run"
-            >
-              <span>🎁</span>
-              <span>Bonus Report (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/variable-pay-report`,
-                `variable_pay_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Variable pay and incentives for this run"
-            >
-              <span>💹</span>
-              <span>Variable Pay (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/reimbursement-report`,
-                `reimbursements_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Approved reimbursements for this run"
-            >
-              <span>🧳</span>
-              <span>Reimbursements (CSV)</span>
-            </button>
-            <button
-              onClick={() => downloadWithAuth(
-                `/finance/runs/${selectedId}/gratuity-report`,
-                `gratuity_provision_run${selectedId}.csv`
-              )}
-              className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
-              title="Annual gratuity provision per employee"
-            >
-              <span>🏦</span>
-              <span>Gratuity Provision (CSV)</span>
-            </button>
-            {run && ['approved','payslip_generated','published','closed','disbursed'].includes(run.status) && (
+            )}
+            {(isFinanceOnly || isFinanceHead) && (
+              <button
+                onClick={() => downloadWithAuth(
+                  `/finance/runs/${selectedId}/payroll-summary/export`,
+                  `payroll_summary_run${selectedId}.xlsx`
+                )}
+                className="flex items-center gap-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm font-semibold text-indigo-700 hover:bg-indigo-100 hover:border-indigo-300 transition"
+                title="Download full payroll summary with all components and bank details (Excel)"
+              >
+                <span>📊</span>
+                <span>Export Summary (Excel)</span>
+              </button>
+            )}
+            {(isFinanceOnly || isFinanceHead) && (
+              <>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/pf-register`,
+                    `pf_register_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="PF register for statutory compliance"
+                >
+                  <span>🏛</span>
+                  <span>PF Register (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/esi-register`,
+                    `esi_register_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="ESI register for statutory compliance"
+                >
+                  <span>📊</span>
+                  <span>ESI Register (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/pt-register`,
+                    `pt_register_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Professional Tax register"
+                >
+                  <span>📋</span>
+                  <span>PT Register (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/tds-report`,
+                    `tds_report_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="TDS report with regime and declaration details"
+                >
+                  <span>🧾</span>
+                  <span>TDS Report (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/form16-batch`,
+                    `form16_batch_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Form 16 annual TDS summary for all employees"
+                >
+                  <span>📄</span>
+                  <span>Form 16 Batch (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/pf-challan`,
+                    `pf_challan_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="PF challan for deposit with EPFO"
+                >
+                  <span>🏦</span>
+                  <span>PF Challan (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/compliance/esi-filing`,
+                    `esi_filing_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="ESI filing format for ESIC portal"
+                >
+                  <span>🏥</span>
+                  <span>ESI Filing (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/payroll-register`,
+                    `payroll_register_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Full payroll register with all components"
+                >
+                  <span>📑</span>
+                  <span>Payroll Register (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/bonus-report`,
+                    `bonus_report_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Bonus adjustments for this run"
+                >
+                  <span>🎁</span>
+                  <span>Bonus Report (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/variable-pay-report`,
+                    `variable_pay_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Variable pay and incentives for this run"
+                >
+                  <span>💹</span>
+                  <span>Variable Pay (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/reimbursement-report`,
+                    `reimbursements_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Approved reimbursements for this run"
+                >
+                  <span>🧳</span>
+                  <span>Reimbursements (CSV)</span>
+                </button>
+                <button
+                  onClick={() => downloadWithAuth(
+                    `/finance/runs/${selectedId}/gratuity-report`,
+                    `gratuity_provision_run${selectedId}.csv`
+                  )}
+                  className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition"
+                  title="Annual gratuity provision per employee"
+                >
+                  <span>🏦</span>
+                  <span>Gratuity Provision (CSV)</span>
+                </button>
+              </>
+            )}
+            {isFinanceOnly && run && ['payslip_generated','published','closed','disbursed'].includes(run.status) && (
               <button
                 onClick={async () => {
                   try {
@@ -431,19 +487,34 @@ export default function PayslipBankAdvice() {
                 <span>Publish All to ESS</span>
               </button>
             )}
-            {run && ['published','closed','disbursed'].includes(run.status) && (
-              <button
-                onClick={async () => {
-                  try {
-                    await financeApi.sendPayslipEmails(selectedId);
-                    showToast('Payslip emails sent successfully');
-                  } catch (e) { showToast(e?.data?.detail || 'Email send failed'); }
-                }}
-                className="flex items-center gap-2.5 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-medium text-blue-700 hover:bg-blue-100 transition"
-              >
-                <span>✉️</span>
-                <span>Send Payslip Emails</span>
-              </button>
+            {isFinanceOnly && run && ['published','closed','disbursed'].includes(run.status) && (
+              <>
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await financeApi.sendPayslipEmails(selectedId);
+                      showToast(_emailResultToast(res));
+                    } catch (e) { showToast(e?.data?.detail || 'Email send failed'); }
+                  }}
+                  className="flex items-center gap-2.5 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-medium text-blue-700 hover:bg-blue-100 transition"
+                >
+                  <span>✉️</span>
+                  <span>Send Payslip Emails</span>
+                </button>
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await financeApi.sendPayslipEmailsForce(selectedId);
+                      showToast(_emailResultToast(res, true));
+                    } catch (e) { showToast(e?.data?.detail || 'Force resend failed'); }
+                  }}
+                  className="flex items-center gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm font-medium text-amber-700 hover:bg-amber-100 transition"
+                  title="Ignore already-sent flag and resend to all published payslips"
+                >
+                  <span>🔁</span>
+                  <span>Force Resend</span>
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -519,7 +590,7 @@ export default function PayslipBankAdvice() {
                           >
                             PDF ↓
                           </button>
-                          {!e.payslip_generated && (
+                          {!e.payslip_generated && isFinanceOnly && (
                             <button
                               onClick={() => handleMarkGenerated(e)}
                               disabled={generating === e.employee_id}

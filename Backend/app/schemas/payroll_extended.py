@@ -1,10 +1,11 @@
 """Pydantic schemas for the extended payroll tables."""
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ─── Statutory Settings ───────────────────────────────────────────────────────
@@ -98,6 +99,13 @@ class PayslipOut(BaseModel):
     emailed_at: Optional[datetime] = None
     download_count: int = 0
     created_at: datetime
+
+    @model_validator(mode='after')
+    def _derive_period_fields(self) -> 'PayslipOut':
+        self.month_label = f"{calendar.month_name[self.pay_period_start.month]} {self.pay_period_start.year}"
+        self.month = self.pay_period_start.month
+        self.year = self.pay_period_start.year
+        return self
 
     class Config:
         from_attributes = True

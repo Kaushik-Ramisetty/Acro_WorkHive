@@ -17,7 +17,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text,
-    UniqueConstraint, event, func,
+    UniqueConstraint, event, func, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -129,6 +129,11 @@ class PayrollRun(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     disbursed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Bank advice tracking
+    bank_advice_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    bank_advice_generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    bank_advice_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     # Ownership
     initiated_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("employees.id"), nullable=True
@@ -141,6 +146,21 @@ class PayrollRun(Base):
     )
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Variance review fields — populated after Finance acknowledges variance log.
+    # These columns exist in the DB (added via ALTER TABLE) but were missing from
+    # the ORM mapping, causing silent write failures on commit.
+    variance_reviewed: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=False)
+    variance_reviewed_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id"), nullable=True
+    )
+    variance_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    variance_threshold_pct: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=20.0,
+        server_default=text("20.0"),
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -169,7 +189,7 @@ class PayrollRun(Base):
     @property
     def lifecycle_status(self) -> str:
         if self.status == "approved" and self.payroll_locked:
-            return "FINALIZED"
+            return "FINAL_APPROVED"
         mapping = {
             "draft": "DRAFT",
             "attendance_frozen": "DRAFT",
@@ -286,7 +306,15 @@ class PayrollRunEmployee(Base):
         """Populate retired amount columns from the source-of-truth columns."""
         self.gross_salary = self.gross_earnings or 0.0
         self.basic = self.basic_pay or 0.0
-        self.allowances = self.special_allowance or 0.0
+        self.allowances = round(sum(float(v or 0.0) for v in (
+            self.da,
+            self.special_allowance,
+            self.lta,
+            self.conveyance,
+            self.bonus,
+            self.variable_pay,
+            self.overtime_amount,
+        )), 2)
         self.pf_employee = self.employee_pf or 0.0
         self.pf_employer = self.employer_pf or 0.0
         self.esi_employee = self.employee_esi or 0.0

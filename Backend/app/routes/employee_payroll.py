@@ -6,23 +6,26 @@ Prefix: /employee/payroll
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, get_current_user
 from app.models.employee import Employee
 from app.models.payroll_extended import Payslip, Reimbursement, EmployeeTaxDeclaration
 from app.models.payroll import PayrollRun, PayrollRunEmployee, SalaryStructure
-from app.services import payslip_service
+from app.services import payslip_service, payroll_service
 
-# Month name lookup — shared by salary-structure and attendance endpoints
-_MONTH_NAMES = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December',
-]
+
+def _month_label_from_parts(month: int, year: int) -> str:
+    return payroll_service.payroll_month_label(date(year, month, 1))
+
+
+def _payslip_month_label(slip: Payslip) -> str:
+    return payroll_service.payroll_month_label(slip.pay_period_start)
 
 router = APIRouter(
     prefix="/employee/payroll",
@@ -41,7 +44,14 @@ def my_payslips(
 ):
     slips = (
         db.query(Payslip)
-        .filter_by(employee_id=current.id, is_published=True)
+        .join(PayrollRun, PayrollRun.id == Payslip.run_id)
+        .filter(
+            Payslip.employee_id == current.id,
+            or_(
+                Payslip.is_published.is_(True),
+                PayrollRun.status.in_(["approved", "completed", "disbursed"]),
+            ),
+        )
         .order_by(Payslip.pay_period_start.desc())
         .all()
     )
@@ -50,7 +60,7 @@ def my_payslips(
         result.append({
             "id": s.id,
             "run_id": s.run_id,
-            "month_label": s.month_label,
+            "month_label": _payslip_month_label(s),
             "pay_period_start": s.pay_period_start,
             "pay_period_end": s.pay_period_end,
             "gross_salary": s.gross_salary,
@@ -70,23 +80,23 @@ def my_payslip_detail(
     current: Employee = CurrentUser,
 ):
     slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=current.id).first()
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
     if not slip:
         raise HTTPException(status_code=404, detail="Payslip not found or not yet published")
-    if not slip.is_published:
+    run_is_published = run and run.status in ("approved", "completed", "disbursed")
+    if not slip.is_published and not run_is_published:
         raise HTTPException(status_code=403, detail="Payslip not yet published")
 
     row = db.query(PayrollRunEmployee).filter_by(run_id=run_id, employee_id=current.id).first()
-    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
 
     earnings = {}
     deductions = {}
+    attendance_summary = None
     if row:
-        earnings = {
-            "Basic": row.basic_pay,
-            "HRA": row.hra,
-            "Allowances": row.special_allowance,
-            "Gross Salary": row.gross_earnings,
-        }
+        earning_components = payroll_service.payslip_earning_components(row)
+        attendance_summary = payroll_service.payslip_attendance_summary(row)
+        earnings = {c["label"]: c["amount"] for c in earning_components}
+        earnings["Gross Salary"] = row.gross_earnings
         deductions = {
             "PF (Employee)": row.employee_pf,
             "ESI (Employee)": row.employee_esi,
@@ -98,16 +108,28 @@ def my_payslip_detail(
 
     return {
         "run_id": run_id,
-        "month_label": slip.month_label,
+        "month_label": _payslip_month_label(slip),
         "pay_period": f"{slip.pay_period_start} to {slip.pay_period_end}",
         "gross_salary": slip.gross_salary,
         "total_deductions": slip.total_deductions,
         "net_salary": slip.net_salary,
         "earnings": earnings,
         "deductions": deductions,
-        "working_days": row.working_days if row else None,
-        "present_days": row.present_days if row else None,
-        "lop_days": row.lop_days if row else None,
+        "working_days": attendance_summary["working_days"] if attendance_summary else None,
+        "present_days": attendance_summary["present_days"] if attendance_summary else None,
+        "leave_days": attendance_summary["leave_days"] if attendance_summary else None,
+        "holiday_days": attendance_summary["holiday_days"] if attendance_summary else None,
+        "lop_days": attendance_summary["lop_days"] if attendance_summary else None,
+        "attendance_reconciled": (
+            attendance_summary["attendance_reconciled"] if attendance_summary else True
+        ),
+        "attendance_reconciliation_delta": (
+            attendance_summary["attendance_reconciliation_delta"] if attendance_summary else 0
+        ),
+        "earnings_total": payroll_service.payslip_earnings_total(row) if row else 0.0,
+        "earnings_reconciliation_delta": (
+            payroll_service.payslip_earnings_reconciliation_delta(row) if row else 0.0
+        ),
         "published_at": slip.published_at,
     }
 
@@ -122,7 +144,9 @@ def my_payslip_pdf(
     slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=current.id).first()
     if not slip:
         raise HTTPException(status_code=404, detail="Payslip not found")
-    if not slip.is_published:
+    run_pdf = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    run_is_published_pdf = run_pdf and run_pdf.status in ("approved", "completed", "disbursed")
+    if not slip.is_published and not run_is_published_pdf:
         raise HTTPException(status_code=403, detail="Payslip not yet published")
 
     pdf_bytes = payslip_service.generate_payslip_pdf(db, run_id, current.id)
@@ -152,8 +176,7 @@ def my_payslip_pdf(
         pass  # Audit failure must never block the download
 
     emp_name = f"{current.first_name}_{current.last_name or ''}".strip("_")
-    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
-    month = run.month_label.replace(" ", "_") if run else f"run{run_id}"
+    month = _payslip_month_label(slip).replace(" ", "_") if slip else f"run{run_id}"
     filename = f"payslip_{emp_name}_{month}.pdf"
     return Response(
         content=pdf_bytes,
@@ -203,7 +226,7 @@ def ytd_summary(
         "months_paid": len(slips),
         "monthly_breakdown": [
             {
-                "month_label": s.month_label,
+                "month_label": _payslip_month_label(s),
                 "gross": s.gross_salary,
                 "deductions": s.total_deductions,
                 "net": s.net_salary,
@@ -419,37 +442,49 @@ def my_salary_structure(
     if not ss:
         return None  # 200 + null body → FE shows "not assigned" message
 
-    # LTA lives in PayrollRunEmployee (not SalaryStructure).
-    # Pull it from the most recent payroll row for a best-effort display.
+    # gross_monthly: always calculate from annual_ctc; stored value may be 0
+    gross_monthly = round(ss.annual_ctc / 12, 2) if ss.annual_ctc else round(ss.gross_monthly or 0, 2)
+
+    # net_monthly: prefer latest approved/disbursed payroll run record; fall back to stored value; else None
+    net_monthly = None
     lta = 0.0
     try:
         pre = (
             db.query(PayrollRunEmployee)
-            .filter(PayrollRunEmployee.employee_id == current.id)
+            .join(PayrollRun, PayrollRun.id == PayrollRunEmployee.run_id)
+            .filter(
+                PayrollRunEmployee.employee_id == current.id,
+                PayrollRun.status.in_(["approved", "disbursed"]),
+            )
             .order_by(PayrollRunEmployee.created_at.desc())
             .first()
         )
         if pre:
             lta = getattr(pre, "lta", 0.0) or 0.0
+            if pre.net_salary:
+                net_monthly = round(pre.net_salary, 2)
     except Exception:
         pass
 
+    if net_monthly is None and ss.net_monthly:
+        net_monthly = round(ss.net_monthly, 2)
+
     return {
         "annual_ctc":          round(ss.annual_ctc, 2),
-        "gross_monthly":       round(ss.gross_monthly, 2),
-        "basic":               round(ss.basic, 2),
-        "hra":                 round(ss.hra, 2),
-        "da":                  round(ss.da, 2),
+        "gross_monthly":       gross_monthly,
+        "basic":               round(ss.basic or 0, 2),
+        "hra":                 round(ss.hra or 0, 2),
+        "da":                  round(ss.da or 0, 2),
         "lta":                 round(lta, 2),
-        "special_allowance":   round(ss.special_allowance, 2),
-        "transport_allowance": round(ss.transport_allowance, 2),
-        "medical_allowance":   round(ss.medical_allowance, 2),
-        "other_allowances":    round(ss.other_allowances, 2),
-        "pf_employee":         round(ss.pf_employee, 2),
-        "professional_tax":    round(ss.professional_tax, 2),
-        "tds":                 round(ss.tds, 2),
-        "total_deductions":    round(ss.total_deductions, 2),
-        "net_monthly":         round(ss.net_monthly, 2),
+        "special_allowance":   round(ss.special_allowance or 0, 2),
+        "transport_allowance": round(ss.transport_allowance or 0, 2),
+        "medical_allowance":   round(ss.medical_allowance or 0, 2),
+        "other_allowances":    round(ss.other_allowances or 0, 2),
+        "pf_employee":         round(ss.pf_employee or 0, 2),
+        "professional_tax":    round(ss.professional_tax or 0, 2),
+        "tds":                 round(ss.tds or 0, 2),
+        "total_deductions":    round(ss.total_deductions or 0, 2),
+        "net_monthly":         net_monthly,
         "effective_from":      ss.effective_from,
         "last_revised":        ss.updated_at,
     }
@@ -485,7 +520,7 @@ def my_attendance_summary(
         {
             "month":              r.month,
             "year":               r.year,
-            "month_label":        f"{_MONTH_NAMES[r.month - 1]} {r.year}",
+            "month_label":        _month_label_from_parts(r.month, r.year),
             "working_days":       r.total_working_days,
             "present_days":       r.present_days,
             "leave_days":         r.leave_days,
@@ -510,32 +545,49 @@ def my_payroll_status(
     """Lightweight status card for the Employee Payroll dashboard header.
 
     Returns:
-      net_monthly       — from active salary structure
-      payroll_month     — current calendar month label
-      attendance_status — current month attendance status
-      attendance_frozen — is current month attendance frozen?
-      payslip_status    — 'published' | 'pending'
-      latest_payslip_month — month label of the most recent published payslip
+      payroll_cycle_started — true only when a payroll_run is active
+      net_monthly/gross_monthly — from this cycle's payroll_run_employee row
+      payroll_month — active payroll_run month label
+      attendance_status — attendance status for the active run's month
+      attendance_frozen — is attendance frozen for the active run's month?
+      payslip_status — only set for the active run
     """
-    from datetime import date
     from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
 
-    today = date.today()
-    month = today.month
-    year = today.year
+    empty_status = {
+        "payroll_cycle_started": False,
+        "message": "No payroll cycle started yet.",
+        "payroll_run_id": None,
+        "payroll_run_status": None,
+        "net_monthly": None,
+        "gross_monthly": None,
+        "payroll_month": None,
+        "attendance_status": "pending_cycle",
+        "attendance_frozen": False,
+        "payslip_status": None,
+        "latest_payslip_month": None,
+    }
 
-    # Active salary structure
-    ss = (
-        db.query(SalaryStructure)
-        .filter(
-            SalaryStructure.employee_id == current.id,
-            SalaryStructure.is_active.is_(True),
-        )
-        .order_by(SalaryStructure.effective_from.desc())
+    # ESS status must be driven by an actual payroll cycle. Monthly attendance
+    # rows can survive demo resets and should never create a "current payroll".
+    active_run = (
+        db.query(PayrollRun)
+        .filter(PayrollRun.status.notin_(["disbursed", "closed", "cancelled"]))
+        .order_by(PayrollRun.pay_period_start.desc(), PayrollRun.id.desc())
         .first()
     )
+    active_run = payroll_service.normalize_payroll_run_period(active_run)
+    if not active_run:
+        return empty_status
 
-    # Current month attendance
+    month = active_run.month or active_run.pay_period_start.month
+    year = active_run.year or active_run.pay_period_start.year
+
+    payroll_row = (
+        db.query(PayrollRunEmployee)
+        .filter_by(run_id=active_run.id, employee_id=current.id)
+        .first()
+    )
     att = (
         db.query(MonthlyAttendanceSummary)
         .filter(
@@ -545,20 +597,29 @@ def my_payroll_status(
         )
         .first()
     )
-
-    # Most recent published payslip
-    latest_slip = (
+    cycle_slip = (
         db.query(Payslip)
-        .filter_by(employee_id=current.id, is_published=True)
+        .filter_by(run_id=active_run.id, employee_id=current.id)
         .order_by(Payslip.pay_period_start.desc())
         .first()
     )
 
+    payslip_status = "pending"
+    latest_payslip_month = None
+    if cycle_slip:
+        latest_payslip_month = _payslip_month_label(cycle_slip)
+        payslip_status = "published" if cycle_slip.is_published else "generated"
+
     return {
-        "net_monthly":           round(ss.net_monthly, 2) if ss else None,
-        "payroll_month":         f"{_MONTH_NAMES[month - 1]} {year}",
+        "payroll_cycle_started": True,
+        "message": None,
+        "payroll_run_id":        active_run.id,
+        "payroll_run_status":    active_run.status,
+        "net_monthly":           round(float(payroll_row.net_pay or 0.0), 2) if payroll_row else None,
+        "gross_monthly":         round(float(payroll_row.gross_earnings or 0.0), 2) if payroll_row else None,
+        "payroll_month":         active_run.month_label or _month_label_from_parts(month, year),
         "attendance_status":     att.attendance_status if att else "not_available",
         "attendance_frozen":     att.is_frozen if att else False,
-        "payslip_status":        "published" if latest_slip else "pending",
-        "latest_payslip_month":  latest_slip.month_label if latest_slip else None,
+        "payslip_status":        payslip_status,
+        "latest_payslip_month":  latest_payslip_month,
     }

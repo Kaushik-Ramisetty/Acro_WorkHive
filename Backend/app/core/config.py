@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = ""        # defaults to SMTP_USERNAME if empty
     SMTP_FROM_NAME: str = "WorkHive HRMS"
     SMTP_USE_TLS: bool = True
+    CLIENT_ACTION_BASE_URL: str = "http://localhost:8000"
 
     @property
     def allowed_origins(self) -> List[str]:

@@ -190,6 +190,13 @@ class AttendanceReport(Base):
 
 
 class PayrollAttendanceSummary(Base):
+    """DEPRECATED — Sprint 3.
+    payroll_attendance_summary is no longer used for payroll calculation.
+    Canonical payroll input is monthly_attendance_summary (MonthlyAttendanceSummary).
+    This table is retained for historical data only — do not write to it from payroll flows.
+    Finance write routes (freeze/unfreeze/upsert) have been removed (HTTP 410 Gone).
+    payroll_service.py no longer imports or queries this model.
+    """
     __tablename__ = "payroll_attendance_summary"
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True)        # e.g. PAS00001

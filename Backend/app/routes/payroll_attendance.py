@@ -22,16 +22,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db, role_required
+from app.core.deps import get_db, get_current_user, role_required
 from app.models.employee import Employee
+from app.models.payroll import PayrollRun, PayrollRunEmployee
 from app.services import payroll_attendance_bridge as _bridge
 
 # ── Role guards ───────────────────────────────────────────────────────────────
-# Admin and Finance can read the summary.
-# Admin only may create manual entries and freeze (HR action).
-# Finance may read but cannot write (they are consumers, not producers).
-_READ_ROLES  = Depends(role_required("admin", "finance", "finance_head"))
-_WRITE_ROLES = Depends(role_required("admin"))   # HR/Admin only
+# HR and Admin can read and write the attendance summary.
+# Finance / Finance Head may read (they are consumers, not producers).
+_READ_ROLES  = Depends(role_required("admin", "hr", "finance", "finance_head"))
+_WRITE_ROLES = Depends(role_required("admin", "hr"))
 
 router = APIRouter(prefix="/payroll", tags=["Payroll Attendance Bridge"])
 
@@ -50,8 +50,15 @@ class ManualSummaryIn(BaseModel):
     total_working_days: int = Field(..., ge=0, le=31)
     present_days: int = Field(..., ge=0, le=31)
     leave_days: int = Field(default=0, ge=0, le=31)
-    lop_days: int = Field(default=0, ge=0, le=31)
     payable_days: float = Field(..., ge=0.0, le=31.0)
+    lop_days: Optional[int] = Field(
+        default=None, ge=0, le=31,
+        description=(
+            "LOP (Loss of Pay) days. When provided, stored with lop_source='Manual Override' "
+            "and protected from Leave Management sync overwrites. Omit to let LOP be "
+            "computed automatically from approved unpaid leave requests."
+        ),
+    )
     approved_timesheet_hours: float = Field(default=0.0, ge=0.0)
     timesheet_status: str = Field(default="pending")
 
@@ -67,6 +74,32 @@ class ValidateIn(BaseModel):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/attendance-summary/open-month",
+    summary="[HR Payroll Dashboard] Auto-detect the current open payroll month",
+    tags=["Payroll Attendance Bridge"],
+)
+def get_open_payroll_month(
+    db: Session = Depends(get_db),
+    _: Employee = _READ_ROLES,
+):
+    """Return the auto-detected open (non-frozen) payroll month.
+
+    Used by the HR dashboard to auto-load the correct month on page load
+    without requiring manual month selection or a payroll run ID.
+
+    Logic:
+    - Finds the latest month/year in monthly_attendance_summary where at
+      least one row is not yet frozen (HR still needs to validate/freeze).
+    - Falls back to the current calendar month when no data exists.
+
+    Response also includes available_months (newest-first) listing every
+    month that has at least one row in monthly_attendance_summary — used
+    to populate the month/year selector dropdown on the HR dashboard.
+    """
+    return _bridge.get_open_month(db)
+
 
 @router.get(
     "/attendance-summary",
@@ -105,13 +138,15 @@ def upsert_manual_summary(
 
     ── TEMPORARY PAYROLL BRIDGE ──
     Only for testing until the Attendance/Timesheet modules are ready.
-    Allowed roles: admin.
+    Allowed roles: admin, hr.
 
     Notes:
     - Cannot update a frozen row.
     - Resets validation_status to 'pending' — re-validate after every edit.
-    - payable_days formula used here: caller supplies the value directly.
-      Typical formula: present_days + approved_leave_days
+    - lop_days: when provided, stored as a Manual Override — not overwritten by
+      Leave Management syncs. When omitted, LOP is computed from approved unpaid leaves.
+    - payable_days formula: caller supplies the value directly, or pass payable_days=0
+      and lop_days to let the service recompute (working_days - lop_days).
     """
     # Verify the employee exists
     emp = db.query(Employee).filter(
@@ -133,8 +168,8 @@ def upsert_manual_summary(
             total_working_days=payload.total_working_days,
             present_days=payload.present_days,
             leave_days=payload.leave_days,
-            lop_days=payload.lop_days,
             payable_days=payload.payable_days,
+            lop_days=payload.lop_days,
             approved_timesheet_hours=payload.approved_timesheet_hours,
             timesheet_status=payload.timesheet_status,
             actor=actor,
@@ -160,8 +195,8 @@ def upsert_manual_summary(
 
 @router.post(
     "/attendance-summary/seed-dummy",
-    status_code=status.HTTP_200_OK,
-    summary="[HR] Seed dummy attendance summary for all active employees",
+    status_code=status.HTTP_410_GONE,
+    summary="[Disabled] Dummy attendance summary seeding",
     tags=["Payroll Attendance Bridge"],
 )
 def seed_dummy_attendance_summary(
@@ -170,31 +205,15 @@ def seed_dummy_attendance_summary(
     db: Session = Depends(get_db),
     actor: Employee = _WRITE_ROLES,
 ):
-    """Seed dummy attendance summary for all active employees (month/year via query params).
-
-    ── TEMPORARY PAYROLL BRIDGE ──
-    Creates/updates monthly_attendance_summary rows with pre-defined ready values.
-    Does NOT create new employees, does NOT change salary structures, does NOT
-    duplicate rows (upserts only).  Frozen rows are skipped.
-
-    Allowed roles: admin.
-
-    Seed values:
-      total_working_days = 22, present_days = 22, leave_days = 0, lop_days = 0,
-      payable_days = 22, approved_timesheet_hours = 176,
-      attendance_status = 'validated' (READY), timesheet_status = 'approved' (READY),
-      validation_status = 'passed' (VALID), issues_count = 0,
-      is_ready_for_payroll = True, is_frozen = False.
-    """
-    try:
-        result = _bridge.seed_dummy_summary(
-            db, month=month, year=year, actor=actor
-        )
-        db.commit()
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
-    return result
+    """Dummy attendance seeding is disabled for production payroll inputs."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "Dummy attendance summary seeding is disabled. Use the manual attendance "
+            "summary endpoint or the Attendance module integration; LOP is supplied "
+            "only by Leave Management."
+        ),
+    )
 
 
 @router.post(
@@ -239,7 +258,7 @@ def validate_attendance_summary(
 @router.post(
     "/attendance-summary/freeze",
     status_code=status.HTTP_200_OK,
-    summary="[HR] Freeze monthly attendance — unlocks payroll generation for Finance",
+    summary="[HR] Freeze payroll input — unlocks payroll generation for Finance",
     tags=["Payroll Attendance Bridge"],
 )
 def freeze_attendance_summary(
@@ -327,4 +346,66 @@ def reset_attendance_freeze(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only: per-employee payroll breakdown for a given payroll run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/runs/{run_id}/employees",
+    summary="Per-employee payroll breakdown for a payroll run",
+    tags=["Payroll Attendance Bridge"],
+)
+def get_payroll_run_employees(
+    run_id: int,
+    db: Session = Depends(get_db),
+    _: Employee = _READ_ROLES,
+):
+    """Return per-employee payroll records for a given payroll_run_id.
+
+    Read-only endpoint. Restricted to Finance, Finance Head, HR, and Admin
+    roles — regular employees cannot access cross-employee salary data here.
+    Employee self-service payslip access is handled via /employee/payroll/payslips.
+
+    Column notes:
+    - gross_earnings  is the canonical gross (gross_salary is kept in sync as a legacy alias).
+    - employee_pf     is the canonical employee PF column (pf_employee is the legacy alias).
+    - net_pay         is the canonical net (net_salary is the legacy alias).
+    """
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Payroll run not found")
+
+    employees = (
+        db.query(PayrollRunEmployee)
+        .filter(PayrollRunEmployee.run_id == run_id)
+        .order_by(PayrollRunEmployee.employee_id)
+        .all()
+    )
+
+    result = []
+    for rec in employees:
+        emp = rec.employee
+        dept = None
+        if emp and emp.department_id:
+            from app.models.department import Department
+            d = db.query(Department).filter(Department.id == emp.department_id).first()
+            dept = d.name if d else None
+        result.append({
+            "employee_id":       rec.employee_id,
+            "employee_code":     emp.employee_code if emp else None,
+            "employee_name":     ((emp.first_name or "") + " " + (emp.last_name or "")).strip() if emp else None,
+            "department":        dept,
+            "lop_days":          rec.lop_days,
+            "gross_earnings":    rec.gross_earnings,
+            "lop_deduction":     rec.lop_deduction,
+            "employee_pf":       rec.employee_pf,
+            "professional_tax":  rec.professional_tax,
+            "tds":               rec.tds,
+            "total_deductions":  rec.total_deductions,
+            "net_pay":           rec.net_pay,
+            "record_status":     rec.record_status,
+        })
     return result

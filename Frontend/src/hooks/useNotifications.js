@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { notificationsApi } from '../services/notifications';
+import { getToken } from '../services/api';
 
 const POLL_INTERVAL_MS = 30000; // 30s polling for unread count
 
@@ -23,6 +24,7 @@ export function useNotifications({ limit = 10 } = {}) {
   const timerRef = useRef(null);
 
   const refreshCount = useCallback(async () => {
+    if (!getToken()) return; // no token → user not logged in, skip to avoid 401
     try {
       const res = await notificationsApi.unreadCount();
       setUnread(res.count || 0);
@@ -30,6 +32,7 @@ export function useNotifications({ limit = 10 } = {}) {
   }, []);
 
   const refreshList = useCallback(async () => {
+    if (!getToken()) return; // no token → user not logged in, skip to avoid 401
     setLoading(true);
     try {
       const rows = await notificationsApi.recent(limit);

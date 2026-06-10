@@ -27,7 +27,7 @@ import AdminPoliciesPage from './policies/AdminPoliciesPage';
 import AdminAnnouncementsPage from './announcements/AdminAnnouncementsPage';
 import BenchResourceManagementPage from './bench/BenchResourceManagementPage';
 import SelfServicePage from '../shared/SelfServicePage';
-
+import PerformanceHubPage from './performance/PerformanceHubPage';
 export { EmployeesPage as Employees };
 export { LeaveManagementPage as LeaveManagement };
 export { AttendancePage as Attendance };
@@ -51,18 +51,7 @@ export const Payroll = () => (
     ]}
   />
 );
-export const Performance = () => (
-  <UnderConstruction
-    accent="teal"
-    title="Performance"
-    description="Org-wide review cycles, calibration, and 360° feedback — built for the people leaders."
-    features={[
-      { label: 'Review cycle setup', icon: _icoCalendar },
-      { label: 'Calibration sessions', icon: _icoChart },
-      { label: 'Org-wide analytics',   icon: _icoStar },
-    ]}
-  />
-);
+export { PerformanceHubPage as Performance };
 export const Recruitment = () => (
   <UnderConstruction
     accent="violet"

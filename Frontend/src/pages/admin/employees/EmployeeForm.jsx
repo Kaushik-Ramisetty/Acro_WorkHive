@@ -3,7 +3,13 @@ import { useEffect, useState } from 'react';
 const FIELD_BASE =
   'mt-1.5 block w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 shadow-sm transition focus:border-brand-600 focus:outline-none focus:ring-2 focus:ring-brand-100';
 
-const ROLES = ['admin', 'manager', 'employee'];
+const ROLE_OPTIONS = [
+  { value: 'admin', label: 'Admin' },
+  { value: 'manager', label: 'Manager' },
+  { value: 'employee', label: 'Employee' },
+  { value: 'finance', label: 'Finance' },
+  { value: 'finance_head', label: 'Finance Head' },
+];
 
 export default function EmployeeForm({ open, mode = 'create', initial, reference, onSubmit, onCancel }) {
   const [form, setForm] = useState({
@@ -73,7 +79,7 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
       else if (form.password.length < 4) next.password = 'Password is too short.';
     }
 
-    if (!ROLES.includes(form.role)) next.role = 'Pick a role.';
+    if (!ROLE_OPTIONS.some((role) => role.value === form.role)) next.role = 'Pick a role.';
 
     setErrors(next);
     return Object.keys(next).length === 0;
@@ -171,7 +177,7 @@ export default function EmployeeForm({ open, mode = 'create', initial, reference
           <div>
             <label className="block text-xs font-semibold text-slate-700">Role<span className="ml-0.5 text-red-500">*</span></label>
             <select className={FIELD_BASE} value={form.role} onChange={update('role')}>
-              {ROLES.map((role) => <option key={role} value={role}>{role[0].toUpperCase() + role.slice(1)}</option>)}
+              {ROLE_OPTIONS.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
             </select>
             {errors.role && <p className="mt-1 text-xs text-red-600">{errors.role}</p>}
           </div>

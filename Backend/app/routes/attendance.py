@@ -448,8 +448,8 @@ def list_regularizations(status: Optional[str] = Query(None), employee_id: Optio
 
 @router.post("/regularization/{rr_id}/review", response_model=RegularizationOut)
 def review_regularization(rr_id: str, payload: RegularizationReviewIn, request: Request, db: Session = Depends(get_db), user: Employee = Depends(get_current_user)):
-    if _role(user) != "admin":
-        raise HTTPException(status_code=403, detail="Admin only.")
+    if _role(user) not in {"admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Admin or Manager only.")
     rr = db.get(RegularizationRequest, rr_id)
     if not rr:
         raise HTTPException(status_code=404, detail="Regularization not found.")

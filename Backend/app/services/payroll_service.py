@@ -45,10 +45,14 @@ from app.models.payroll_extended import (
     StatutoryDeduction,
 )
 from app.models.salary_revision import SalaryRevisionLog
-from app.models.attendance_records import PayrollAttendanceSummary
+from app.models.bonus_request import BonusRequest as _BonusRequest
+# PayrollAttendanceSummary import removed — table is deprecated; payroll_service
+# now uses MonthlyAttendanceSummary exclusively.
+from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
 from app.models.employee import Employee
 from app.models.department import Department
 from app.services.ctc_engine import compute_from_ctc, apply_lop, SalaryBreakup
+from app.services.payroll_bridge import aggregate_leave_days_for_payroll_month
 from app.services import statutory_service as _stat_svc
 
 log = logging.getLogger("hrms.payroll")
@@ -72,6 +76,149 @@ def _subtract_money(base: float | Decimal, *values: float | Decimal | int | None
     return _money(_to_decimal(base) - sum((_to_decimal(value) for value in values), Decimal("0")))
 
 
+PAYSLIP_BALANCING_COMPONENT_LABEL = "Special Allowance"
+
+_PAYSLIP_EARNINGS_BEFORE_BALANCE = (
+    ("Basic", "basic_pay"),
+    ("HRA", "hra"),
+)
+_PAYSLIP_EARNINGS_AFTER_BALANCE = (
+    ("DA", "da"),
+    ("LTA", "lta"),
+    ("Transport Allowance", "conveyance"),
+    ("Bonus", "bonus"),
+    ("Variable Pay", "variable_pay"),
+    ("Overtime", "overtime_amount"),
+)
+
+
+def _positive_amount(value: float | Decimal | int | None) -> float:
+    amount = _money(value or 0.0)
+    return amount if amount > 0.0 else 0.0
+
+
+def _balanced_special_allowance(
+    gross_earnings: float | Decimal | int | None,
+    *,
+    basic_pay: float | Decimal | int | None = 0.0,
+    hra: float | Decimal | int | None = 0.0,
+    da: float | Decimal | int | None = 0.0,
+    lta: float | Decimal | int | None = 0.0,
+    conveyance: float | Decimal | int | None = 0.0,
+    bonus: float | Decimal | int | None = 0.0,
+    variable_pay: float | Decimal | int | None = 0.0,
+    overtime_amount: float | Decimal | int | None = 0.0,
+) -> float:
+    """Return the payslip balancing amount that makes earnings equal gross."""
+    return _subtract_money(
+        gross_earnings or 0.0,
+        basic_pay,
+        hra,
+        da,
+        lta,
+        conveyance,
+        bonus,
+        variable_pay,
+        overtime_amount,
+    )
+
+
+def payslip_earning_components(row: PayrollRunEmployee) -> list[dict[str, float | str]]:
+    """Positive earning components derived only from a payroll run employee row.
+
+    Special Allowance is the balancing component: it absorbs any residual between
+    payroll gross and the other payroll-record earning columns so the rendered
+    payslip always reconciles to the computed gross pay.
+    """
+    gross = _money(getattr(row, "gross_earnings", 0.0) or 0.0)
+    components: list[dict[str, float | str]] = []
+
+    def append_positive(label: str, amount: float) -> None:
+        if amount > 0.0:
+            components.append({"label": label, "amount": amount})
+
+    non_balancing_total = 0.0
+    for _, attr in (*_PAYSLIP_EARNINGS_BEFORE_BALANCE, *_PAYSLIP_EARNINGS_AFTER_BALANCE):
+        non_balancing_total = _sum_money(
+            non_balancing_total,
+            _positive_amount(getattr(row, attr, 0.0)),
+        )
+
+    for label, attr in _PAYSLIP_EARNINGS_BEFORE_BALANCE:
+        append_positive(label, _positive_amount(getattr(row, attr, 0.0)))
+
+    balancing_amount = _subtract_money(gross, non_balancing_total)
+    if balancing_amount > 0.0:
+        append_positive(PAYSLIP_BALANCING_COMPONENT_LABEL, balancing_amount)
+    elif balancing_amount < -0.01:
+        log.warning(
+            "[PAYSLIP] payroll_record_id=%s has earnings greater than gross: "
+            "gross=%.2f, non_balancing_total=%.2f, delta=%.2f",
+            getattr(row, "id", None),
+            gross,
+            non_balancing_total,
+            balancing_amount,
+        )
+
+    for label, attr in _PAYSLIP_EARNINGS_AFTER_BALANCE:
+        append_positive(label, _positive_amount(getattr(row, attr, 0.0)))
+
+    return components
+
+
+def payslip_earnings_total(row: PayrollRunEmployee) -> float:
+    return _sum_money(*(c["amount"] for c in payslip_earning_components(row)))
+
+
+def payslip_earnings_reconciliation_delta(row: PayrollRunEmployee) -> float:
+    return _subtract_money(getattr(row, "gross_earnings", 0.0) or 0.0, payslip_earnings_total(row))
+
+
+def _attendance_reconciliation_delta(
+    *,
+    working_days: int,
+    present_days: int,
+    leave_days: int,
+    holiday_days: int,
+    lop_days: int,
+) -> int:
+    return int(working_days or 0) - int(
+        (present_days or 0) + (leave_days or 0) + (holiday_days or 0) + (lop_days or 0)
+    )
+
+
+def payslip_attendance_summary(row: PayrollRunEmployee) -> dict[str, int | float | bool]:
+    """Attendance summary derived from payroll record values for payslip display."""
+    working_days = int(getattr(row, "working_days", 0) or 0)
+    present_days = int(getattr(row, "present_days", 0) or 0)
+    leave_days = int(getattr(row, "leave_days", 0) or 0)
+    holiday_days = int(getattr(row, "holiday_days", 0) or 0)
+    lop_days = int(getattr(row, "lop_days", 0) or 0)
+    delta = _attendance_reconciliation_delta(
+        working_days=working_days,
+        present_days=present_days,
+        leave_days=leave_days,
+        holiday_days=holiday_days,
+        lop_days=lop_days,
+    )
+    if delta > 0:
+        holiday_days += delta
+        delta = 0
+    return {
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "holiday_days": holiday_days,
+        "lop_days": lop_days,
+        "payable_days": float(getattr(row, "payable_days", 0.0) or 0.0),
+        "attendance_reconciliation_delta": delta,
+        "attendance_reconciled": delta == 0,
+    }
+
+
+PAYROLL_GENERATION_EMPTY_ERROR = "Payroll generation failed: no employee payroll records created."
+
+
 # ─── Status machine ──────────────────────────────────────────────────────────
 #
 # Full workflow:
@@ -88,16 +235,17 @@ def _subtract_money(base: float | Decimal, *values: float | Decimal | int | None
 #                                                                                          └─[head_reject]──► under_review
 #   approved
 #     └─[generate_payslips]──► payslip_generated
-#                                └─[publish]──► published
-#                                               └─[close]──► closed
+#                                └─[publish]──► completed
 #
 # Error recovery: error_found ──[resolve_errors]──► under_review
 # Cancellation: any non-final state ──[cancel]──► cancelled
 
 _TRANSITIONS: dict[str, dict[str, str]] = {
     "draft": {
+        # Finance can only freeze attendance (which records HR input accountability)
+        # or cancel.  Direct generation from draft is not allowed — HR must first
+        # freeze monthly_attendance_summary so there is an auditable readiness record.
         "freeze_attendance": "attendance_frozen",
-        "process":           "processing",
         "cancel":            "cancelled",
     },
     "attendance_frozen": {
@@ -106,21 +254,31 @@ _TRANSITIONS: dict[str, dict[str, str]] = {
         "cancel":            "cancelled",
     },
     "processing": {
-        "submit_review":     "under_review",
-        "submit_for_approval": "under_review",
+        # One-click Finance submission: Generated → pending_head_approval directly.
+        # Finance reviews the employee rows in-page and clicks Submit to Finance Head.
+        "submit_review":       "pending_head_approval",
+        "submit_for_approval": "pending_head_approval",
+        # Two-step path: Finance can still enter an explicit under_review stage.
+        "start_review":       "under_review",
         # Allow recompute directly from processing so Finance can add adjustments
-        # and immediately re-run the payroll engine without the extra
-        # submit_review → under_review cycle.
-        "recompute":         "processing",
-        "cancel":            "cancelled",
+        # and immediately re-run the payroll engine without the extra cycle.
+        "recompute":          "processing",
+        # Allow 'generate' from processing as an alias for recompute — Finance
+        # clicking "Generate Payroll" again on a run with 0 employees must not 400.
+        "generate":           "processing",
+        "cancel":             "cancelled",
     },
     "under_review": {
-        "flag_error":        "error_found",
-        "recompute":         "processing",
-        "approve":           "pending_head_approval",
-        "finance_review":    "pending_head_approval",
-        "reject":            "draft",
-        "cancel":            "cancelled",
+        "flag_error":          "error_found",
+        "recompute":           "processing",
+        "approve":             "pending_head_approval",
+        "finance_review":      "pending_head_approval",
+        # Allow re-submission from under_review (head_reject recovery path) via
+        # the same submit_review action Finance uses from processing.
+        "submit_review":       "pending_head_approval",
+        "submit_for_approval": "pending_head_approval",
+        "reject":              "draft",
+        "cancel":              "cancelled",
     },
     "error_found": {
         "recompute":         "processing",
@@ -137,22 +295,40 @@ _TRANSITIONS: dict[str, dict[str, str]] = {
     "approved": {
         "finalize":          "approved",
         "generate_payslips": "payslip_generated",
-        "disburse":          "disbursed",      # legacy — kept for backward compat
+        # "disburse" removed — Finance Head approval no longer bypasses the full
+        # publication workflow.  Existing disbursed runs remain valid; new runs
+        # must follow: payslip_generated → bank_advice_generated → published → closed.
     },
     "payslip_generated": {
+        # Allow direct publish from payslip_generated for standard demo/live flow.
+        "publish":              "published",
+        # Optional intermediate: generate bank advice CSV before publishing.
+        "generate_bank_advice": "bank_advice_generated",
+    },
+    "bank_advice_generated": {
         "publish":           "published",
     },
     "published": {
         "close":             "closed",
     },
-    "disbursed":  {},
+    "completed":  {},   # legacy terminal — kept for runs closed before this workflow
+    "disbursed":  {},   # legacy terminal — kept for pre-Sprint 3 runs
     "closed":     {},
     "cancelled":  {},
 }
 
 # Statuses from which recomputation is NEVER allowed (immutable payroll history)
 _LOCKED_STATUSES = frozenset({
-    "approved", "payslip_generated", "published", "closed", "cancelled",
+    "payslip_generated", "bank_advice_generated", "published", "completed", "closed", "cancelled",
+})
+_FINAL_APPROVED_STATUSES = frozenset({
+    "approved", "payslip_generated", "bank_advice_generated",
+    "published", "completed", "closed", "disbursed",
+})
+_PUBLISH_READY_STATUSES = frozenset({
+    # payslip_generated removed — bank advice must be generated before payslips
+    # can be published to employees.
+    "bank_advice_generated", "published", "completed", "closed", "disbursed",
 })
 
 _STATUS_TO_DOCUMENT_LIFECYCLE = {
@@ -164,6 +340,7 @@ _STATUS_TO_DOCUMENT_LIFECYCLE = {
     "pending_head_approval": "PENDING_APPROVAL",
     "approved": "APPROVED",
     "payslip_generated": "FINALIZED",
+    "bank_advice_generated": "FINALIZED",
     "disbursed": "FINALIZED",
     "published": "PUBLISHED",
     "closed": "PUBLISHED",
@@ -183,6 +360,135 @@ _APPROVAL_ACTION_LEVEL = {
 
 def _next_status(current: str, action: str) -> Optional[str]:
     return _TRANSITIONS.get(current, {}).get(action)
+
+
+def is_final_approved_run(run: PayrollRun | None) -> bool:
+    """True once Finance Head final approval locked the payroll run."""
+    return bool(
+        run
+        and run.status in _FINAL_APPROVED_STATUSES
+        and bool(run.payroll_locked)
+    )
+
+
+def _is_immutable_run(run: PayrollRun | None) -> bool:
+    return bool(run and (run.payroll_locked or run.status in _LOCKED_STATUSES))
+
+
+def _ensure_editable_run(run: PayrollRun | None) -> None:
+    if _is_immutable_run(run):
+        raise ValueError("Final approved payroll cannot be edited.")
+
+
+def ensure_payroll_records_exist(db: Session, run_id: int) -> int:
+    count = db.query(PayrollRunEmployee).filter_by(run_id=run_id).count()
+    if count <= 0:
+        raise ValueError(PAYROLL_GENERATION_EMPTY_ERROR)
+    return count
+
+
+def is_false_salary_assignment_variance(row: PayrollRunEmployee) -> bool:
+    """True for legacy assignment-only variance that current payroll ignores."""
+    reason = (getattr(row, "variance_reason", None) or "").lower()
+    salary_structure = getattr(row, "salary_structure", None)
+    annual_ctc = float(getattr(salary_structure, "annual_ctc", 0.0) or 0.0)
+    return bool(
+        getattr(row, "variance_flag", False)
+        and not getattr(row, "has_error", False)
+        and annual_ctc > 0.0
+        and "salary assignment" in reason
+    )
+
+
+def visible_variance_count(db: Session, run_id: int) -> int:
+    rows = db.query(PayrollRunEmployee).filter_by(
+        run_id=run_id,
+        variance_flag=True,
+    ).all()
+    return sum(1 for row in rows if not is_false_salary_assignment_variance(row))
+
+
+def _add_generation_error(
+    db: Session,
+    run: PayrollRun,
+    emp: Employee,
+    error_type: str,
+    description: str,
+    *,
+    severity: str = "error",
+    salary_structure_id: int | None = None,
+    salary_assignment_id: int | None = None,
+    working_days: int = 0,
+    payable_days: float = 0.0,
+    present_days: int = 0,
+    leave_days: int = 0,
+    lop_days: int = 0,
+    holiday_days: int = 0,
+) -> PayrollRunEmployee:
+    """Create a visible run row for a generation error."""
+    db.add(PayrollError(
+        run_id=run.id,
+        employee_id=emp.id,
+        error_type=error_type,
+        description=description,
+        severity=severity,
+    ))
+
+    row = db.query(PayrollRunEmployee).filter_by(
+        run_id=run.id,
+        employee_id=emp.id,
+    ).first()
+    if row is None:
+        row = PayrollRunEmployee(
+            run_id=run.id,
+            employee_id=emp.id,
+            salary_structure_id=salary_structure_id,
+            salary_assignment_id=salary_assignment_id,
+            total_working_days=int(working_days or 0),
+            working_days=int(working_days or 0),
+            payable_days=float(payable_days or 0.0),
+            present_days=int(present_days or 0),
+            leave_days=int(leave_days or 0),
+            lop_days=int(lop_days or 0),
+            holiday_days=int(holiday_days or 0),
+            gross_earnings=0.0,
+            basic_pay=0.0,
+            hra=0.0,
+            da=0.0,
+            special_allowance=0.0,
+            lta=0.0,
+            conveyance=0.0,
+            bonus=0.0,
+            variable_pay=0.0,
+            overtime_amount=0.0,
+            employee_pf=0.0,
+            employer_pf=0.0,
+            employee_esi=0.0,
+            employer_esi=0.0,
+            professional_tax=0.0,
+            tds=0.0,
+            lop_deduction=0.0,
+            other_deductions=0.0,
+            total_deductions=0.0,
+            net_pay=0.0,
+            has_error=True,
+            record_status="ERROR",
+            variance_flag=False,
+            variance_reason=description,
+            migration_completed=True,
+        )
+        row.sync_legacy_amount_columns()
+        db.add(row)
+    else:
+        row.has_error = True
+        row.record_status = "ERROR"
+        row.variance_reason = description
+        row.variance_flag = False
+        if salary_structure_id is not None:
+            row.salary_structure_id = salary_structure_id
+        if salary_assignment_id is not None:
+            row.salary_assignment_id = salary_assignment_id
+    return row
 
 
 def _get_employees_by_role(db: Session, *role_names: str) -> list:
@@ -210,18 +516,28 @@ def _dispatch_payroll_notifications(
     actor: Employee,
     remarks: Optional[str] = None,
 ) -> None:
-    """Fire in-app notifications and email for payroll workflow events. Never raises."""
+    """Fire in-app notifications and HTML emails for payroll workflow events. Never raises.
+
+    In-app notifications go through notification_service.notify (send_email=False here
+    because payroll_notifications handles the HTML email side to avoid duplicates and
+    to use properly formatted subjects/templates for each trigger).
+    """
     try:
         from app.services import notification_service as _ns
-        from app.services import email_service as _es
+        from app.services import payroll_notifications as _pn
 
         run_label = run.month_label or f"Run #{run.id}"
         actor_name = f"{actor.first_name} {actor.last_name or ''}".strip()
         run_ref_id = str(run.id)
 
         def _notify_group(role_names, ntype, title, body):
+            """Write in-app notifications only; email is handled by payroll_notifications."""
             users = _get_employees_by_role(db, *role_names)
+            notified_ids: set[int] = set()
             for u in users:
+                if u.id in notified_ids:
+                    continue
+                notified_ids.add(u.id)
                 _ns.notify(
                     db,
                     recipient_id=u.id,
@@ -230,33 +546,41 @@ def _dispatch_payroll_notifications(
                     body=body,
                     reference_table="payroll_runs",
                     reference_id=run_ref_id,
+                    send_email=False,
                     autocommit=True,
                 )
             return users
 
-        def _email_group(users, event_label):
-            for u in users:
-                email = (getattr(u, "official_email", None) or u.email or "").strip()
-                if email:
-                    try:
-                        _es.send_payroll_event_email(
-                            email, event_label, run_label, actor_name, remarks
-                        )
-                    except Exception as _em:
-                        log.warning("[PAYROLL EMAIL] Failed to %s for %s: %s", event_label, email, _em)
+        if action in ("create", "initiate"):
+            title = f"Payroll run created — {run_label}"
+            body = f"Payroll {run_label} has been created by {actor_name} and is ready for Finance."
+            _notify_group(("finance",), "payroll_run_created", title, body)
 
-        if action in ("submit_review", "submit_for_approval"):
-            # Notify Finance team only — Finance Head is notified once Finance approves
-            title = f"Payroll submitted for review — {run_label}"
-            body = f"Payroll {run_label} has been submitted for Finance review by {actor_name}."
-            users = _notify_group(("finance",), "payroll_submitted_for_review", title, body)
-            _email_group(users, "Payroll Submitted for Finance Review")
+        elif action == "freeze_attendance":
+            # Trigger 1: Attendance frozen — notify Finance via in-app + email
+            title = f"Payroll input frozen — {run_label}"
+            body = f"Attendance/input freeze completed for payroll {run_label} by {actor_name}."
+            _notify_group(("finance",), "payroll_freeze_done", title, body)
+            _pn.notify_attendance_frozen(db, run, actor_name)
+
+        elif action in ("generate", "process"):
+            title = f"Payroll generated — {run_label}"
+            body = f"Payroll computation for {run_label} initiated by {actor_name}."
+            _notify_group(("admin",), "payroll_initiated", title, body)
+
+        elif action in ("submit_review", "submit_for_approval"):
+            # submit_review now goes directly to pending_head_approval — notify Finance Head
+            title = f"Payroll awaiting your approval — {run_label}"
+            body = f"Payroll {run_label} has been reviewed by Finance ({actor_name}) and is awaiting your final approval."
+            _notify_group(("finance_head",), "payroll_awaiting_head_approval", title, body)
+            _pn.notify_finance_approved(db, run, actor_name)
 
         elif action == "reject":
+            # Trigger 3: Finance rejected — notify HR/Admin with reason
             title = f"Finance rejected payroll — {run_label}"
             body = f"Finance rejected payroll {run_label}. Remarks: {remarks or '—'}."
-            users = _notify_group(("admin",), "payroll_rejected", title, body)
-            _email_group(users, "Finance Rejected Payroll")
+            _notify_group(("admin", "hr"), "payroll_rejected", title, body)
+            _pn.notify_payroll_rejected(db, run, actor_name, remarks)
 
         elif action == "head_reject":
             title = f"Finance Head returned payroll — {run_label}"
@@ -264,86 +588,132 @@ def _dispatch_payroll_notifications(
                 f"Finance Head returned payroll {run_label} to Finance for review. "
                 f"Remarks: {remarks or '—'}."
             )
-            users = _notify_group(("admin", "finance"), "payroll_returned_to_finance", title, body)
-            _email_group(users, "Finance Head Returned Payroll")
+            _notify_group(("finance", "admin"), "payroll_returned_to_finance", title, body)
 
         elif action in ("finance_review", "approve"):
-            # Finance approved → notify Finance Head that final approval is needed
-            title = f"Payroll awaiting final approval — {run_label}"
-            body = f"Payroll {run_label} is waiting for Finance Head approval."
-            users = _notify_group(("finance_head",), "payroll_awaiting_head_approval", title, body)
-            _email_group(users, "Payroll Awaiting Finance Head Approval")
+            # Trigger 4: Finance approved → notify Finance Head for final approval
+            title = f"Payroll approved by Finance — {run_label}"
+            body = f"Payroll {run_label} was approved by Finance and is waiting for Finance Head approval."
+            _notify_group(("finance_head",), "payroll_awaiting_head_approval", title, body)
+            _pn.notify_finance_approved(db, run, actor_name)
 
         elif action in ("head_approve", "finance_head_approve"):
-            # Finance Head approved → notify Finance to generate payslips
+            # Trigger 5: Finance Head final approval — notify HR/Admin and Finance
             title = f"Payroll approved by Finance Head — {run_label}"
             body = f"Payroll {run_label} approved by Finance Head. Ready for payslip generation."
-            users = _notify_group(("finance",), "payroll_head_approved", title, body)
-            _email_group(users, "Payroll Approved by Finance Head")
-
-        elif action == "publish":
-            # Notify Finance/Admin teams
-            title = f"Payslips published — {run_label}"
-            body = f"Payslips for {run_label} have been published to employee self-service."
-            staff_users = _notify_group(("admin", "finance"), "payslips_published", title, body)
-            _email_group(staff_users, "Payslips Published")
-            # Notify every employee whose payslip is in this run
-            try:
-                from app.models.payroll_extended import Payslip as _Payslip
-                published_slips = (
-                    db.query(_Payslip)
-                    .filter_by(run_id=run.id, is_published=True)
-                    .all()
-                )
-                for slip in published_slips:
-                    _ns.notify(
-                        db,
-                        recipient_id=slip.employee_id,
-                        type_="payslip_published",
-                        title=f"Your payslip is ready — {run_label}",
-                        body=f"Your payslip for {run_label} has been published. View it in the Employee Portal.",
-                        reference_table="payroll_runs",
-                        reference_id=run_ref_id,
-                        autocommit=True,
-                    )
-            except Exception as _emp_err:
-                log.warning("Employee payslip notification failed (non-fatal): %s", _emp_err)
-
-        elif action == "freeze_attendance":
-            title = f"Attendance frozen — {run_label}"
-            body = f"Attendance/input freeze completed for payroll {run_label} by {actor_name}."
-            _notify_group(("admin",), "payroll_freeze_done", title, body)
-
-        elif action in ("generate", "process"):
-            title = f"Payroll generated — {run_label}"
-            body = f"Payroll computation for {run_label} initiated by {actor_name}."
-            _notify_group(("admin",), "payroll_initiated", title, body)
+            _notify_group(("admin", "finance", "hr"), "payroll_finalized", title, body)
+            _pn.notify_head_approved(db, run, actor_name)
 
         elif action == "recompute":
             title = f"Payroll recomputed — {run_label}"
             body = f"Payroll {run_label} has been recomputed and is ready for review."
             _notify_group(("finance", "finance_head"), "payroll_recomputed", title, body)
 
+        elif action == "publish":
+            # Trigger 6: Payslips published — notify in-app via existing helper,
+            # then send individual HTML emails to each employee.
+            published_slips = (
+                db.query(Payslip)
+                .filter_by(run_id=run.id, is_published=True)
+                .all()
+            )
+            _dispatch_payslip_published_notifications(db, run, published_slips)
+            _pn.notify_payslips_published(db, run)
+
     except Exception as _err:
         log.warning("Payroll notification dispatch failed (non-fatal): %s", _err)
+
+
+def _dispatch_payslip_published_notifications(
+    db: Session,
+    run: "PayrollRun",
+    slips: list[Payslip],
+    *,
+    send_email: bool = True,
+) -> None:
+    """Notify employees whose payslips were published. Never raises."""
+    if not run or not slips:
+        return
+    try:
+        from app.services import notification_service as _ns
+
+        run_label = run.month_label or f"Run #{run.id}"
+        seen_employee_ids: set[int] = set()
+        for slip in slips:
+            employee_id = getattr(slip, "employee_id", None)
+            if not employee_id or employee_id in seen_employee_ids:
+                continue
+            seen_employee_ids.add(employee_id)
+            _ns.notify(
+                db,
+                recipient_id=employee_id,
+                type_="payslip_published",
+                title="Payslip Published",
+                body=f"Your {run_label} payslip is now available for viewing and download.",
+                reference_table="payroll_runs",
+                reference_id=str(run.id),
+                send_email=send_email,
+                autocommit=True,
+            )
+    except Exception as _err:
+        log.warning("Employee payslip notification failed (non-fatal): %s", _err)
 
 
 def document_lifecycle_status(status: str, payroll_locked: bool = False) -> str:
     """Map existing UI statuses to the Payroll DB document lifecycle."""
     if status == "approved" and payroll_locked:
-        return "FINALIZED"
+        return "FINAL_APPROVED"
     return _STATUS_TO_DOCUMENT_LIFECYCLE.get(status, status.upper())
 
 
+def derive_payroll_period_fields(pay_period_start: date) -> dict[str, int | str]:
+    """Derive payroll month fields from the period start date."""
+    month = pay_period_start.month
+    year = pay_period_start.year
+    return {
+        "month_label": f"{calendar.month_name[month]} {year}",
+        "month": month,
+        "year": year,
+    }
+
+
+def payroll_month_label(pay_period_start: date) -> str:
+    return str(derive_payroll_period_fields(pay_period_start)["month_label"])
+
+
+def payroll_month_label_from_parts(month: int, year: int) -> str:
+    return payroll_month_label(date(year, month, 1))
+
+
+def normalize_payroll_run_period(run: PayrollRun | None) -> PayrollRun | None:
+    if not run or not run.pay_period_start:
+        return run
+    fields = derive_payroll_period_fields(run.pay_period_start)
+    run.month_label = str(fields["month_label"])
+    run.month = int(fields["month"])
+    run.year = int(fields["year"])
+    return run
+
+
+def normalize_payslip_period(slip: Payslip | None) -> Payslip | None:
+    if not slip or not slip.pay_period_start:
+        return slip
+    fields = derive_payroll_period_fields(slip.pay_period_start)
+    slip.month_label = str(fields["month_label"])
+    slip.month = int(fields["month"])
+    slip.year = int(fields["year"])
+    return slip
+
+
 def _period_month_year(run: PayrollRun) -> tuple[int, int, str]:
-    month = run.month or run.pay_period_start.month
-    year = run.year or run.pay_period_start.year
-    month_name = calendar.month_name[month]
-    return month, year, month_name
+    fields = derive_payroll_period_fields(run.pay_period_start)
+    month = int(fields["month"])
+    return month, int(fields["year"]), calendar.month_name[month]
 
 
 def _ensure_run_document_fields(run: PayrollRun) -> None:
     month, year, _ = _period_month_year(run)
+    normalize_payroll_run_period(run)
     run.month = month
     run.year = year
     if not run.payroll_run_code and run.id:
@@ -438,57 +808,81 @@ def _get_salary_assignment_for_period(
     )
 
 
+def _leave_lop_days(db: Session, employee_id: int, month: int, year: int) -> int:
+    return aggregate_leave_days_for_payroll_month(db, employee_id, month, year)["lop_days"]
+
+
+def _leave_paid_days(db: Session, employee_id: int, month: int, year: int) -> int:
+    return aggregate_leave_days_for_payroll_month(db, employee_id, month, year)["paid_leave_days"]
+
+
 def get_payroll_attendance_summary(
     db: Session, employee_id: int, month: int | str, year: int
 ) -> dict:
-    """Return finalized payroll attendance input, or a demo-safe fallback.
+    """Return finalized payroll attendance from monthly_attendance_summary only.
 
-    Temporary fallback: attendance/timesheet finalization is owned by another
-    module. Until it supplies finalized payroll summary rows, payroll uses a
-    conservative full-payable-month snapshot so dashboards and processing do not
-    crash or block.
+    DEPRECATED fallbacks removed in Sprint 3:
+      - payroll_attendance_summary (legacy table) fallback removed.
+      - Demo-safe 26-day hardcoded fallback removed.
+    Only frozen MonthlyAttendanceSummary rows are accepted as valid payroll input.
     """
-    month_name = calendar.month_name[int(month)] if isinstance(month, int) else str(month)
-    att = (
-        db.query(PayrollAttendanceSummary)
-        .filter_by(employee_id=employee_id, year=year)
-        .filter(PayrollAttendanceSummary.month.ilike(month_name))
+    if isinstance(month, int):
+        month_int = month
+    else:
+        try:
+            month_int = list(calendar.month_name).index(str(month).capitalize())
+        except ValueError:
+            month_int = list(calendar.month_abbr).index(str(month)[:3].capitalize())
+
+    leave_totals = aggregate_leave_days_for_payroll_month(db, employee_id, month_int, year)
+    leave_paid_days = leave_totals["paid_leave_days"]
+
+    mas = (
+        db.query(MonthlyAttendanceSummary)
+        .filter(
+            MonthlyAttendanceSummary.employee_id          == employee_id,
+            MonthlyAttendanceSummary.month                == month_int,
+            MonthlyAttendanceSummary.year                 == year,
+            MonthlyAttendanceSummary.is_frozen            == True,
+            MonthlyAttendanceSummary.is_ready_for_payroll == True,
+        )
         .first()
     )
-    if att and att.is_finalized:
-        total_working_days = att.total_working_days or 26
-        lop_days = att.lop_days or 0
-        payable_days = (
-            att.payable_days
-            if getattr(att, "payable_days", None) is not None
-            else max(total_working_days - lop_days, 0)
+    if mas:
+        total_working_days = mas.total_working_days or 0
+        lop_days           = int(mas.lop_days or 0)
+        payable_days       = (
+            float(mas.payable_days)
+            if mas.payable_days is not None
+            else float(max(total_working_days - lop_days, 0))
         )
         return {
             "total_working_days": total_working_days,
-            "payable_days": payable_days,
-            "present_days": att.present_days or int(payable_days),
-            "leave_days": att.leave_days or 0,
-            "lop_days": lop_days,
-            "holiday_days": att.holiday_count or 0,
-            "overtime_hours": att.overtime_hours or 0.0,
-            "is_finalized": True,
-            "fallback_used": False,
-            "fallback_reason": None,
+            "payable_days":       payable_days,
+            "present_days":       mas.present_days or int(payable_days),
+            "leave_days":         leave_paid_days,
+            "lop_days":           lop_days,
+            "holiday_days":       0,
+            "overtime_hours":     float(mas.approved_timesheet_hours or 0.0),
+            "is_finalized":       True,
+            "fallback_used":      False,
+            "fallback_reason":    None,
         }
 
+    # No frozen MAS found — return not-finalized so callers can surface the error.
     return {
-        "total_working_days": 26,
-        "payable_days": 26.0,
-        "present_days": 26,
-        "leave_days": 0,
-        "lop_days": 0,
-        "holiday_days": 0,
-        "overtime_hours": 0.0,
-        "is_finalized": False,
-        "fallback_used": True,
-        "fallback_reason": (
-            "Missing finalized attendance/timesheet summary"
-            if not att else "Attendance/timesheet summary is not finalized"
+        "total_working_days": 0,
+        "payable_days":       0.0,
+        "present_days":       0,
+        "leave_days":         leave_paid_days,
+        "lop_days":           0,
+        "holiday_days":       0,
+        "overtime_hours":     0.0,
+        "is_finalized":       False,
+        "fallback_used":      False,
+        "fallback_reason":    (
+            f"No frozen MonthlyAttendanceSummary found for employee {employee_id} "
+            f"({month_int}/{year}). HR must validate and freeze attendance before payroll."
         ),
     }
 
@@ -564,6 +958,14 @@ def _ensure_pending_approval_steps(db: Session, run: PayrollRun, actor: Employee
             ))
 
 
+def _finance_review_completed(db: Session, run_id: int) -> bool:
+    return db.query(PayrollApproval).filter(
+        PayrollApproval.run_id == run_id,
+        PayrollApproval.approval_level == "FINANCE_REVIEW",
+        PayrollApproval.approval_status == "APPROVED",
+    ).first() is not None
+
+
 def _detect_variance(
     db: Session,
     employee_id: int,
@@ -573,38 +975,17 @@ def _detect_variance(
     net_pay: float,
     payable_days: float,
     lop_days: int,
-    assignment_missing: bool,
+    salary_structure: SalaryStructure | None,
     attendance_fallback_reason: str | None,
 ) -> tuple[bool, str | None]:
     reasons: list[str] = []
-    previous = (
-        db.query(PayrollRunEmployee)
-        .join(PayrollRun, PayrollRunEmployee.run_id == PayrollRun.id)
-        .filter(
-            PayrollRunEmployee.employee_id == employee_id,
-            PayrollRun.pay_period_start < run.pay_period_start,
-        )
-        .order_by(PayrollRun.pay_period_start.desc(), PayrollRunEmployee.created_at.desc())
-        .first()
-    )
-    if previous:
-        def changed(prev: float, current: float) -> bool:
-            return bool(prev and abs(current - prev) / abs(prev) >= 0.10)
 
-        if changed(previous.net_pay, net_pay):
-            reasons.append("Net pay changed significantly from previous payroll")
-        if changed(previous.gross_earnings, gross_earnings):
-            reasons.append("Gross earnings changed significantly from previous payroll")
-        if changed(previous.total_deductions, total_deductions):
-            reasons.append("Total deductions changed significantly from previous payroll")
+    if salary_structure is None:
+        reasons.append("Salary structure missing")
+    else:
+        if float(salary_structure.annual_ctc or 0.0) <= 0.0:
+            reasons.append("Annual CTC missing in salary structure")
 
-    total_days = run.pay_period_end.day or 26
-    if payable_days < max(total_days * 0.6, 1):
-        reasons.append("Payable days very low")
-    if lop_days >= 3:
-        reasons.append("LOP days high")
-    if assignment_missing:
-        reasons.append("Missing active salary assignment; used salary structure fallback")
     if attendance_fallback_reason:
         reasons.append(attendance_fallback_reason)
 
@@ -634,10 +1015,11 @@ def _save_statutory_deductions(db: Session, row: PayrollRunEmployee) -> None:
 # ─── Payroll Variance Computation ────────────────────────────────────────────
 
 def _compute_and_store_variance(db: Session, run: PayrollRun) -> None:
-    """Compute payroll variance vs. previous month and store in payroll_variance_log.
+    """Store payroll variance context for review.
 
-    Flags employees whose gross/net pay or TDS differs by more than the
-    configured threshold (run.variance_threshold_pct, default 20%).
+    Row-level warning flags are limited to current payroll source-of-truth
+    issues. Salary assignments are audit-only for this flow; successful rows
+    generated from salary_structures.annual_ctc are not variance rows.
 
     Called automatically after every generate/recompute.  Finance must
     acknowledge flagged rows before sending to Finance Head.
@@ -648,8 +1030,8 @@ def _compute_and_store_variance(db: Session, run: PayrollRun) -> None:
         log.warning("PayrollVarianceLog model not available — skipping variance compute")
         return
 
-    run_month = run.month or run.pay_period_start.month
-    run_year  = run.year  or run.pay_period_start.year
+    run_month = run.pay_period_start.month
+    run_year  = run.pay_period_start.year
 
     # Find the immediately preceding closed/published/approved run
     prev_run = (
@@ -661,8 +1043,6 @@ def _compute_and_store_variance(db: Session, run: PayrollRun) -> None:
         .order_by(PayrollRun.pay_period_start.desc())
         .first()
     )
-
-    threshold = float(getattr(run, "variance_threshold_pct", 20.0) or 20.0)
 
     # Clear existing variance log rows for this run (idempotent on recompute)
     try:
@@ -702,16 +1082,13 @@ def _compute_and_store_variance(db: Session, run: PayrollRun) -> None:
         gross_var_pct = _pct_change(prev_gross, curr_gross)
         net_var_pct   = _pct_change(prev_net,   curr_net)
 
-        # Determine flags
         flags: list[str] = []
-        if gross_var_pct > threshold:
-            flags.append(f"Gross pay change {gross_var_pct:.1f}% (> {threshold:.0f}% threshold)")
-        if net_var_pct > threshold:
-            flags.append(f"Net pay change {net_var_pct:.1f}% (> {threshold:.0f}% threshold)")
-        if prev_tds and abs(curr_tds - prev_tds) > 500:
-            flags.append(f"TDS changed by ₹{abs(curr_tds - prev_tds):,.0f}")
-        if curr_lop > 3:
-            flags.append(f"High LOP: {curr_lop:.1f} days")
+        if (
+            row.variance_flag
+            and row.variance_reason
+            and not is_false_salary_assignment_variance(row)
+        ):
+            flags.append(row.variance_reason)
 
         is_flagged = bool(flags)
         if is_flagged:
@@ -736,9 +1113,9 @@ def _compute_and_store_variance(db: Session, run: PayrollRun) -> None:
         )
         db.add(vlog)
 
-    # Mark run variance_reviewed=False since new data was generated
+    # No acknowledgement is needed when generation produced no approved variance warnings.
     try:
-        run.variance_reviewed = False
+        run.variance_reviewed = not any_flagged
     except Exception:
         pass
 
@@ -757,7 +1134,10 @@ def get_variance_summary(db: Session, run_id: int) -> dict:
     try:
         from app.models.payroll_extended import PayrollVarianceLog
         rows = db.query(PayrollVarianceLog).filter_by(run_id=run_id).all()
-        flagged = [r for r in rows if r.is_flagged]
+        flagged = [
+            r for r in rows
+            if r.is_flagged and "salary assignment" not in (r.variance_flags or "").lower()
+        ]
         acknowledged = [r for r in flagged if r.acknowledged_by_id is not None]
 
         run = db.query(PayrollRun).filter_by(id=run_id).first()
@@ -1058,63 +1438,38 @@ def upsert_salary_structure_from_ctc(
     bank_name: str = None, account_number: str = None, ifsc_code: str = None,
     effective_from: date = None, revision_reason: str = None,
 ) -> SalaryStructure:
-    """Compute and save salary structure from annual CTC using the CTC engine."""
-    breakup = compute_from_ctc(annual_ctc, db)
+    """Save salary structure CTC master data only.
 
+    Breakup components (basic, hra, pf, etc.) are stored as 0 for DB compatibility.
+    Actual payroll computation happens during payroll generation using annual_ctc.
+    """
     data = {
-        "employee_id":        employee_id,
-        "basic":              breakup.basic,
-        "hra":                breakup.hra,
-        "da":                 breakup.da,
-        "special_allowance":  breakup.special_allowance,
-        "transport_allowance":breakup.transport_allowance,
-        "medical_allowance":  0.0,          # no medical in Excel formula
-        # LTA stored in other_allowances — no dedicated lta column in salary_structures.
-        # upsert_salary_structure includes other_allowances in gross_monthly, so
-        # gross = basic + hra + special + transport + other_allowances(LTA) is correct.
-        "other_allowances":   breakup.lta,
-        "pf_employee":        breakup.pf_employee,
-        "pf_employer":        breakup.pf_employer,
-        "esi_employee":       breakup.esi_employee,
-        "esi_employer":       breakup.esi_employer,
-        "professional_tax":   breakup.professional_tax,
-        "tds":                breakup.tds,
-        "bank_name":          bank_name,
-        "account_number":     account_number,
-        "ifsc_code":          ifsc_code,
-        "effective_from":     effective_from or date.today(),
-        "revision_reason":    revision_reason,
-        # Preserve the exact user-entered annual CTC so upsert_salary_structure
-        # stores it as-is rather than recomputing it from rounded gross components
-        # (prevents the ₹0.08 paisa-residue display bug).
-        "annual_ctc":         annual_ctc,
+        "employee_id":         employee_id,
+        "basic":               0.0,
+        "hra":                 0.0,
+        "da":                  0.0,
+        "special_allowance":   0.0,
+        "transport_allowance": 0.0,
+        "medical_allowance":   0.0,
+        "other_allowances":    0.0,
+        "pf_employee":         0.0,
+        "pf_employer":         0.0,
+        "esi_employee":        0.0,
+        "esi_employer":        0.0,
+        "professional_tax":    0.0,
+        "tds":                 0.0,
+        "bank_name":           bank_name,
+        "account_number":      account_number,
+        "ifsc_code":           ifsc_code,
+        "effective_from":      effective_from or date.today(),
+        "revision_reason":     revision_reason,
+        "annual_ctc":          annual_ctc,
     }
     struct = upsert_salary_structure(db, data, actor)
 
-    # Immediately refresh TDS from tax declaration so salary structure
-    # shows correct net (same as what payroll generation will use).
-    try:
-        _stat_svc.refresh_tds_for_employee(db, employee_id, commit=True)
-        db.refresh(struct)
-    except Exception as _tds_err:
-        log.warning(
-            "TDS refresh after CTC structure save failed for employee_id=%d: %s",
-            employee_id, _tds_err,
-        )
-
     log.info(
-        "[CTC_SAVE] employee_id=%d | annual_ctc=%.2f | "
-        "basic_monthly=%.2f | hra_monthly=%.2f | lta_monthly=%.2f | "
-        "transport_monthly=%.2f | special_allowance_monthly=%.2f | "
-        "gross_monthly=%.2f | employee_pf=%.2f | employer_pf=%.2f | "
-        "esi=%.2f | pt=%.2f | monthly_tds=%.2f | net_monthly=%.2f | "
-        "salary_structure_id=%s",
-        employee_id, breakup.annual_ctc,
-        breakup.basic, breakup.hra, breakup.lta,
-        breakup.transport_allowance, breakup.special_allowance,
-        breakup.gross_monthly, breakup.pf_employee, breakup.pf_employer,
-        breakup.esi_employee, breakup.professional_tax, struct.tds,
-        struct.net_monthly, struct.id,
+        "[CTC_SAVE] employee_id=%d | annual_ctc=%.2f | salary_structure_id=%s",
+        employee_id, annual_ctc, struct.id,
     )
 
     return struct
@@ -1165,8 +1520,20 @@ def get_salary_structure_for_period(
 
 
 def list_salary_structures(db: Session, active_only: bool = True) -> list[SalaryStructure]:
-    """List salary structures. active_only=True returns only current active revisions."""
-    q = db.query(SalaryStructure)
+    """List salary structures for active, non-deleted employees only.
+
+    Joins with the employees table so that soft-deleted or inactive employees
+    (is_deleted=True or employment_status != 'active') are excluded from the
+    Salary Master list without physically removing any salary_structures rows.
+    """
+    q = (
+        db.query(SalaryStructure)
+        .join(Employee, SalaryStructure.employee_id == Employee.id)
+        .filter(
+            Employee.is_deleted.is_(False),
+            Employee.employment_status == "active",
+        )
+    )
     if active_only:
         q = q.filter(SalaryStructure.is_active.is_(True))
     return q.order_by(SalaryStructure.employee_id, SalaryStructure.effective_from.desc()).all()
@@ -1486,7 +1853,10 @@ def list_employees_missing_salary_structure(db: Session) -> list[dict]:
     structured_ids = {
         row.employee_id
         for row in db.query(SalaryStructure)
-        .filter(SalaryStructure.is_active.is_(True), SalaryStructure.gross_monthly > 0)
+        .filter(
+            SalaryStructure.is_active.is_(True),
+            or_(SalaryStructure.gross_monthly > 0, SalaryStructure.annual_ctc > 0),
+        )
         .all()
     }
     employees = (
@@ -1516,16 +1886,30 @@ def list_employees_missing_salary_structure(db: Session) -> list[dict]:
 # ─── Payroll Run CRUD ─────────────────────────────────────────────────────────
 
 def create_payroll_run(db: Session, data: dict, actor: Employee) -> PayrollRun:
+    fields = derive_payroll_period_fields(data["pay_period_start"])
+    # Prevent duplicate: if a non-cancelled run already exists for this month/year, return it
+    existing = (
+        db.query(PayrollRun)
+        .filter(
+            PayrollRun.month == int(fields["month"]),
+            PayrollRun.year == int(fields["year"]),
+            PayrollRun.status != "cancelled",
+        )
+        .first()
+    )
+    if existing:
+        return normalize_payroll_run_period(existing)
     run = PayrollRun(
         pay_period_start=data["pay_period_start"],
         pay_period_end=data["pay_period_end"],
-        month_label=data["month_label"],
-        month=data.get("month") or data["pay_period_start"].month,
-        year=data.get("year") or data["pay_period_start"].year,
+        month_label=str(fields["month_label"]),
+        month=int(fields["month"]),
+        year=int(fields["year"]),
         notes=data.get("notes"),
         status="draft",
         attendance_locked=False,
         payroll_locked=False,
+        variance_threshold_pct=float(data.get("variance_threshold_pct") or 20.0),
         initiated_by_id=actor.id,
         initiated_at=datetime.utcnow(),
     )
@@ -1535,11 +1919,12 @@ def create_payroll_run(db: Session, data: dict, actor: Employee) -> PayrollRun:
     _log_action(db, run, actor, "initiate", None, "draft")
     db.commit()
     db.refresh(run)
+    _dispatch_payroll_notifications(db, run, "create", actor, data.get("notes"))
     return run
 
 
 def get_payroll_run(db: Session, run_id: int) -> Optional[PayrollRun]:
-    return (
+    run = (
         db.query(PayrollRun)
         .options(
             joinedload(PayrollRun.employees),
@@ -1549,16 +1934,51 @@ def get_payroll_run(db: Session, run_id: int) -> Optional[PayrollRun]:
         .filter(PayrollRun.id == run_id)
         .first()
     )
+    return normalize_payroll_run_period(run)
 
 
 def list_payroll_runs(db: Session, limit: int = 20, offset: int = 0) -> list[PayrollRun]:
-    return (
+    # Status priority: higher index = more advanced/preferred when deduplicating
+    _STATUS_PRIORITY = {
+        "draft": 0,
+        "attendance_frozen": 1,
+        "processing": 2,
+        "under_review": 3,
+        "pending_head_approval": 4,
+        "approved": 5,
+        "payslip_generated": 6,
+        "bank_advice_generated": 7,
+        "published": 8,
+        "closed": 9,
+    }
+    all_runs = (
         db.query(PayrollRun)
+        .filter(PayrollRun.status != "cancelled")
         .order_by(PayrollRun.pay_period_start.desc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
+    # Normalize first so month/year are always derived from pay_period_start
+    # (DB columns are Optional — old runs may have NULL month/year)
+    all_runs = [normalize_payroll_run_period(r) for r in all_runs if r]
+    # Deduplicate: keep highest-priority status per month/year
+    seen: dict = {}
+    for run in all_runs:
+        # Use pay_period_start as authoritative fallback if month/year still null
+        m = run.month or (run.pay_period_start.month if run.pay_period_start else 0)
+        y = run.year or (run.pay_period_start.year if run.pay_period_start else 0)
+        key = (m, y)
+        if key not in seen:
+            seen[key] = run
+        else:
+            existing_priority = _STATUS_PRIORITY.get(seen[key].status, -1)
+            this_priority = _STATUS_PRIORITY.get(run.status, -1)
+            if this_priority > existing_priority:
+                seen[key] = run
+    deduped = sorted(seen.values(), key=lambda r: (
+        r.year or (r.pay_period_start.year if r.pay_period_start else 0),
+        r.month or (r.pay_period_start.month if r.pay_period_start else 0),
+    ), reverse=True)
+    return deduped[offset: offset + limit]
 
 
 def advance_run_status(
@@ -1567,6 +1987,7 @@ def advance_run_status(
     run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
     if not run:
         raise ValueError(f"Payroll run {run_id} not found")
+    _ensure_run_document_fields(run)
 
     # ── Defense-in-depth: explicitly block destructive actions on locked runs ──
     if (run.status in _LOCKED_STATUSES or run.payroll_locked) and action in ("generate", "recompute", "process"):
@@ -1580,19 +2001,42 @@ def advance_run_status(
             f"Action '{action}' is not valid from status '{run.status}'"
         )
 
-    # Gate: existing UI flow still requires the explicit freeze step.
-    # The document-style "process" action is allowed to lock payroll-side
-    # attendance consumption without changing the attendance module itself.
-    if action == "generate" and run.status != "attendance_frozen":
-        raise ValueError("Attendance must be frozen before generating payroll")
+    if action == "generate_payslips" and not is_final_approved_run(run):
+        raise ValueError(
+            "Finance Head final approval is required before generating payslips."
+        )
+
+    if action == "publish":
+        if not is_final_approved_run(run):
+            raise ValueError(
+                "Finance Head final approval is required before publishing payslips to ESS."
+            )
+        ensure_payroll_records_exist(db, run.id)
+        generated_slips = db.query(Payslip).filter_by(run_id=run.id).count()
+        if generated_slips == 0:
+            raise ValueError("Generate payslips before publishing to ESS.")
+
+    # Gate: payroll generation requires either the run's attendance to have been
+    # explicitly frozen (attendance_frozen status) OR the HR monthly attendance
+    # summary to be frozen (checked by the bridge gate below).  Allowing "generate"
+    # from "draft" lets Finance skip the redundant "Freeze Payroll Input" click when
+    # HR has already frozen the monthly attendance summary.
+    # Also allow "generate" from "processing" — treated as a recompute so Finance
+    # can re-generate employee rows when the run has 0 records (e.g. after a prior
+    # partial failure) without needing to know to use "recompute" explicitly.
+    if action == "generate" and run.status not in ("attendance_frozen", "processing"):
+        raise ValueError(
+            "Payroll can only be generated from attendance_frozen or processing status. "
+            "HR must freeze monthly attendance before payroll generation."
+        )
 
     # ── Monthly Attendance Summary bridge gate ────────────────────────────
     # TEMPORARY PAYROLL BRIDGE: In production the Attendance/Timesheet modules
     # will populate monthly_attendance_summary and set is_frozen=True.
     # Until then, HR/Admin must freeze via /payroll/attendance-summary/freeze.
     if action in ("generate", "process"):
-        run_month = run.month or run.pay_period_start.month
-        run_year  = run.year or run.pay_period_start.year
+        run_month = run.pay_period_start.month
+        run_year  = run.pay_period_start.year
         try:
             from app.services.payroll_attendance_bridge import check_frozen_for_payroll
             ok, reason = check_frozen_for_payroll(db, run_month, run_year)
@@ -1608,8 +2052,21 @@ def advance_run_status(
                 "Attendance bridge gate check failed (non-fatal, allowing): %s", _gate_err
             )
 
-    # Gate: cannot approve if unresolved errors exist
-    if action in ("approve", "head_approve", "finance_review", "finance_head_approve", "hr_confirm"):
+    # Gate: cannot submit, approve, or produce payroll outputs if unresolved
+    # generation/review errors exist.
+    if action in (
+        "submit_review",
+        "submit_for_approval",
+        "approve",
+        "head_approve",
+        "finance_review",
+        "finance_head_approve",
+        "hr_confirm",
+        "generate_payslips",
+        "generate_bank_advice",
+        "publish",
+        "close",
+    ):
         open_errors = (
             db.query(PayrollError)
             .filter_by(run_id=run_id, is_resolved=False)
@@ -1621,20 +2078,56 @@ def advance_run_status(
                 f"({open_errors} unresolved error(s) found)"
             )
 
-    # Gate: Finance must acknowledge variance BEFORE sending to Finance Head
-    if action in ("approve", "finance_review"):
+    if action in ("head_approve", "finance_head_approve") and not _finance_review_completed(db, run_id):
+        raise ValueError("Finance review must be completed before Finance Head final approval")
+
+    if action in (
+        "start_review",
+        "submit_review",
+        "submit_for_approval",
+        "approve",
+        "finance_review",
+        "head_approve",
+        "finance_head_approve",
+        "hr_confirm",
+        "finalize",
+        "generate_payslips",
+        "generate_bank_advice",
+        "publish",
+        "close",
+    ):
+        ensure_payroll_records_exist(db, run.id)
+
+    # Gate: Finance must acknowledge variance BEFORE sending to Finance Head.
+    # Also covers submit_review/submit_for_approval which now go directly to
+    # pending_head_approval (one-click Finance submission flow).
+    if action in ("approve", "finance_review", "submit_review", "submit_for_approval"):
         try:
             from app.models.payroll_extended import PayrollVarianceLog
-            flagged_unacknowledged = (
+            flagged_rows = (
                 db.query(PayrollVarianceLog)
                 .filter(
                     PayrollVarianceLog.run_id == run_id,
                     PayrollVarianceLog.is_flagged.is_(True),
                     PayrollVarianceLog.acknowledged_by_id.is_(None),
                 )
-                .count()
+                .all()
             )
-            # Also check run-level variance_reviewed flag
+            flagged_unacknowledged = sum(
+                1
+                for variance_row in flagged_rows
+                if "salary assignment" not in (variance_row.variance_flags or "").lower()
+            )
+
+            # Auto-acknowledge: when no variance entries are flagged (first payroll
+            # run, or all employees have 0% variance vs previous run), mark
+            # variance_reviewed automatically so Finance is not blocked.
+            if flagged_unacknowledged == 0:
+                try:
+                    run.variance_reviewed = True
+                except Exception:
+                    pass
+
             variance_reviewed = getattr(run, "variance_reviewed", True)
             if flagged_unacknowledged > 0 and not variance_reviewed:
                 raise ValueError(
@@ -1657,7 +2150,7 @@ def advance_run_status(
         run.attendance_locked = True
         _record_lock_history(db, run, "ATTENDANCE", "LOCK", actor, remarks or "Payroll attendance snapshot locked")
 
-    if action in ("generate", "process"):
+    if action in ("generate", "process", "recompute"):
         run.processed_at = now
         run.attendance_locked = True
         # Refresh TDS from latest tax declarations before computing rows
@@ -1671,42 +2164,72 @@ def advance_run_status(
             _compute_and_store_variance(db, run)
         except Exception as _var_e:
             log.warning("Variance computation failed (non-fatal): %s", _var_e)
+        # H-5: HR accountability audit — record that Finance generated payroll
+        # against HR-frozen attendance inputs.
+        try:
+            _mark_approval_step(
+                db, run, actor, "HR_INPUT_FROZEN", "APPROVED",
+                f"Payroll generated by Finance based on HR-frozen attendance for {run.month_label}.",
+            )
+        except Exception as _hr_log_err:
+            log.warning("HR input audit log failed (non-fatal): %s", _hr_log_err)
 
-    elif action == "recompute":
-        run.processed_at = now
-        try:
-            _stat_svc.refresh_tds_for_run(db, run.id)
-        except Exception as _tds_err:
-            log.warning("TDS refresh failed before recompute (run %s): %s", run.id, _tds_err)
-        _generate_employee_rows(db, run)
-        # Recompute variance after recompute
-        try:
-            _compute_and_store_variance(db, run)
-        except Exception as _var_e:
-            log.warning("Variance computation failed after recompute (non-fatal): %s", _var_e)
+    elif action == "start_review":
+        # H-3: Finance formally enters review state (processing → under_review).
+        if (run.total_employees or 0) == 0:
+            raise ValueError(
+                "Cannot start Finance Review: payroll has 0 employee records. "
+                "Generate payroll first."
+            )
+        _mark_approval_step(
+            db, run, actor, "FINANCE_REVIEW", "INITIATED",
+            remarks or f"Finance Review started for {run.month_label}.",
+        )
 
     elif action in ("submit_review", "submit_for_approval"):
+        # Validate payroll completeness before Finance submits to Finance Head.
+        if (run.total_employees or 0) == 0:
+            raise ValueError(
+                "Cannot submit: payroll has 0 employee records. "
+                "Generate payroll first before submitting to Finance Head."
+            )
+        if (run.total_gross or 0) <= 0:
+            raise ValueError(
+                "Cannot submit: total gross pay is ₹0. Regenerate payroll before submitting."
+            )
+        if (run.total_net or 0) <= 0:
+            raise ValueError(
+                "Cannot submit: total net pay is ₹0. Regenerate payroll before submitting."
+            )
+        # Record Finance team's review sign-off and set Finance approval timestamp.
+        _mark_approval_step(db, run, actor, "FINANCE_REVIEW", "APPROVED", remarks)
         _ensure_pending_approval_steps(db, run, actor)
+        run.approved_at = now
+        run.approved_by_id = actor.id
+        try:
+            run.variance_reviewed = True
+        except Exception:
+            pass
 
     elif action in ("approve", "finance_review"):
+        # Recovery path: Finance resubmitting after Finance Head rejection
+        # (under_review → pending_head_approval). Set the same Finance sign-off
+        # fields as the primary submit_review path.
         _mark_approval_step(db, run, actor, "FINANCE_REVIEW", "APPROVED", remarks)
+        _ensure_pending_approval_steps(db, run, actor)
+        run.approved_at = now
+        run.approved_by_id = actor.id
+        try:
+            run.variance_reviewed = True
+        except Exception:
+            pass
 
     elif action in ("head_approve", "finance_head_approve"):
         _mark_approval_step(db, run, actor, "FINANCE_HEAD_APPROVAL", "APPROVED", remarks)
         _mark_approval_step(db, run, actor, "HR_CONFIRMATION", "APPROVED", "Legacy head approval confirmed payroll")
         run.approved_at = now
         run.approved_by_id = actor.id
-        # Lock payroll immediately on Finance Head final approval
-        run.payroll_locked = True
-        run.finalized_by_id = actor.id
-        run.finalized_at = now
-        db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
-            {"is_locked": True}, synchronize_session=False
-        )
-        _record_lock_history(
-            db, run, "PAYROLL", "LOCK", actor,
-            remarks or "Finance Head final approval — payroll locked"
-        )
+        run.payroll_locked = True  # Lock payroll so is_final_approved_run() passes
 
     elif action == "hr_confirm":
         _mark_approval_step(db, run, actor, "HR_CONFIRMATION", "APPROVED", remarks)
@@ -1727,27 +2250,42 @@ def advance_run_status(
         _record_lock_history(db, run, "PAYROLL", "LOCK", actor, remarks or "Payroll finalized")
 
     elif action == "disburse":
+        # Legacy action — no longer reachable via _TRANSITIONS.  Kept so that
+        # pre-Sprint 3 disbursed runs can still be queried without errors.
         run.disbursed_at = now
 
+    elif action == "generate_bank_advice":
+        # Sprint 3: mandatory step between payslip_generated and published.
+        # The actual CSV is generated by the route handler via payslip_service;
+        # this handler records the audit trail and sets the run metadata.
+        try:
+            run.bank_advice_generated_at = now
+            run.bank_advice_status = "generated"
+        except Exception:
+            pass
+        _mark_approval_step(
+            db, run, actor, "BANK_ADVICE", "GENERATED",
+            remarks or f"Bank advice generated for {run.month_label}.",
+        )
+
     elif action == "generate_payslips":
-        if not run.payroll_locked:
-            run.payroll_locked = True
-            run.finalized_by_id = actor.id
-            run.finalized_at = now
-            db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
-                {"is_locked": True}, synchronize_session=False
-            )
-            _record_lock_history(db, run, "PAYROLL", "LOCK", actor, "Payslip generation finalized payroll")
         _generate_payslip_records(db, run, actor)
 
     elif action == "publish":
         run.published_at = now
-        # Use payslip_service.bulk_publish_payslips for individual immutability +
-        # email notification per employee.  The service internally calls publish_payslip
-        # which sets is_published=True and sends the email.
+        # Final publish locks the payroll and completes the run.
+        run.payroll_locked = True
+        run.finalized_by_id = actor.id
+        run.finalized_at = now
+        db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
+            {"is_locked": True}, synchronize_session=False
+        )
+        # Use payslip_service.bulk_publish_payslips for individual immutability.
+        # Employee notifications are emitted once below through the shared
+        # notification service after this transition commits.
         try:
             from app.services.payslip_service import bulk_publish_payslips as _bulk_pub
-            pub_result = _bulk_pub(db, run_id=run.id, published_by_id=actor.id, send_emails=True)
+            pub_result = _bulk_pub(db, run_id=run.id, published_by_id=actor.id, send_emails=False)
             log.info(
                 "Bulk publish run_id=%d: %s", run.id, pub_result
             )
@@ -1765,8 +2303,13 @@ def advance_run_status(
         except Exception as _tds_bp_err:
             log.warning("TDS monthly breakup storage failed (non-fatal): %s", _tds_bp_err)
 
-    # On close: persist annual TDS summary (Form 16 Part A) for each employee
-    if new_status == "closed":
+    if action == "close":
+        # Ensure payroll is locked on close — may already be True from publish, but make explicit.
+        run.payroll_locked = True
+        _record_lock_history(db, run, "PAYROLL", "LOCK", actor, remarks or "Payroll run closed")
+
+    # On completion or close: persist annual TDS summary (Form 16 Part A) for each employee
+    if new_status in ("completed", "closed"):
         try:
             _upsert_annual_tds_summaries_for_run(db, run)
         except Exception as _tds_ann_err:
@@ -1834,6 +2377,18 @@ def _upsert_annual_tds_summaries_for_run(db: Session, run: PayrollRun) -> None:
 
 # ─── Core Payroll Generation Engine ──────────────────────────────────────────
 
+# Maps BonusRequest.bonus_type → PayrollAdjustment.adjustment_type
+_BONUS_TYPE_TO_ADJ_TYPE: dict[str, str] = {
+    "Joining Bonus":     "bonus",
+    "Annual Bonus":      "bonus",
+    "Performance Bonus": "bonus",
+    "Incentive":         "bonus",
+    "Arrears":           "arrears",
+    "Special Bonus":     "bonus",
+    "Other":             "other_addition",
+}
+
+
 def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
     """
     Enterprise payroll row generation.
@@ -1841,7 +2396,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
     For each active employee:
       1. Find the LATEST active salary structure with effective_from <= pay_period_end.
       2. Validate the structure (gross > 0, no CTC mismatch).
-      3. Apply LOP deduction from PayrollAttendanceSummary if available.
+      3. Apply LOP deduction from Leave Management payroll inputs.
       4. Apply one-time PayrollAdjustments (bonus, arrears, deductions).
       5. Store the salary_structure_id used (immutable audit anchor).
       6. Log TDS computation details.
@@ -1863,13 +2418,23 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
     # synchronize_session=False: bypass ORM identity-map evaluation so the DELETE
     # always hits the DB cleanly regardless of what objects are in the session cache.
     db.query(PayrollRunEmployee).filter_by(run_id=run.id).delete(synchronize_session=False)
-    db.query(PayrollError).filter_by(
-        run_id=run.id, error_type="missing_salary_structure"
-    ).delete(synchronize_session=False)
-    db.query(PayrollError).filter_by(
-        run_id=run.id, error_type="salary_mismatch"
-    ).delete(synchronize_session=False)
+    for error_type in (
+        "employee_inactive",
+        "doj_doe_issue",
+        "duplicate_payroll_record",
+        "invalid_net_pay",
+        "lop_payable_mismatch",
+        "missing_ctc",
+        "missing_salary_structure",
+        "salary_mismatch",
+        "missing_attendance_summary",
+        "computation_error",
+    ):
+        db.query(PayrollError).filter_by(
+            run_id=run.id, error_type=error_type
+        ).delete(synchronize_session=False)
 
+    pay_period_start = run.pay_period_start
     pay_period_end = run.pay_period_end
     period_month_num, period_year, period_month = _period_month_year(run)
 
@@ -1881,9 +2446,40 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
     # All active, non-deleted employees are evaluated
     active_employees = (
         db.query(Employee)
-        .filter(Employee.is_deleted.is_(False), Employee.employment_status == "active")
+        .filter(
+            Employee.is_deleted.is_(False),
+            Employee.employment_status == "active",
+            or_(Employee.date_of_joining.is_(None), Employee.date_of_joining <= pay_period_end),
+            or_(Employee.date_of_exit.is_(None), Employee.date_of_exit >= pay_period_start),
+        )
         .order_by(Employee.id)
         .all()
+    )
+    active_employee_ids = {emp.id for emp in active_employees}
+    attendance_employee_ids = {
+        employee_id
+        for (employee_id,) in (
+            db.query(MonthlyAttendanceSummary.employee_id)
+            .filter(
+                MonthlyAttendanceSummary.month == period_month_num,
+                MonthlyAttendanceSummary.year == period_year,
+                MonthlyAttendanceSummary.is_frozen.is_(True),
+                MonthlyAttendanceSummary.is_ready_for_payroll.is_(True),
+            )
+            .all()
+        )
+    }
+    candidate_employee_ids = active_employee_ids | attendance_employee_ids
+    active_employees = (
+        db.query(Employee)
+        .filter(
+            Employee.id.in_(candidate_employee_ids),
+            Employee.is_deleted.is_(False),
+        )
+        .order_by(Employee.id)
+        .all()
+        if candidate_employee_ids
+        else []
     )
 
     generated = 0
@@ -1892,18 +2488,35 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
     for emp in active_employees:
         emp_label = f"{emp.first_name} {emp.last_name or ''}".strip()
 
-        # ── Step 1: Find salary assignment/structure for this payroll period ──
-        # Uses date-range based lookup (not status=ACTIVE) so that historical
-        # payroll runs for periods BEFORE a recent hike still find the correct
-        # SUPERSEDED assignment rather than returning None.
+        employee_validation_issues: list[str] = []
+        if (emp.employment_status or "").lower() != "active":
+            employee_validation_issues.append("Employee is inactive for this payroll period")
+        if emp.date_of_joining and emp.date_of_joining > pay_period_end:
+            employee_validation_issues.append(
+                f"DOJ {emp.date_of_joining} is after pay period end {pay_period_end}"
+            )
+        if emp.date_of_exit and emp.date_of_exit < pay_period_start:
+            employee_validation_issues.append(
+                f"DOE {emp.date_of_exit} is before pay period start {pay_period_start}"
+            )
+        if employee_validation_issues:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "doj_doe_issue"
+                if any(issue.startswith(("DOJ", "DOE")) for issue in employee_validation_issues)
+                else "employee_inactive",
+                "; ".join(employee_validation_issues),
+            )
+            errors += 1
+            continue
+
+        # ── Step 1: Find salary structure for this payroll period ──
+        # salary_structures is the approved payroll source of truth.  Assignment
+        # rows are retained only as audit context for older data.
         assignment = _get_salary_assignment_for_period(db, emp.id, pay_period_end)
-        ss = assignment.salary_structure if assignment else None
-        assignment_missing = assignment is None
-        if ss is None:
-            # Backward-compatible fallback for existing demo data and salary UI:
-            # salary_structures remains the historical source until all employees
-            # have employee_salary_assignments rows.
-            ss = get_salary_structure_for_period(db, emp.id, pay_period_end)
+        ss = get_salary_structure_for_period(db, emp.id, pay_period_end)
 
         if ss is None:
             # Check whether there IS a structure but it's future-dated
@@ -1940,28 +2553,45 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
                     run.id, emp.id, emp_label,
                 )
 
-            db.add(PayrollError(
-                run_id=run.id,
-                employee_id=emp.id,
-                error_type="missing_salary_structure",
-                description=desc,
-                severity="error",
-            ))
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "missing_salary_structure",
+                desc,
+            )
             errors += 1
             continue
 
+        annual_ctc = float(ss.annual_ctc or 0.0)
+        gross_monthly = float(ss.gross_monthly or 0.0)
+        has_earnings_breakup = any(
+            float(value or 0.0) > 0.0
+            for value in (
+                ss.basic,
+                ss.hra,
+                ss.da,
+                ss.special_allowance,
+            )
+        )
+        # Always derive from annual_ctc when set — stale stored component values
+        # (gross_monthly, basic, hra, etc.) are ignored to prevent using outdated data.
+        ctc_only_structure = annual_ctc > 0.0
+
         # ── Step 2: Sanity validation ──
-        if ss.gross_monthly <= 0:
-            db.add(PayrollError(
-                run_id=run.id,
-                employee_id=emp.id,
-                error_type="missing_salary_structure",
-                description=(
-                    f"Salary structure (id={ss.id}) for {emp_label} has ₹0 gross monthly. "
-                    "Update the salary structure with valid CTC values before generating payroll."
+        if gross_monthly <= 0.0 and annual_ctc <= 0.0:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "missing_ctc",
+                (
+                    f"Salary structure (id={ss.id}) for {emp_label} has no Annual CTC. "
+                    "Update Salary Master with valid Annual CTC before generating payroll."
                 ),
-                severity="error",
-            ))
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+            )
             log.error(
                 "[Run %d] Employee %d (%s): salary structure id=%d has ₹0 gross — skipping.",
                 run.id, emp.id, emp_label, ss.id,
@@ -1969,12 +2599,28 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             errors += 1
             continue
 
+        if annual_ctc <= 0.0:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "missing_ctc",
+                (
+                    f"Annual CTC missing in salary structure (id={ss.id}) for {emp_label}. "
+                    "Payroll must be generated from Annual CTC."
+                ),
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+            )
+            errors += 1
+            continue
+
         # CTC mismatch guard — catches accidental monthly-vs-annual data entry errors.
         # Threshold: gross_monthly < 30% of (annual_ctc / 12) is suspicious.
-        if ss.annual_ctc > 50_000:
-            expected_monthly = ss.annual_ctc / 12
-            if ss.gross_monthly < expected_monthly * 0.30:
-                mismatch_pct = round(ss.gross_monthly / expected_monthly * 100, 1)
+        if not ctc_only_structure and annual_ctc > 50_000:
+            expected_monthly = annual_ctc / 12
+            if gross_monthly < expected_monthly * 0.30:
+                mismatch_pct = round(gross_monthly / expected_monthly * 100, 1)
                 db.add(PayrollError(
                     run_id=run.id,
                     employee_id=emp.id,
@@ -1994,29 +2640,179 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
                     "[Run %d] Employee %d (%s): salary mismatch — "
                     "annual_ctc=%.2f, expected_monthly=%.2f, actual_gross=%.2f (%.1f%%)",
                     run.id, emp.id, emp_label,
-                    ss.annual_ctc, expected_monthly, ss.gross_monthly, mismatch_pct,
+                    ss.annual_ctc, expected_monthly, gross_monthly, mismatch_pct,
                 )
                 # Warning only — row is still generated, Finance must review
 
         log.info(
             "[Run %d] Employee %d (%s): using salary_structure id=%d, "
             "effective_from=%s, gross=₹%.2f",
-            run.id, emp.id, emp_label, ss.id, ss.effective_from, ss.gross_monthly,
+            run.id, emp.id, emp_label, ss.id, ss.effective_from, gross_monthly,
         )
 
         # ── Step 3: Finalized attendance/timesheet summary for this period ──
-        attendance = get_payroll_attendance_summary(db, emp.id, period_month_num, period_year)
-        working_days = int(attendance["total_working_days"])
-        payable_days = float(attendance["payable_days"])
-        present_days = int(attendance["present_days"])
-        leave_days = int(attendance["leave_days"])
-        lop_days = int(attendance["lop_days"])
-        holiday_days = int(attendance["holiday_days"])
-        overtime_hours = float(attendance["overtime_hours"])
+        # Primary source: MonthlyAttendanceSummary (integer month/year, is_frozen +
+        # is_ready_for_payroll flags).  This is the canonical payroll bridge table
+        # populated by Attendance/Timesheet modules (or manual HR entry).
+        # Fallback: legacy PayrollAttendanceSummary may supply attendance fields
+        # for backwards compatibility, but LOP still comes only from Leave Management.
+        mas_att = (
+            db.query(MonthlyAttendanceSummary)
+            .filter(
+                MonthlyAttendanceSummary.employee_id == emp.id,
+                MonthlyAttendanceSummary.month == period_month_num,
+                MonthlyAttendanceSummary.year == period_year,
+                MonthlyAttendanceSummary.is_frozen.is_(True),
+                MonthlyAttendanceSummary.is_ready_for_payroll.is_(True),
+            )
+            .first()
+        )
+
+        if mas_att is not None:
+            working_days   = int(mas_att.total_working_days or 0)
+            lop_days       = int(mas_att.lop_days or 0)
+            payable_days   = (
+                float(mas_att.payable_days)
+                if mas_att.payable_days is not None
+                else float(max(working_days - lop_days, 0))
+            )
+            present_days   = int(mas_att.present_days or 0)
+            leave_days     = int(mas_att.leave_days or 0)
+            holiday_days   = 0
+            attendance_delta = _attendance_reconciliation_delta(
+                working_days=working_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                holiday_days=holiday_days,
+                lop_days=lop_days,
+            )
+            if attendance_delta > 0:
+                holiday_days = attendance_delta
+            elif attendance_delta < 0:
+                _add_generation_error(
+                    db,
+                    run,
+                    emp,
+                    "attendance_reconciliation_mismatch",
+                    (
+                        f"Attendance summary mismatch for {emp_label}: present={present_days}, "
+                        f"leave={leave_days}, holidays={holiday_days}, lop={lop_days}, "
+                        f"working={working_days}."
+                    ),
+                    salary_structure_id=ss.id,
+                    salary_assignment_id=assignment.id if assignment else None,
+                    working_days=working_days,
+                    payable_days=payable_days,
+                    present_days=present_days,
+                    leave_days=leave_days,
+                    lop_days=lop_days,
+                    holiday_days=holiday_days,
+                )
+                errors += 1
+                continue
+            overtime_hours = float(mas_att.approved_timesheet_hours) if mas_att.approved_timesheet_hours else 0.0
+            log.info(
+                "[Run %d] Employee %d (%s): attendance from MonthlyAttendanceSummary — "
+                "working=%d, present=%d, leave=%d, holidays=%d, lop=%d, payable=%.1f",
+                run.id, emp.id, emp_label,
+                working_days, present_days, leave_days, holiday_days, lop_days, payable_days,
+            )
+            attendance = {
+                "is_finalized": True,
+                "fallback_used": False,
+                "fallback_reason": None,
+            }
+        else:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "missing_attendance_summary",
+                (
+                    f"Frozen monthly attendance summary not found for {emp_label} "
+                    f"(employee_id={emp.id}) for {period_month_num}/{period_year}. "
+                    "Freeze monthly attendance before generating payroll."
+                ),
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+            )
+            log.error(
+                "[Run %d] Employee %d (%s): frozen MonthlyAttendanceSummary missing "
+                "for month=%d year=%d — skipping.",
+                run.id, emp.id, emp_label, period_month_num, period_year,
+            )
+            errors += 1
+            continue
 
         # ── Step 4: One-time adjustments ──
         # Normalize direction to lowercase+stripped so any casing variation in the
         # DB ("Addition", " addition", "ADDITION") is handled correctly.
+        expected_payable_days = float(max(working_days - lop_days, 0))
+        if (
+            working_days <= 0
+            or lop_days < 0
+            or lop_days > working_days
+            or abs(float(payable_days or 0.0) - expected_payable_days) > 0.01
+        ):
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "lop_payable_mismatch",
+                (
+                    f"LOP/payable days mismatch for {emp_label}: working={working_days}, "
+                    f"lop={lop_days}, payable={payable_days}, expected payable={expected_payable_days}."
+                ),
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+                working_days=working_days,
+                payable_days=payable_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                lop_days=lop_days,
+                holiday_days=holiday_days,
+            )
+            errors += 1
+            continue
+
+        # ── Materialise waiting bonus requests for this employee + payroll month ──
+        # Only regular_payroll bonuses in waiting_for_payroll_application are picked up here.
+        # off_cycle bonuses always go to status=approved and are never auto-applied by generation.
+        # Idempotent: payroll_adjustment_id IS NULL prevents double-apply on recompute.
+        waiting_bonuses = (
+            db.query(_BonusRequest)
+            .filter(
+                _BonusRequest.employee_id   == emp.id,
+                _BonusRequest.payroll_month == period_month_num,
+                _BonusRequest.payroll_year  == period_year,
+                _BonusRequest.status        == "waiting_for_payroll_application",
+                _BonusRequest.payment_mode  == "regular_payroll",
+                _BonusRequest.payroll_adjustment_id.is_(None),
+            )
+            .all()
+        )
+        for br in waiting_bonuses:
+            adj = PayrollAdjustment(
+                run_id=run.id,
+                employee_id=br.employee_id,
+                adjustment_type=_BONUS_TYPE_TO_ADJ_TYPE.get(br.bonus_type, "bonus"),
+                direction="addition",
+                amount=br.amount,
+                description=f"{br.bonus_type}" + (f": {br.reason}" if br.reason else ""),
+                is_taxable=True,
+                approved_by_id=br.approved_by_id,
+            )
+            db.add(adj)
+            db.flush()
+            br.payroll_adjustment_id = adj.id
+            br.payroll_run_id = run.id
+            br.status = "applied"
+            log.info(
+                "[Run %d] Employee %d (%s): materialised waiting bonus request %d "
+                "(%s ₹%.2f) → PayrollAdjustment %d",
+                run.id, emp.id, emp_label, br.id, br.bonus_type, br.amount, adj.id,
+            )
+
         adjustments = (
             db.query(PayrollAdjustment)
             .filter_by(run_id=run.id, employee_id=emp.id)
@@ -2085,7 +2881,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
 
         is_mid_month = proration.get("is_prorated", False)
 
-        if is_mid_month:
+        if is_mid_month and not ctc_only_structure:
             # Use blended prorated values for every component
             base_gross      = proration["prorated_gross"]
             base_basic      = proration["prorated_basic"]
@@ -2119,7 +2915,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             base_esi_er     = proration["prorated_esi_er"]
             base_pt         = proration["prorated_pt"]
             base_tds        = proration["prorated_tds"]
-            base_deductions = _sum_money(base_pf_emp, base_pf_er, base_esi_emp, base_pt, base_tds)
+            base_deductions = _sum_money(base_pf_emp, base_esi_emp, base_pt, base_tds)
             log.info(
                 "[Run %d] Employee %d (%s): MID-MONTH REVISION detected — "
                 "hike_date=%s, old_days=%d, new_days=%d, prorated_gross=₹%.2f",
@@ -2128,6 +2924,62 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
                 proration["old_salary_days"],
                 proration["new_salary_days"],
                 base_gross,
+            )
+        elif ctc_only_structure:
+            # CTC-only salary master (from-ctc endpoint stores components as 0).
+            # Compute the full monthly breakup via the CTC engine at generation time,
+            # which is exactly what was intended by the from-ctc save path.
+            _ctc_tds_override = ss.tds or 0.0
+            try:
+                breakup = compute_from_ctc(annual_ctc, db, monthly_tds=_ctc_tds_override)
+            except Exception as _ctc_err:
+                _add_generation_error(
+                    db,
+                    run,
+                    emp,
+                    "computation_error",
+                    f"Payroll calculation failed for {emp_label}: {_ctc_err}",
+                    salary_structure_id=ss.id,
+                    salary_assignment_id=assignment.id if assignment else None,
+                    working_days=working_days,
+                    payable_days=payable_days,
+                    present_days=present_days,
+                    leave_days=leave_days,
+                    lop_days=lop_days,
+                    holiday_days=holiday_days,
+                )
+                errors += 1
+                continue
+            base_gross      = breakup.gross_monthly
+            base_basic      = breakup.basic
+            base_hra        = breakup.hra
+            base_da         = breakup.da
+            base_special    = breakup.special_allowance
+            base_conveyance = breakup.transport_allowance
+            base_lta        = breakup.lta
+            base_allowances = (
+                breakup.special_allowance
+                + breakup.transport_allowance
+                + breakup.medical_allowance
+            )
+            base_pf_emp     = breakup.pf_employee
+            base_pf_er      = breakup.pf_employer
+            base_esi_emp    = breakup.esi_employee
+            base_esi_er     = breakup.esi_employer
+            base_pt         = breakup.professional_tax
+            base_tds        = breakup.tds
+            base_deductions = _sum_money(
+                breakup.pf_employee, breakup.esi_employee,
+                breakup.professional_tax, breakup.tds,
+            )
+            log.info(
+                "[Run %d] Employee %d (%s): CTC-only salary master — "
+                "computed from annual_ctc=₹%.2f → gross=₹%.2f, basic=₹%.2f, "
+                "hra=₹%.2f, pf_emp=₹%.2f, pt=₹%.2f, tds=₹%.2f, net=₹%.2f",
+                run.id, emp.id, emp_label,
+                annual_ctc, base_gross, base_basic, base_hra,
+                base_pf_emp, base_pt, base_tds,
+                _subtract_money(base_gross, base_deductions),
             )
         else:
             base_gross      = ss.gross_monthly
@@ -2149,7 +3001,15 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             base_esi_er     = ss.esi_employer
             base_pt         = ss.professional_tax
             base_tds        = ss.tds
-            base_deductions = ss.total_deductions
+            base_deductions = _sum_money(ss.pf_employee, ss.esi_employee, ss.professional_tax, ss.tds)
+
+        # ── PF Policy: Fixed at ₹1,800 — LOP does not reduce PF ──
+        _FIXED_PF = 1800.0
+        if base_pf_emp > 0:
+            base_pf_emp = _FIXED_PF
+        if base_pf_er > 0:
+            base_pf_er = _FIXED_PF
+        base_deductions = _sum_money(base_pf_emp, base_esi_emp, base_pt, base_tds)
 
         # ── ESI ceiling guard ──
         # If gross exceeds the statutory ESI wage ceiling, ESI is not applicable.
@@ -2160,7 +3020,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
         if base_gross > esi_ceiling:
             base_esi_emp = 0.0
             base_esi_er  = 0.0
-            base_deductions = _sum_money(base_pf_emp, base_pf_er, base_pt, base_tds)
+            base_deductions = _sum_money(base_pf_emp, base_pt, base_tds)
 
         original_base_gross = base_gross
         lop_deduction = 0.0
@@ -2178,14 +3038,14 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             base_special     = round(base_special     * pay_ratio, 2)
             base_conveyance  = round(base_conveyance  * pay_ratio, 2)
             base_allowances  = round(base_allowances  * pay_ratio, 2)
-            base_pf_emp      = round(base_pf_emp      * pay_ratio, 2)
-            base_pf_er       = round(base_pf_er       * pay_ratio, 2)
+            # PF (employee + employer) is NOT scaled — fixed at ₹1,800 per policy
             base_esi_emp     = round(base_esi_emp     * pay_ratio, 2)
             base_esi_er      = round(base_esi_er      * pay_ratio, 2)
             base_tds         = round(base_tds         * pay_ratio, 2)
             lop_deduction    = round(original_base_gross - base_gross, 2)
             # PT is NOT scaled for LOP in most Indian states (fixed per month)
-            base_deductions  = _sum_money(base_pf_emp, base_pf_er, base_esi_emp, base_pt, base_tds)
+            # Employer PF is NOT in employee deductions — only employee-side deductions affect net_pay
+            base_deductions  = _sum_money(base_pf_emp, base_esi_emp, base_pt, base_tds)
             log.info(
                 "[Run %d] Employee %d (%s): LOP applied — lop=%d, working=%d, "
                 "pay_ratio=%.4f, gross ₹%.2f → ₹%.2f",
@@ -2212,11 +3072,68 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
                     run.id, emp.id, emp_label, _tds_adj_err,
                 )
             # Rebuild base_deductions with the updated TDS (keeps PF/ESI/PT intact)
-            base_deductions = _sum_money(base_pf_emp, base_pf_er, base_esi_emp, base_pt, base_tds)
+            base_deductions = _sum_money(base_pf_emp, base_esi_emp, base_pt, base_tds)
 
         final_gross      = round(base_gross + additions, 2)
         final_deductions = _sum_money(base_deductions, deduction_adj)
         final_net        = _subtract_money(final_gross, final_deductions)
+        if final_gross <= 0.0 or final_net <= 0.0:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "invalid_net_pay",
+                (
+                    f"Net pay is invalid for {emp_label}: gross={final_gross}, "
+                    f"deductions={final_deductions}, net={final_net}."
+                ),
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+                working_days=working_days,
+                payable_days=payable_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                lop_days=lop_days,
+                holiday_days=holiday_days,
+            )
+            errors += 1
+            continue
+        row_lta = _sum_money(base_lta, lta_amount)
+        balanced_special = _balanced_special_allowance(
+            final_gross,
+            basic_pay=base_basic,
+            hra=base_hra,
+            da=base_da,
+            lta=row_lta,
+            conveyance=base_conveyance,
+            bonus=bonus_amount,
+            variable_pay=variable_pay_amount,
+            overtime_amount=overtime_amount,
+        )
+        if balanced_special < -0.01:
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "earnings_reconciliation_mismatch",
+                (
+                    f"Earnings components exceed gross pay for {emp_label}: gross={final_gross}, "
+                    f"basic={base_basic}, hra={base_hra}, da={base_da}, lta={row_lta}, "
+                    f"transport={base_conveyance}, bonus={bonus_amount}, "
+                    f"variable_pay={variable_pay_amount}, overtime={overtime_amount}."
+                ),
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+                working_days=working_days,
+                payable_days=payable_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                lop_days=lop_days,
+                holiday_days=holiday_days,
+            )
+            errors += 1
+            continue
+        base_special = max(balanced_special, 0.0)
         variance_flag, variance_reason = _detect_variance(
             db=db,
             employee_id=emp.id,
@@ -2226,7 +3143,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             net_pay=final_net,
             payable_days=payable_days,
             lop_days=lop_days,
-            assignment_missing=assignment_missing,
+            salary_structure=ss,
             attendance_fallback_reason=attendance.get("fallback_reason"),
         )
 
@@ -2260,6 +3177,21 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
                 "[Run %d] Employee %d (%s): duplicate payroll row detected — skipping insert.",
                 run.id, emp.id, emp_label,
             )
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "duplicate_payroll_record",
+                f"Duplicate payroll record exists for {emp_label} in run {run.id}.",
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+                working_days=working_days,
+                payable_days=payable_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                lop_days=lop_days,
+                holiday_days=holiday_days,
+            )
             errors += 1
             continue
 
@@ -2280,7 +3212,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
             hra=base_hra,
             da=base_da,
             special_allowance=base_special,
-            lta=base_lta + lta_amount,
+            lta=row_lta,
             conveyance=base_conveyance,
             bonus=bonus_amount,
             variable_pay=variable_pay_amount,
@@ -2302,21 +3234,34 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
         )
         row.sync_legacy_amount_columns()
         try:
+            # Use a nested transaction (savepoint) so a flush failure for one
+            # employee only rolls back that employee's insert — all previously
+            # inserted employees remain intact in the outer transaction.
+            savepoint = db.begin_nested()
             db.add(row)
             db.flush()
+            savepoint.commit()
         except Exception as _row_err:
-            db.rollback()
+            savepoint.rollback()
             log.error(
                 "[Run %d] Employee %d (%s): failed to insert payroll row — %s",
                 run.id, emp.id, emp_label, _row_err,
             )
-            db.add(PayrollError(
-                run_id=run.id,
-                employee_id=emp.id,
-                error_type="computation_error",
-                description=f"Payroll row insert failed: {_row_err}",
-                severity="error",
-            ))
+            _add_generation_error(
+                db,
+                run,
+                emp,
+                "computation_error",
+                f"Payroll row insert failed: {_row_err}",
+                salary_structure_id=ss.id,
+                salary_assignment_id=assignment.id if assignment else None,
+                working_days=working_days,
+                payable_days=payable_days,
+                present_days=present_days,
+                leave_days=leave_days,
+                lop_days=lop_days,
+                holiday_days=holiday_days,
+            )
             errors += 1
             continue
 
@@ -2362,6 +3307,7 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
 
     db.flush()
     _refresh_run_totals(db, run)
+    ensure_payroll_records_exist(db, run.id)
 
     log.info(
         "[Run %d] Generation complete — %d rows generated, %d errors/warnings.",
@@ -2373,14 +3319,18 @@ def _generate_employee_rows(db: Session, run: PayrollRun) -> None:
 
 def _generate_payslip_records(db: Session, run: PayrollRun, actor: Employee) -> None:
     """Create Payslip rows for every non-error employee in the run."""
+    normalize_payroll_run_period(run)
+    ensure_payroll_records_exist(db, run.id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run.id).all()
     month, year, _ = _period_month_year(run)
+    month_label = payroll_month_label(run.pay_period_start)
     now = datetime.utcnow()
     for row in rows:
         if row.has_error:
             continue
         existing = db.query(Payslip).filter_by(run_id=run.id, employee_id=row.employee_id).first()
         if existing:
+            normalize_payslip_period(existing)
             row.payslip_generated = True
             row.payslip_url = existing.file_url or existing.pdf_path
             continue
@@ -2389,7 +3339,7 @@ def _generate_payslip_records(db: Session, run: PayrollRun, actor: Employee) -> 
             payroll_record_id=row.id,
             run_id=run.id,
             employee_id=row.employee_id,
-            month_label=run.month_label,
+            month_label=month_label,
             month=month,
             year=year,
             payslip_number=payslip_number,
@@ -2458,7 +3408,7 @@ def _log_audit(
 
 def create_adjustment(db: Session, data: dict, actor: Employee) -> PayrollAdjustment:
     run = db.query(PayrollRun).filter(PayrollRun.id == data["run_id"]).first()
-    if run and (run.payroll_locked or run.status in _LOCKED_STATUSES):
+    if run and (run.payroll_locked or run.status in _LOCKED_STATUSES or run.status == "approved"):
         raise ValueError("Payroll is locked for this run; unlock workflow is required before changes")
     # Normalize direction and type so comparisons in _generate_employee_rows always work.
     raw_direction = str(data["direction"]).strip().lower()
@@ -2501,7 +3451,7 @@ def delete_adjustment(db: Session, adj_id: int) -> bool:
     if not adj:
         return False
     run = db.query(PayrollRun).filter(PayrollRun.id == adj.run_id).first()
-    if run and (run.payroll_locked or run.status in _LOCKED_STATUSES):
+    if run and (run.payroll_locked or run.status in _LOCKED_STATUSES or run.status == "approved"):
         raise ValueError("Payroll is locked for this run; unlock workflow is required before changes")
     db.delete(adj)
     db.commit()
@@ -2511,6 +3461,8 @@ def delete_adjustment(db: Session, adj_id: int) -> bool:
 # ─── Payroll Errors ───────────────────────────────────────────────────────────
 
 def create_payroll_error(db: Session, data: dict, actor: Employee) -> PayrollError:
+    run = db.query(PayrollRun).filter(PayrollRun.id == data["run_id"]).first()
+    _ensure_editable_run(run)
     err = PayrollError(
         run_id=data["run_id"],
         employee_id=data["employee_id"],
@@ -2537,6 +3489,8 @@ def resolve_payroll_error(
     err = db.query(PayrollError).filter(PayrollError.id == error_id).first()
     if not err:
         raise ValueError(f"Error {error_id} not found")
+    run = db.query(PayrollRun).filter(PayrollRun.id == err.run_id).first()
+    _ensure_editable_run(run)
     err.is_resolved = True
     err.resolved_by_id = actor.id
     err.resolved_at = datetime.utcnow()
@@ -2546,7 +3500,7 @@ def resolve_payroll_error(
         .filter_by(run_id=err.run_id, employee_id=err.employee_id, is_resolved=False)
         .count()
     )
-    if open_errors <= 1:
+    if open_errors <= 0:
         row = (
             db.query(PayrollRunEmployee)
             .filter_by(run_id=err.run_id, employee_id=err.employee_id)
@@ -2594,6 +3548,7 @@ def get_dashboard_stats(db: Session) -> dict:
         .order_by(PayrollRun.pay_period_start.desc())
         .first()
     )
+    normalize_payroll_run_period(current_run)
 
     last_disbursed = (
         db.query(PayrollRun)
@@ -2601,6 +3556,7 @@ def get_dashboard_stats(db: Session) -> dict:
         .order_by(PayrollRun.pay_period_start.desc())
         .first()
     )
+    normalize_payroll_run_period(last_disbursed)
 
     total_employees = (
         db.query(Employee)
@@ -2624,9 +3580,7 @@ def get_dashboard_stats(db: Session) -> dict:
         payslip_published_count = db.query(Payslip).filter_by(
             run_id=current_run.id, is_published=True
         ).count()
-        variance_count = db.query(PayrollRunEmployee).filter_by(
-            run_id=current_run.id, variance_flag=True
-        ).count()
+        variance_count = visible_variance_count(db, current_run.id)
         approval_status = _approval_status_summary(db, current_run.id)
         if current_run.total_employees > 0:
             processed = (
@@ -2656,10 +3610,10 @@ def get_dashboard_stats(db: Session) -> dict:
         ),
         "payroll_locked": bool(current_run.payroll_locked) if current_run else False,
         "is_finalized": (
-            bool(current_run.payroll_locked or current_run.status in ("payslip_generated", "published", "closed"))
+            bool(current_run.payroll_locked or current_run.status in ("payslip_generated", "published", "completed", "closed"))
             if current_run else False
         ),
-        "is_published": bool(current_run and current_run.status in ("published", "closed")),
+        "is_published": bool(current_run and current_run.status in ("published", "completed", "closed")),
         "approval_status": approval_status,
         "finance_review_status": approval_status.get("FINANCE_REVIEW") if approval_status else None,
         "payslip_generated_count": payslip_generated_count,
@@ -2719,22 +3673,29 @@ def list_run_employees(db: Session, run_id: int) -> list[PayrollRunEmployee]:
 
 
 def mark_payslip_generated(db: Session, run_id: int, employee_id: int) -> bool:
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run:
+        return False
+    ensure_payroll_records_exist(db, run_id)
     row = (
         db.query(PayrollRunEmployee)
         .filter_by(run_id=run_id, employee_id=employee_id)
         .first()
     )
     if row:
-        run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+        if not is_final_approved_run(run):
+            raise ValueError("Finance Head final approval is required before generating payslips.")
         if run:
+            normalize_payroll_run_period(run)
             month, year, _ = _period_month_year(run)
+            month_label = payroll_month_label(run.pay_period_start)
             slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=employee_id).first()
             if not slip:
                 slip = Payslip(
                     payroll_record_id=row.id,
                     run_id=run_id,
                     employee_id=employee_id,
-                    month_label=run.month_label,
+                    month_label=month_label,
                     month=month,
                     year=year,
                     payslip_number=f"PS-{year}{month:02d}-{run_id:04d}-{employee_id:04d}",
@@ -2748,6 +3709,8 @@ def mark_payslip_generated(db: Session, run_id: int, employee_id: int) -> bool:
                     is_published=False,
                 )
                 db.add(slip)
+            else:
+                normalize_payslip_period(slip)
         row.payslip_generated = True
         db.commit()
         return True
@@ -2762,7 +3725,8 @@ def list_payslips(db: Session, run_id: Optional[int] = None, employee_id: Option
         q = q.filter_by(run_id=run_id)
     if employee_id:
         q = q.filter_by(employee_id=employee_id)
-    return q.order_by(Payslip.pay_period_start.desc()).all()
+    slips = q.order_by(Payslip.pay_period_start.desc()).all()
+    return [normalize_payslip_period(slip) for slip in slips]
 
 
 def publish_payslip(db: Session, payslip_id: int, actor: Employee) -> Payslip:
@@ -2770,57 +3734,85 @@ def publish_payslip(db: Session, payslip_id: int, actor: Employee) -> Payslip:
     if not slip:
         raise ValueError(f"Payslip {payslip_id} not found")
     run = db.query(PayrollRun).filter(PayrollRun.id == slip.run_id).first()
-    if run and not run.payroll_locked:
-        if run.status == "approved":
-            run.payroll_locked = True
-            run.finalized_by_id = actor.id if actor else None
-            run.finalized_at = datetime.utcnow()
-            db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
-                {"is_locked": True}, synchronize_session=False
-            )
-            _record_lock_history(db, run, "PAYROLL", "LOCK", actor, "Auto-finalized before payslip publish")
-        elif run.status not in ("payslip_generated", "published", "closed"):
-            raise ValueError("Payroll must be finalized before publishing payslips")
+    was_published = bool(slip.is_published)
+    if not run or not is_final_approved_run(run) or run.status not in _PUBLISH_READY_STATUSES:
+        raise ValueError(
+            "Payslips can be published only after they are generated following Finance Head final approval."
+        )
+    ensure_payroll_records_exist(db, run.id)
     slip.is_published = True
     slip.status = "PUBLISHED"
     slip.published_at = datetime.utcnow()
     if run:
         run.published_at = slip.published_at
+        if run.status not in ("closed", "disbursed", "completed", "published"):
+            run.status = "published"
     db.commit()
     db.refresh(slip)
     _log_audit(db, slip.run_id, slip.employee_id, "published")
     if run:
-        _record_lock_history(db, run, "PAYSLIP", "LOCK", actor, "Payslip published")
-    db.commit()
-    return slip
-
-
-def bulk_publish_payslips(db: Session, run_id: int, actor: Employee) -> int:
-    """Publish all payslips for a run. Returns count published."""
-    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
-    if run and not run.payroll_locked:
-        if run.status == "approved":
+        if not run.payroll_locked:
             run.payroll_locked = True
-            run.finalized_by_id = actor.id if actor else None
-            run.finalized_at = datetime.utcnow()
+            run.finalized_by_id = actor.id
+            run.finalized_at = slip.published_at
             db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
                 {"is_locked": True}, synchronize_session=False
             )
-            _record_lock_history(db, run, "PAYROLL", "LOCK", actor, "Auto-finalized before payslip publish")
-        elif run.status not in ("payslip_generated", "published", "closed"):
-            raise ValueError("Payroll must be finalized before publishing payslips")
-    slips = db.query(Payslip).filter_by(run_id=run_id, is_published=False).all()
+            _record_lock_history(db, run, "PAYROLL", "LOCK", actor, "Payslip published")
+        else:
+            _record_lock_history(db, run, "PAYSLIP", "LOCK", actor, "Payslip published")
+    db.commit()
+    if run and not was_published:
+        _dispatch_payslip_published_notifications(db, run, [slip])
+    return slip
+
+
+def bulk_publish_payslips(
+    db: Session,
+    run_id: int,
+    actor: Employee,
+    *,
+    send_notification_email: bool = True,
+) -> int:
+    """Publish all payslips for a run. Returns count published."""
+    run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not run or not is_final_approved_run(run) or run.status not in _PUBLISH_READY_STATUSES:
+        raise ValueError(
+            "Payslips can be published only after they are generated following Finance Head final approval."
+        )
+    ensure_payroll_records_exist(db, run_id)
+    all_slips = db.query(Payslip).filter_by(run_id=run_id).all()
+    if not all_slips:
+        raise ValueError("Generate payslips before publishing to ESS.")
+    slips = [slip for slip in all_slips if not slip.is_published]
     now = datetime.utcnow()
     count = 0
+    published_slips: list[Payslip] = []
     for slip in slips:
         slip.is_published = True
         slip.status = "PUBLISHED"
         slip.published_at = now
         _log_audit(db, slip.run_id, slip.employee_id, "published")
+        published_slips.append(slip)
         count += 1
     if run:
-        run.status = "published"
+        if run.status not in ("closed", "disbursed", "completed", "published"):
+            run.status = "published"
         run.published_at = now
+        if not run.payroll_locked:
+            run.payroll_locked = True
+            run.finalized_by_id = actor.id
+            run.finalized_at = now
+            db.query(PayrollRunEmployee).filter_by(run_id=run.id).update(
+                {"is_locked": True}, synchronize_session=False
+            )
         _record_lock_history(db, run, "PAYSLIP", "LOCK", actor, "All payslips published")
     db.commit()
+    if run and published_slips:
+        _dispatch_payslip_published_notifications(
+            db,
+            run,
+            published_slips,
+            send_email=send_notification_email,
+        )
     return count

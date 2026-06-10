@@ -26,8 +26,16 @@ function StatusBadge({ text }) {
 
 // ── Attendance hours display ──────────────────────────────────────────────────
 
-function HoursCell({ attendance }) {
+/**
+ * loggedHours — fallback from TimesheetEntry.logged_hours.
+ * Used when there is no AttendanceRecord for the day (e.g. seeded entries,
+ * manually-created entries, or attendance not yet processed).
+ */
+function HoursCell({ attendance, loggedHours = 0 }) {
   if (!attendance) {
+    if (loggedHours > 0) {
+      return <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--hrms-text)' }}>{loggedHours}h</span>;
+    }
     return <span style={{ fontSize: 11, color: 'var(--hrms-text-faint)' }}>—</span>;
   }
   const { attendance_status, effective_hours, status } = attendance;
@@ -46,6 +54,9 @@ function HoursCell({ attendance }) {
     );
   }
   if (attendance_status === 'NO_ATTENDANCE' || !effective_hours) {
+    if (loggedHours > 0) {
+      return <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--hrms-text)' }}>{loggedHours}h</span>;
+    }
     return <span style={{ fontSize: 11, color: 'var(--hrms-text-faint)', fontStyle: 'italic' }}>No attendance</span>;
   }
   return (
@@ -62,7 +73,7 @@ const PROJECTS = ['HRMS Portal', 'Team Meeting', 'Payroll App', 'BGV System', 'O
 
 // ── Inline edit row (client / project / task only) ────────────────────────────
 
-function EditRow({ entry, attendance, onSave, onCancel }) {
+function EditRow({ entry, attendance, loggedHours, onSave, onCancel }) {
   const [form, setForm]     = useState({ client: entry.client, project: entry.project, task: entry.task });
   const [errors, setErrors] = useState({});
   const [shake, setShake]   = useState(false);
@@ -146,9 +157,9 @@ function EditRow({ entry, attendance, onSave, onCancel }) {
           />
         </td>
 
-        {/* Hours — always readonly, from attendance */}
+        {/* Hours — readonly; attendance takes priority, entry.logged_hours is fallback */}
         <td style={{ padding: '6px 9px' }}>
-          <HoursCell attendance={attendance} />
+          <HoursCell attendance={attendance} loggedHours={loggedHours} />
           {errors.attendance && (
             <div style={{ color: '#EF4444', fontSize: 10, marginTop: 1 }}>{errors.attendance}</div>
           )}
@@ -292,12 +303,14 @@ export default function EntriesTable({
             )}
 
             {filtered.map((entry) => {
-              const att = attendanceMap?.[entry.date];
+              const att         = attendanceMap?.[entry.date];
+              const loggedHours = entry.logged_hours || 0;
               return editingId === entry.id && !isLocked ? (
                 <EditRow
                   key={entry.id}
                   entry={entry}
                   attendance={att}
+                  loggedHours={loggedHours}
                   onSave={(data) => handleSave(entry.id, data)}
                   onCancel={() => setEditingId(null)}
                 />
@@ -327,7 +340,7 @@ export default function EntriesTable({
                     {entry.task || <span style={{ color: 'var(--hrms-text-faint)', fontStyle: 'italic' }}>—</span>}
                   </td>
                   <td style={{ padding: '7px 10px' }}>
-                    <HoursCell attendance={att} />
+                    <HoursCell attendance={att} loggedHours={loggedHours} />
                   </td>
                   <td style={{ padding: '7px 10px' }}>
                     <StatusBadge text={rowStatus(entry, att)} />

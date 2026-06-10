@@ -23,8 +23,10 @@ from sqlalchemy.orm import Session
 
 from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
 from app.models.employee import Employee
+from app.services.payroll_bridge import aggregate_leave_days_for_payroll_month
 
 log = logging.getLogger("hrms.payroll.attendance_bridge")
+LOP_SOURCE = "Leave Management"
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -82,7 +84,113 @@ def _active_employees(db: Session) -> list[Employee]:
     )
 
 
+def _leave_payroll_days(db: Session, employee_id: int, month: int, year: int) -> dict[str, int]:
+    return aggregate_leave_days_for_payroll_month(db, employee_id, month, year)
+
+
+def _apply_leave_payroll_overlay(row: MonthlyAttendanceSummary, leave_days: dict[str, int]) -> None:
+    row.leave_days = max(0, int(leave_days.get("paid_leave_days") or 0))
+    row.lop_days = max(0, int(leave_days.get("lop_days") or 0))
+    row.lop_source = LOP_SOURCE
+    row.lop_status = "ready"
+    row.lop_last_synced_at = datetime.utcnow()
+    if row.total_working_days and row.total_working_days > 0:
+        total_wd = int(row.total_working_days)
+        row.payable_days = float(max(total_wd - row.lop_days, 0))
+        # Ensure present_days + leave_days + lop_days <= total_working_days so the
+        # payroll reconciliation check (present + leave + holidays + lop == working_days)
+        # can balance. When the attendance row starts at full-present (e.g. demo seed or
+        # no separate attendance records) the leave overlay must reduce present_days.
+        total_absence = row.leave_days + row.lop_days
+        if (row.present_days or 0) + total_absence > total_wd:
+            row.present_days = max(0, total_wd - total_absence)
+
+
+def _refresh_leave_lop_overlays(db: Session, month: int, year: int) -> None:
+    rows = (
+        db.query(MonthlyAttendanceSummary)
+        .filter_by(month=month, year=year)
+        .all()
+    )
+    for row in rows:
+        if row.is_frozen:
+            continue
+        if row.lop_source == "Manual Override":
+            continue  # Preserve manually set LOP — don't let leave-system sync overwrite it
+        _apply_leave_payroll_overlay(row, _leave_payroll_days(db, row.employee_id, month, year))
+
+
 # ─── Core service functions ───────────────────────────────────────────────────
+
+def get_open_month(db: Session) -> dict:
+    """Return the auto-detected open payroll month and available months list.
+
+    The "open month" is the latest (year DESC, month DESC) month in
+    monthly_attendance_summary that has at least one non-frozen row —
+    i.e., HR still has work to do for that month.
+
+    Falls back to the current calendar month when no attendance data exists.
+
+    Returns
+    -------
+    {
+      month: int, year: int, month_label: str,
+      has_data: bool,
+      available_months: [
+        {month, year, month_label, is_fully_frozen}, ...
+      ]   # newest-first; only months that have ≥1 row in the table
+    }
+    """
+    # All distinct (year, month) pairs with any data — newest first
+    all_pairs = (
+        db.query(MonthlyAttendanceSummary.month, MonthlyAttendanceSummary.year)
+        .distinct()
+        .order_by(MonthlyAttendanceSummary.year.desc(), MonthlyAttendanceSummary.month.desc())
+        .all()
+    )
+
+    # Pairs that still have at least one non-frozen row
+    open_pairs: set[tuple[int, int]] = {
+        (row.month, row.year)
+        for row in db.query(
+            MonthlyAttendanceSummary.month, MonthlyAttendanceSummary.year
+        )
+        .filter(MonthlyAttendanceSummary.is_frozen.is_(False))
+        .distinct()
+        .all()
+    }
+
+    from datetime import date as _date
+    today = _date.today()
+
+    available_months: list[dict] = []
+    open_month: dict | None = None
+
+    for pair in all_pairs:
+        is_fully_frozen = (pair.month, pair.year) not in open_pairs
+        label = _month_label(pair.month, pair.year)
+        available_months.append({
+            "month": pair.month,
+            "year": pair.year,
+            "month_label": label,
+            "is_fully_frozen": is_fully_frozen,
+        })
+        if open_month is None and not is_fully_frozen:
+            open_month = {"month": pair.month, "year": pair.year, "month_label": label}
+
+    # Fall back to current calendar month when no data exists at all
+    if open_month is None:
+        fallback_label = _month_label(today.month, today.year)
+        open_month = {"month": today.month, "year": today.year, "month_label": fallback_label}
+
+    return {
+        "month": open_month["month"],
+        "year": open_month["year"],
+        "month_label": open_month["month_label"],
+        "has_data": len(all_pairs) > 0,
+        "available_months": available_months,
+    }
+
 
 def get_summary(db: Session, month: int, year: int) -> dict:
     """Return aggregated readiness status for HR payroll dashboard.
@@ -109,6 +217,7 @@ def get_summary(db: Session, month: int, year: int) -> dict:
         .filter(
             MonthlyAttendanceSummary.month == month,
             MonthlyAttendanceSummary.year == year,
+            MonthlyAttendanceSummary.employee_id.in_(emp_ids),
         )
         .all()
     ) if emp_ids else []
@@ -138,20 +247,46 @@ def get_summary(db: Session, month: int, year: int) -> dict:
     for eid in emp_ids:
         emp = emp_map[eid]
         r = row_map.get(eid)
+        # blocked_lop_days is a runtime check for LOP that arrived after a freeze;
+        # it drives the warning banner only and is not stored in the DB.
+        leave_data = _leave_payroll_days(db, eid, month, year)
+        blocked_lop_days = leave_data.get("blocked_lop_days", 0)
         detail.append({
             "employee_id": eid,
+            "employee_code": emp.employee_code,
             "employee_name": emp.full_name,
+            "department": emp.department.name if emp.department else None,
+            "designation": emp.designation.title if emp.designation else None,
+            "date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
             "has_summary": r is not None,
             "total_working_days": r.total_working_days if r else None,
             "present_days": r.present_days if r else None,
+            # Read lop_days, leave_days, payable_days directly from DB.
+            # get_summary() is read-only — no writes happen here.
             "leave_days": r.leave_days if r else None,
             "lop_days": r.lop_days if r else None,
+            "lop_source": r.lop_source if r else None,
+            "lop_status": (
+                "reopen_required"
+                if blocked_lop_days > 0
+                else ("ready" if r else "pending")
+            ),
+            "lop_warning": (
+                "Payroll input is frozen. Reopen payroll input to include this LOP."
+                if blocked_lop_days > 0
+                else None
+            ),
+            "lop_last_synced_at": r.lop_last_synced_at if r else None,
             "payable_days": r.payable_days if r else None,
             "approved_timesheet_hours": r.approved_timesheet_hours if r else None,
             "attendance_status": r.attendance_status if r else "missing",
             "timesheet_status": r.timesheet_status if r else "missing",
-            "validation_status": r.validation_status if r else "missing",
-            "is_ready_for_payroll": r.is_ready_for_payroll if r else False,
+            "validation_status": (
+                "failed" if blocked_lop_days > 0 else (r.validation_status if r else "missing")
+            ),
+            "is_ready_for_payroll": (
+                False if blocked_lop_days > 0 else (r.is_ready_for_payroll if r else False)
+            ),
             "is_frozen": r.is_frozen if r else False,
             "issues_count": r.issues_count if r else 0,
             "validation_notes": r.validation_notes if r else None,
@@ -185,8 +320,8 @@ def upsert_manual_summary(
     total_working_days: int,
     present_days: int,
     leave_days: int,
-    lop_days: int,
     payable_days: float,
+    lop_days: Optional[int] = None,
     approved_timesheet_hours: float = 0.0,
     timesheet_status: str = "pending",
     actor: Employee,
@@ -199,6 +334,10 @@ def upsert_manual_summary(
 
     Validation_status is reset to 'pending' on every upsert so the
     HR must re-validate after any manual edit.
+
+    lop_days — when explicitly provided, stored as a "Manual Override" and
+    protected from future Leave Management syncs. When omitted (None), LOP
+    is computed from approved unpaid leave requests as usual.
     """
     existing = (
         db.query(MonthlyAttendanceSummary)
@@ -219,9 +358,15 @@ def upsert_manual_summary(
 
     row.total_working_days = total_working_days
     row.present_days = present_days
-    row.leave_days = leave_days
-    row.lop_days = lop_days
     row.payable_days = payable_days
+    if lop_days is not None:
+        row.lop_days = max(0, lop_days)
+        row.lop_source = "Manual Override"
+        row.lop_status = "ready"
+        row.lop_last_synced_at = datetime.utcnow()
+        row.payable_days = float(max(total_working_days - row.lop_days, 0))
+    else:
+        _apply_leave_payroll_overlay(row, _leave_payroll_days(db, employee_id, month, year))
     row.approved_timesheet_hours = approved_timesheet_hours
     row.timesheet_status = timesheet_status
     # Reset validation state — any edit invalidates the previous validation
@@ -241,8 +386,9 @@ def upsert_manual_summary(
         year=year,
         details=(
             f"employee_id={employee_id} total_working_days={total_working_days} "
-            f"present={present_days} leave={leave_days} lop={lop_days} "
-            f"payable={payable_days}"
+            f"present={present_days} paid_leave={row.leave_days} "
+            f"lop_source={row.lop_source} lop={row.lop_days} "
+            f"payable={row.payable_days}"
         ),
     )
     log.info(
@@ -265,7 +411,7 @@ def validate_summary(
     Validation rules:
       V1  Missing summary — employee has no row at all
       V2  Negative days   — any of present/leave/lop/payable < 0
-      V3  Day overflow     — present_days + leave_days + lop_days > total_working_days
+      V3  Attendance overflow — present_days > total_working_days
       V4  Zero working days — total_working_days = 0
       V5  Payable > total  — payable_days > total_working_days
       V6  Timesheet pending — timesheet_status = 'pending' (warning, not blocker)
@@ -284,6 +430,7 @@ def validate_summary(
         .filter_by(month=month, year=year)
         .all()
     )
+    _refresh_leave_lop_overlays(db, month, year)
     row_map = {r.employee_id: r for r in rows}
 
     all_issues: list[dict] = []
@@ -326,13 +473,18 @@ def validate_summary(
         if (row.total_working_days or 0) == 0:
             emp_issues.append("V4: total_working_days is 0")
 
-        # V3 — day overflow
-        day_sum = (row.present_days or 0) + (row.leave_days or 0) + (row.lop_days or 0)
-        if (row.total_working_days or 0) > 0 and day_sum > row.total_working_days:
+        # V3 — attendance overflow. Leave/LOP are separate Leave Management
+        # overlays, so full-present temporary attendance data must not block
+        # approved paid leave or LOP visibility.
+        if (row.total_working_days or 0) > 0 and (row.present_days or 0) > row.total_working_days:
             emp_issues.append(
-                f"V3: present({row.present_days}) + leave({row.leave_days}) "
-                f"+ lop({row.lop_days}) = {day_sum} exceeds "
-                f"total_working_days({row.total_working_days})"
+                f"V3: present({row.present_days}) exceeds total_working_days({row.total_working_days})"
+            )
+
+        leave_total = (row.leave_days or 0) + (row.lop_days or 0)
+        if (row.total_working_days or 0) > 0 and leave_total > row.total_working_days:
+            emp_issues.append(
+                f"V7: leave({row.leave_days}) + LOP({row.lop_days}) exceeds total_working_days({row.total_working_days})"
             )
 
         # V5 — payable overflow
@@ -428,6 +580,8 @@ def freeze_attendance(
     if total == 0:
         raise ValueError("No active employees found.")
 
+    _refresh_leave_lop_overlays(db, month, year)
+
     rows = (
         db.query(MonthlyAttendanceSummary)
         .filter_by(month=month, year=year)
@@ -457,6 +611,9 @@ def freeze_attendance(
 
     db.flush()
 
+    # Create or advance a PayrollRun to attendance_frozen so Finance can generate payroll
+    _ensure_payroll_run_frozen(db, month=month, year=year, total_employees=total, actor=actor)
+
     # Notify Finance and Finance Head
     label = _month_label(month, year)
     _notify_finance(
@@ -478,7 +635,7 @@ def freeze_attendance(
     )
 
     log.info(
-        "[ATT_BRIDGE] Attendance frozen for month=%d year=%d by actor_id=%d (%d employees)",
+        "[ATT_BRIDGE] Payroll input frozen for month=%d year=%d by actor_id=%d (%d employees)",
         month, year, actor.id, total,
     )
 
@@ -489,6 +646,85 @@ def freeze_attendance(
         "frozen_count": total,
         "message": f"Attendance for {label} has been frozen. Finance has been notified.",
     }
+
+
+def _ensure_payroll_run_frozen(
+    db: Session,
+    *,
+    month: int,
+    year: int,
+    total_employees: int,
+    actor: Employee,
+) -> None:
+    """Create or advance a PayrollRun to attendance_frozen status.
+
+    After HR freezes attendance, Finance must be able to Generate Payroll.
+    The payroll state machine requires status=attendance_frozen for that.
+    This helper finds or creates the run and advances it to that status.
+    """
+    try:
+        import calendar as _cal
+        from app.models.payroll import PayrollRun
+
+        _ADVANCEABLE = {"draft", "attendance_frozen"}
+
+        # Find any non-cancelled run for this month/year
+        run = (
+            db.query(PayrollRun)
+            .filter(
+                PayrollRun.month == month,
+                PayrollRun.year == year,
+                PayrollRun.status.notin_(["cancelled"]),
+            )
+            .order_by(PayrollRun.id.desc())
+            .first()
+        )
+
+        if run is None:
+            # Create a fresh draft and immediately set to attendance_frozen
+            import datetime as _dt
+            first_day = _dt.date(year, month, 1)
+            last_day = _dt.date(year, month, _cal.monthrange(year, month)[1])
+            run = PayrollRun(
+                pay_period_start=first_day,
+                pay_period_end=last_day,
+                month_label=f"{_cal.month_name[month]} {year}",
+                month=month,
+                year=year,
+                status="attendance_frozen",
+                total_employees=total_employees,
+                attendance_locked=True,
+                payroll_locked=False,
+                initiated_by_id=actor.id,
+                initiated_at=_dt.datetime.utcnow(),
+            )
+            db.add(run)
+            db.flush()
+            log.info(
+                "[ATT_BRIDGE] Created PayrollRun id=%d for month=%d year=%d (attendance_frozen)",
+                run.id, month, year,
+            )
+        elif run.status in _ADVANCEABLE:
+            run.status = "attendance_frozen"
+            run.total_employees = total_employees
+            run.attendance_locked = True
+            db.flush()
+            log.info(
+                "[ATT_BRIDGE] Advanced PayrollRun id=%d to attendance_frozen (month=%d year=%d)",
+                run.id, month, year,
+            )
+        else:
+            # Run already past attendance_frozen — just sync total_employees
+            run.total_employees = total_employees
+            db.flush()
+            log.info(
+                "[ATT_BRIDGE] PayrollRun id=%d already at status=%s for month=%d year=%d — skipped advance",
+                run.id, run.status, month, year,
+            )
+    except Exception as exc:
+        log.warning(
+            "[ATT_BRIDGE] _ensure_payroll_run_frozen failed (non-fatal): %s", exc
+        )
 
 
 def _notify_finance(
@@ -541,116 +777,6 @@ def _notify_finance(
         log.warning("Finance notification after freeze failed (non-fatal): %s", exc)
 
 
-def seed_dummy_summary(
-    db: Session,
-    *,
-    month: int,
-    year: int,
-    actor: Employee,
-) -> dict:
-    """Seed dummy attendance summary for all active employees.
-
-    ── TEMPORARY PAYROLL BRIDGE ──
-    Creates or updates monthly_attendance_summary rows for all active employees
-    with pre-defined "all ready" values.  Does NOT create new employees, does NOT
-    change salary structures, does NOT duplicate rows.
-
-    Seed values applied per employee:
-      total_working_days       = 22
-      present_days             = 22
-      leave_days               = 0
-      lop_days                 = 0
-      payable_days             = 22.0
-      approved_timesheet_hours = 176.0
-      attendance_status        = 'validated'   (READY)
-      timesheet_status         = 'approved'    (READY)
-      validation_status        = 'passed'      (VALID)
-      issues_count             = 0
-      is_ready_for_payroll     = True
-      is_frozen                = False  (caller must explicitly freeze)
-
-    Frozen rows are skipped — freeze is irreversible via API.
-    """
-    # ── TEMPORARY PAYROLL BRIDGE ──────────────────────────────────────────────
-    active = _active_employees(db)
-    if not active:
-        raise ValueError("No active employees found. Cannot seed dummy attendance summary.")
-
-    created = 0
-    updated = 0
-    skipped_frozen = 0
-
-    for emp in active:
-        existing = (
-            db.query(MonthlyAttendanceSummary)
-            .filter_by(employee_id=emp.id, month=month, year=year)
-            .first()
-        )
-
-        if existing and existing.is_frozen:
-            # Skip — frozen rows are immutable
-            skipped_frozen += 1
-            continue
-
-        if existing:
-            row = existing
-            updated += 1
-        else:
-            row = MonthlyAttendanceSummary(employee_id=emp.id, month=month, year=year)
-            db.add(row)
-            created += 1
-
-        # Seed values
-        row.total_working_days = 22
-        row.present_days = 22
-        row.leave_days = 0
-        row.lop_days = 0
-        row.payable_days = 22.0
-        row.approved_timesheet_hours = 176.0
-        row.attendance_status = "validated"   # READY
-        row.timesheet_status = "approved"     # READY
-        row.validation_status = "passed"      # VALID
-        row.issues_count = 0
-        row.validation_notes = None
-        row.is_ready_for_payroll = True
-        row.is_frozen = False
-
-    db.flush()
-
-    label = _month_label(month, year)
-    _write_audit(
-        db,
-        user_id=actor.id,
-        role=_role_name(actor),
-        action="DUMMY_ATTENDANCE_SUMMARY_SEEDED",
-        month=month,
-        year=year,
-        details=(
-            f"created={created} updated={updated} skipped_frozen={skipped_frozen} "
-            f"total_active={len(active)}"
-        ),
-    )
-    log.info(
-        "[ATT_BRIDGE] Dummy summary seeded: month=%d year=%d by actor_id=%d "
-        "(created=%d updated=%d skipped_frozen=%d)",
-        month, year, actor.id, created, updated, skipped_frozen,
-    )
-
-    return {
-        "month": month,
-        "year": year,
-        "month_label": label,
-        "total_employees": len(active),
-        "created": created,
-        "updated": updated,
-        "skipped_frozen": skipped_frozen,
-        "message": (
-            f"Dummy attendance summary seeded for {created + updated} employee(s) "
-            f"for {label}."
-        ),
-    }
-
-
 def reset_freeze_summary(
     db: Session,
     *,
@@ -697,7 +823,7 @@ def reset_freeze_summary(
     if not rows:
         raise ValueError(
             f"No attendance summary rows found for {_month_label(month, year)}. "
-            "Run 'Create Dummy Summary' first."
+            "Create or import attendance summary rows first."
         )
 
     reset_count = 0
@@ -710,6 +836,7 @@ def reset_freeze_summary(
         row.is_ready_for_payroll = True
         row.finalized_by         = None
         row.finalized_at         = None
+        _apply_leave_payroll_overlay(row, _leave_payroll_days(db, row.employee_id, month, year))
         reset_count += 1
 
     db.flush()
@@ -763,15 +890,17 @@ def check_frozen_for_payroll(db: Session, month: int, year: int) -> tuple[bool, 
     total = len(active)
     emp_ids = [e.id for e in active]
 
-    frozen_count = (
+    rows = (
         db.query(MonthlyAttendanceSummary)
         .filter(
             MonthlyAttendanceSummary.month == month,
             MonthlyAttendanceSummary.year == year,
-            MonthlyAttendanceSummary.is_frozen.is_(True),
+            MonthlyAttendanceSummary.employee_id.in_(emp_ids),
         )
-        .count()
+        .all()
     )
+    row_map = {r.employee_id: r for r in rows}
+    frozen_count = sum(1 for r in rows if r.is_frozen)
 
     if frozen_count == 0:
         return (
@@ -786,6 +915,50 @@ def check_frozen_for_payroll(db: Session, month: int, year: int) -> tuple[bool, 
             False,
             f"Attendance not frozen for {missing} employee(s). "
             "HR must freeze all employees before payroll generation.",
+        )
+
+    # C-3: verify is_ready_for_payroll flag — HR must mark records as ready
+    not_ready_ids = [
+        eid for eid in emp_ids
+        if row_map.get(eid) and not row_map[eid].is_ready_for_payroll
+    ]
+    if not_ready_ids:
+        return (
+            False,
+            f"Payroll input not ready for {len(not_ready_ids)} employee(s) "
+            "(is_ready_for_payroll is False). "
+            "HR must complete attendance review and mark inputs as ready before payroll generation.",
+        )
+
+    # C-3: block if attendance validation has explicitly failed
+    failed_validation_ids = [
+        eid for eid in emp_ids
+        if row_map.get(eid) and row_map[eid].validation_status == "failed"
+    ]
+    if failed_validation_ids:
+        return (
+            False,
+            f"Attendance validation failed for {len(failed_validation_ids)} employee(s). "
+            "Resolve validation issues in the Attendance module before generating payroll.",
+        )
+
+    stale_lop_count = 0
+    for eid in emp_ids:
+        row = row_map.get(eid)
+        leave_days = _leave_payroll_days(db, eid, month, year)
+        if row is not None and int(row.lop_days or 0) != int(leave_days["lop_days"] or 0):
+            stale_lop_count += 1
+
+    if stale_lop_count:
+        # Stale LOP is a data-quality warning, not a generation blocker.
+        # Leave Management changes after the attendance freeze are common (e.g. late
+        # leave approvals). Payroll generation will use the frozen lop_days; Finance
+        # should review any LOP mismatch as a PayrollError warning.
+        log.warning(
+            "[check_frozen] %d employee(s) have stale LOP (frozen summary vs current "
+            "Leave Management mismatch) for month=%d year=%d — allowing generation; "
+            "Finance will see PayrollError warnings for these employees.",
+            stale_lop_count, month, year,
         )
 
     return True, ""

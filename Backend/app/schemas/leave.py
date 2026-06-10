@@ -102,6 +102,7 @@ class LeaveRequestOut(BaseModel):
     payroll_synced_at: Optional[datetime] = None
     payroll_sync_attempts: int = 0
     payroll_last_error: Optional[str] = None
+    is_lop: bool = False
     created_at: datetime
     updated_at: datetime
 

@@ -38,12 +38,21 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Employee, LeaveRequest, LeaveType, Notification, PayrollAttendanceSummary,
+    MonthlyAttendanceSummary, PayrollLopInput,
 )
 from app.services.email_dispatcher import dispatch_for_recipient
 from utils.time_utils import now_utc
 
 
 MAX_RETRY_ATTEMPTS = 5
+LOP_SOURCE = "Leave Management"
+PAYROLL_ACTIVE_LEAVE_STATUSES = (
+    "approved",
+    "cancel_pending",
+    "consumed",
+    "completed",
+    "partially_cancelled",
+)
 
 
 # ---------- helpers --------------------------------------------------
@@ -64,6 +73,93 @@ def _split_by_month(start: date, end: date) -> dict[tuple[int, str], int]:
         out[(cur.year, _month_label(cur))] += 1
         cur += timedelta(days=1)
     return out
+
+
+def _split_by_month_number(start: date, end: date) -> dict[tuple[int, int], int]:
+    """Return {(year, month_number): day_count} for the inclusive range."""
+    out: dict[tuple[int, int], int] = defaultdict(int)
+    cur = start
+    while cur <= end:
+        out[(cur.year, cur.month)] += 1
+        cur += timedelta(days=1)
+    return out
+
+
+def _split_request_days_by_month(req: LeaveRequest) -> dict[tuple[int, int], int]:
+    """Split a leave request's approved day count across calendar months."""
+    calendar_splits = _split_by_month_number(req.start_date, req.end_date)
+    if not calendar_splits:
+        return {}
+
+    days = int(req.consumed_days or 0) if req.status == "partially_cancelled" else int(req.total_days or 0)
+    if days <= 0:
+        days = sum(calendar_splits.values())
+    if len(calendar_splits) == 1:
+        key = next(iter(calendar_splits))
+        return {key: days}
+
+    total_calendar_days = sum(calendar_splits.values())
+    weighted: list[tuple[tuple[int, int], int, float]] = []
+    assigned = 0
+    for key, calendar_days in calendar_splits.items():
+        raw = days * (calendar_days / total_calendar_days)
+        whole = int(raw)
+        weighted.append((key, whole, raw - whole))
+        assigned += whole
+
+    remainder = max(0, days - assigned)
+    weighted.sort(key=lambda item: item[2], reverse=True)
+    out = {key: whole for key, whole, _ in weighted}
+    for idx in range(remainder):
+        key = weighted[idx % len(weighted)][0]
+        out[key] += 1
+    return {key: value for key, value in out.items() if value > 0}
+
+
+def aggregate_leave_days_for_payroll_month(
+    db: Session,
+    employee_id: int,
+    month: int,
+    year: int,
+) -> dict[str, int]:
+    """Approved Leave Management days for payroll display/calculation."""
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+    paid_leave_days = 0
+    lop_days = 0
+    blocked_lop_days = 0
+
+    rows = (
+        db.query(LeaveRequest)
+        .join(LeaveType, LeaveRequest.leave_type_id == LeaveType.id)
+        .filter(
+            LeaveRequest.employee_id == employee_id,
+            LeaveRequest.status.in_(PAYROLL_ACTIVE_LEAVE_STATUSES),
+            LeaveRequest.approved_at.is_not(None),
+            LeaveRequest.start_date <= month_end,
+            LeaveRequest.end_date >= month_start,
+        )
+        .all()
+    )
+    for req in rows:
+        days = _split_request_days_by_month(req).get((year, month), 0)
+        if days <= 0:
+            continue
+        leave_type = req.leave_type or (db.get(LeaveType, req.leave_type_id) if req.leave_type_id else None)
+        is_unpaid = bool(getattr(req, "is_lop", False)) or (leave_type is not None and not bool(leave_type.is_paid))
+        if is_unpaid:
+            lop_days += days
+            err = (req.payroll_last_error or "").lower()
+            if (req.payroll_sync_status or "").lower() == "failed" and "frozen" in err:
+                blocked_lop_days += days
+        else:
+            paid_leave_days += days
+
+    return {
+        "paid_leave_days": paid_leave_days,
+        "lop_days": lop_days,
+        "blocked_lop_days": blocked_lop_days,
+    }
 
 
 def _next_summary_id(db: Session) -> str:
@@ -117,6 +213,109 @@ def _get_or_create_summary(db: Session, employee_id: int, year: int,
     return row
 
 
+def _get_or_create_monthly_summary(
+    db: Session,
+    employee_id: int,
+    year: int,
+    month: int,
+) -> MonthlyAttendanceSummary:
+    row = (
+        db.query(MonthlyAttendanceSummary)
+        .filter_by(employee_id=employee_id, month=month, year=year)
+        .first()
+    )
+    if row:
+        return row
+
+    row = MonthlyAttendanceSummary(
+        employee_id=employee_id,
+        month=month,
+        year=year,
+        lop_source=LOP_SOURCE,
+        lop_status="ready",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _frozen_month_error(db: Session, req: LeaveRequest, splits: dict[tuple[int, int], int]) -> Optional[str]:
+    for (year, month), _ in splits.items():
+        row = (
+            db.query(MonthlyAttendanceSummary)
+            .filter_by(employee_id=req.employee_id, month=month, year=year)
+            .first()
+        )
+        if row and row.is_frozen:
+            return "Payroll input is frozen. Reopen payroll input to include this LOP."
+    return None
+
+
+def _refresh_monthly_lop_overlay(
+    db: Session,
+    employee_id: int,
+    year: int,
+    month: int,
+    *,
+    create: bool = True,
+) -> None:
+    leave_days = aggregate_leave_days_for_payroll_month(db, employee_id, month, year)
+    total = leave_days["lop_days"]
+
+    row = (
+        db.query(MonthlyAttendanceSummary)
+        .filter_by(employee_id=employee_id, month=month, year=year)
+        .first()
+    )
+    if not row and (create or total > 0):
+        row = _get_or_create_monthly_summary(db, employee_id, year, month)
+    if not row:
+        return
+    if row.is_frozen:
+        raise ValueError(
+            f"Payroll input for {calendar.month_name[month]} {year} is frozen."
+        )
+
+    lop_days = int(total)
+    row.leave_days = int(leave_days["paid_leave_days"])
+    row.lop_days = lop_days
+    row.lop_source = LOP_SOURCE
+    row.lop_status = "ready"
+    row.lop_last_synced_at = _utcnow()
+    if row.total_working_days and row.total_working_days > 0:
+        row.payable_days = float(max(int(row.total_working_days) - lop_days, 0))
+
+
+def _upsert_leave_lop_inputs(
+    db: Session,
+    req: LeaveRequest,
+    splits: dict[tuple[int, int], int],
+) -> None:
+    for (year, month), days in splits.items():
+        row = (
+            db.query(PayrollLopInput)
+            .filter_by(
+                leave_request_id=req.id,
+                employee_id=req.employee_id,
+                month=month,
+                year=year,
+            )
+            .first()
+        )
+        if not row:
+            row = PayrollLopInput(
+                leave_request_id=req.id,
+                employee_id=req.employee_id,
+                month=month,
+                year=year,
+            )
+            db.add(row)
+        row.lop_days = float(days)
+        row.source = LOP_SOURCE
+        row.status = "ready"
+        _refresh_monthly_lop_overlay(db, req.employee_id, year, month)
+
+
 def _notify_admins(db: Session, type_: str, title: str, body: str,
                    leave_request_id: Optional[str]) -> None:
     # Local import to dodge circular: leave_engine also imports this module.
@@ -157,6 +356,7 @@ def sync_leave_to_payroll(db: Session, req: LeaveRequest) -> tuple[bool, Optiona
 
     is_unpaid = not bool(lt.is_paid)
     splits = _split_by_month(req.start_date, req.end_date)
+    lop_splits = _split_by_month_number(req.start_date, req.end_date)
 
     # First pass — detect any finalized month so the whole write is atomic
     # (we don't want to partially write the unfinalized months and then
@@ -180,12 +380,26 @@ def sync_leave_to_payroll(db: Session, req: LeaveRequest) -> tuple[bool, Optiona
             req.payroll_last_error = msg
             return False, msg
 
+    if is_unpaid:
+        msg = _frozen_month_error(db, req, lop_splits)
+        if msg:
+            req.payroll_sync_status = "failed"
+            req.payroll_last_error = msg
+            return False, msg
+
     # Second pass — apply the increments.
     for (year, month_label), days in splits.items():
         row = _get_or_create_summary(db, req.employee_id, year, month_label)
         row.leave_days = int(row.leave_days or 0) + days
-        if is_unpaid:
-            row.lop_days = int(row.lop_days or 0) + days
+
+    if is_unpaid:
+        try:
+            _upsert_leave_lop_inputs(db, req, lop_splits)
+        except ValueError as exc:
+            msg = str(exc)
+            req.payroll_sync_status = "failed"
+            req.payroll_last_error = msg
+            return False, msg
 
     req.payroll_sync_status = "synced"
     req.payroll_synced_at = _utcnow()
@@ -199,6 +413,13 @@ def reverse_leave_from_payroll(db: Session, req: LeaveRequest, days: int,
     """Subtract a previously-synced leave (used when WoL validation reverses
     a consumed leave). No-op if no summary rows exist for the months."""
     splits = _split_by_month(start, end)
+    lop_splits = _split_by_month_number(start, end)
+    if is_unpaid:
+        msg = _frozen_month_error(db, req, lop_splits)
+        if msg:
+            req.payroll_last_error = msg
+            return False, msg
+
     for (year, month_label), d in splits.items():
         row = (
             db.query(PayrollAttendanceSummary)
@@ -218,8 +439,19 @@ def reverse_leave_from_payroll(db: Session, req: LeaveRequest, days: int,
             req.payroll_last_error = msg
             return False, msg
         row.leave_days = max(0, int(row.leave_days or 0) - d)
-        if is_unpaid:
-            row.lop_days = max(0, int(row.lop_days or 0) - d)
+    if is_unpaid:
+        for (year, month), _ in lop_splits.items():
+            (
+                db.query(PayrollLopInput)
+                .filter_by(
+                    leave_request_id=req.id,
+                    employee_id=req.employee_id,
+                    month=month,
+                    year=year,
+                )
+                .delete(synchronize_session=False)
+            )
+            _refresh_monthly_lop_overlay(db, req.employee_id, year, month, create=False)
     req.payroll_last_error = None
     return True, None
 
@@ -253,7 +485,11 @@ def retry_pending_syncs(db: Session) -> dict:
         if int(req.payroll_sync_attempts or 0) >= MAX_RETRY_ATTEMPTS and req.payroll_sync_status == "failed":
             summary["skipped_max_attempts"] += 1
             continue
-        ok, err = sync_leave_to_payroll(db, req)
+        lt = db.get(LeaveType, req.leave_type_id) if req.leave_type_id else None
+        if req.status == "approved" and lt and not bool(lt.is_paid):
+            ok, err = sync_lop_to_payroll(db, req)
+        else:
+            ok, err = sync_leave_to_payroll(db, req)
         if ok:
             summary["synced"] += 1
         else:
@@ -272,3 +508,40 @@ def retry_pending_syncs(db: Session) -> dict:
                 )
     db.commit()
     return summary
+
+
+def sync_lop_to_payroll(db: Session, req: LeaveRequest) -> tuple[bool, Optional[str]]:
+    """Sync an HR-approved LOP leave to monthly payroll inputs immediately.
+
+    Called right after HR approval (not waiting for scheduler consumption).
+    Upserts idempotent Leave Management LOP rows and overlays the aggregate
+    into monthly_attendance_summary.lop_days for each month spanned.
+    Returns (success, error_message).
+    """
+    req.payroll_sync_attempts = int(req.payroll_sync_attempts or 0) + 1
+
+    lt = db.get(LeaveType, req.leave_type_id) if req.leave_type_id else None
+    is_lop_type = lt and not bool(lt.is_paid)
+    if not is_lop_type:
+        msg = f"sync_lop_to_payroll called for non-LOP type '{req.leave_type_id}'."
+        return False, msg
+
+    splits = _split_by_month_number(req.start_date, req.end_date)
+    msg = _frozen_month_error(db, req, splits)
+    if msg:
+        req.payroll_sync_status = "failed"
+        req.payroll_last_error = msg
+        return False, msg
+
+    try:
+        _upsert_leave_lop_inputs(db, req, splits)
+    except ValueError as exc:
+        msg = str(exc)
+        req.payroll_sync_status = "failed"
+        req.payroll_last_error = msg
+        return False, msg
+
+    req.payroll_sync_status = "synced"
+    req.payroll_synced_at = _utcnow()
+    req.payroll_last_error = None
+    return True, None

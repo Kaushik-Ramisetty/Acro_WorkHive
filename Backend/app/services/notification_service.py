@@ -35,6 +35,15 @@ _TYPE_ROUTE_HINTS: dict[str, str] = {
     "leave_pending_your_approval":         "approvals",
     "leave_cancel_pending_your_approval":  "approvals",
     "leave_escalated":                     "approvals",
+    # LOP workflow notifications
+    "lop_requested":                        "leave",
+    "lop_manager_approved":                 "leave",
+    "lop_rejected":                         "leave",
+    "lop_approved":                         "leave",
+    "lop_payroll_processed":                "leave",
+    "lop_pending_manager_approval":         "approvals",
+    "lop_pending_hr_approval":              "approvals",
+    "lop_approved_hr_info":                 "approvals",
     # Attendance
     "attendance_anomaly":                  "attendance",
     "attendance_missed_checkout":          "attendance",
@@ -64,6 +73,33 @@ _TYPE_ROUTE_HINTS: dict[str, str] = {
     "sla_escalation":                      "approvals",
     "hr_escalation":                       "approvals",
     "compliance_alert":                    "reports",
+    # PMS — Phase 1: Goal-setting workflow
+    "pms_goals_assigned":                  "performance",
+    "pms_goals_discussed":                 "performance",
+    "pms_goals_approved":                  "performance",
+    "pms_goals_locked":                    "performance",
+    # PMS — Phase 2: Mid-Cycle Review workflow
+    "pms_mid_cycle_created":               "performance",
+    "pms_progress_submitted":              "performance",
+    "pms_manager_reviewed_progress":       "performance",
+    "pms_mid_cycle_manager_approved":      "performance",
+    "pms_mid_cycle_hr_reviewed":           "performance",
+    "pms_mid_cycle_locked":                "performance",
+    # PMS — Phase 3: End Cycle Assessment workflow
+    "pms_assessment_opened":               "performance",
+    "pms_self_assessed":                   "performance",
+    "pms_manager_assessed":                "performance",
+    "pms_assessment_submitted_to_hr":      "performance",
+    "pms_assessment_hr_received":          "performance",
+    "pms_assessment_locked":               "performance",
+    # PMS — Phase 4: Normalization workflow
+    "pms_rating_frozen":                   "performance",
+    "pms_hike_generated":                  "performance",
+    "pms_hike_approved":                   "performance",
+    # PMS — Phase 5: Compensation workflow
+    "pms_revision_letter_ready":           "performance",
+    "pms_revision_acknowledged":           "performance",
+    "pms_cycle_archived":                  "performance",
 }
 
 # Reference-table → route fragment (used as a fallback when type is
@@ -78,6 +114,12 @@ _REF_ROUTE_HINTS: dict[str, str] = {
     "payroll_runs":            "payroll",
     "announcements":           "announcements",
     "policies":                "policies",
+    "pms_goal_assignments":          "performance",
+    "pms_mid_cycle_reviews":         "performance",
+    "pms_end_cycle_assessments":     "performance",
+    "pms_normalization_sessions":    "performance",
+    "pms_compensation_revisions":    "performance",
+    "pms_cycles":                    "performance",
 }
 
 
@@ -125,9 +167,10 @@ def notify(
     leave_request_id: Optional[str] = None,
     action_url: Optional[str] = None,
     meta_json: Optional[str] = None,
+    send_email: bool = False,
     autocommit: bool = False,
 ) -> Optional[Notification]:
-    """Insert one in-app notification. Returns the row (or None on failure)."""
+    """Insert one in-app notification. Optionally dispatch an email as best-effort."""
     if not recipient_id:
         return None
     try:
@@ -150,6 +193,12 @@ def notify(
         if autocommit:
             db.commit()
             db.refresh(n)
+        if send_email:
+            try:
+                from app.services.email_dispatcher import dispatch_for_recipient
+                dispatch_for_recipient(db, recipient_id, n.title, n.body)
+            except Exception:
+                pass
         return n
     except Exception:
         try:
@@ -170,6 +219,7 @@ def notify_many(
     reference_id: Optional[str] = None,
     action_url: Optional[str] = None,
     meta_json: Optional[str] = None,
+    send_email: bool = False,
     autocommit: bool = False,
 ) -> int:
     """Bulk-notify multiple recipients. Returns number of rows written."""
@@ -185,6 +235,7 @@ def notify_many(
             reference_id=reference_id,
             action_url=action_url,
             meta_json=meta_json,
+            send_email=send_email,
             autocommit=False,
         ):
             n += 1

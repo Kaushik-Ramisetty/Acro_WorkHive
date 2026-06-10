@@ -176,10 +176,11 @@ const FINANCE_HEAD_ITEMS = [
 const Sidebar = ({ onLogout }) => {
   const { currentPage, navigate } = useApp();
   const { open, setOpen } = useSidebar();
-  const { role } = useAuth();
+  const { role, user } = useAuth();
 
   const r = (role || "").toLowerCase();
   const extraItems = r === "finance" ? FINANCE_ITEMS : r === "finance_head" ? FINANCE_HEAD_ITEMS : [];
+
   const allItems = [...navItems, ...extraItems];
 
   // Close mobile sidebar after navigating

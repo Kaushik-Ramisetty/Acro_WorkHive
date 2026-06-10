@@ -76,8 +76,11 @@ from app.models.onboarding import (
 
 # Finance / Payroll domain
 from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
+from app.models.payroll_lop_input import PayrollLopInput
 from app.models.salary_revision import SalaryRevisionLog
 from app.models.salary_hike_request import SalaryHikeRequest
+from app.models.bonus_request import BonusRequest
+from app.models.off_cycle_payment import OffCyclePayment, OffCycleAuditLog
 from app.models.payroll import (
     SalaryStructure,
     PayrollRun,
@@ -107,6 +110,33 @@ from app.models.payroll_extended import (
 )
 
 
+# PMS (Performance Management System)
+from app.models.pms_settings import PMSPhaseSettings
+from app.models.pms import (
+    GoalTemplate,
+    TemplateKRA,
+    TemplateKPI,
+    TemplateCompetency,
+    GoalAssignment,
+    AssignedKRA,
+    AssignedKPI,
+    AssignedCompetency,
+    GoalComment,
+    MidCycleReview,
+    KPIProgress,
+    ReviewEvidence,
+    # Phase 3
+    EndCycleAssessment,
+    GoalRating,
+    CompetencyRating,
+    # Phase 4
+    NormalizationSession,
+    NormalizationRecord,
+    # Phase 5
+    CompensationRevision,
+    PMSCycle,
+)
+
 __all__ = [
     "Role", "Department", "Designation", "Employee",
     "LeaveType", "LeaveBalance", "LeaveRequest",
@@ -134,8 +164,9 @@ __all__ = [
     "OnboardedEmployeeStatus", "OnboardedEmployee",
     "UserRole", "User",
     # Payroll
-    "MonthlyAttendanceSummary",
-    "SalaryRevisionLog", "SalaryHikeRequest",
+    "MonthlyAttendanceSummary", "PayrollLopInput",
+    "SalaryRevisionLog", "SalaryHikeRequest", "BonusRequest",
+    "OffCyclePayment", "OffCycleAuditLog",
     "SalaryStructure", "PayrollRun", "PayrollRunEmployee",
     "PayrollApproval", "PayrollError", "PayrollLockHistory",
     "StatutorySettings", "PayrollAdjustment", "EmployeeTaxDeclaration",
@@ -144,4 +175,14 @@ __all__ = [
     "StatutoryDeduction", "EmployeeSalaryAssignment", "Reimbursement",
     "PayslipDownloadAudit", "TdsAnnualSummary", "TdsMonthlyBreakup",
     "PayrollVarianceLog", "DeclarationAuditLog",
+    # PMS Phase 1 + 2
+    "GoalTemplate", "TemplateKRA", "TemplateKPI", "TemplateCompetency",
+    "GoalAssignment", "AssignedKRA", "AssignedKPI", "AssignedCompetency",
+    "GoalComment", "MidCycleReview", "KPIProgress", "ReviewEvidence",
+    # PMS Phase 3
+    "EndCycleAssessment", "GoalRating", "CompetencyRating",
+    # PMS Phase 4
+    "NormalizationSession", "NormalizationRecord",
+    # PMS Phase 5
+    "CompensationRevision", "PMSCycle",
 ]

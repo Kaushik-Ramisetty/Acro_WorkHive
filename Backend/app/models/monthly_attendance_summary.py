@@ -7,7 +7,8 @@
 ║  rows manually via the /payroll/attendance-summary/manual endpoint.       ║
 ║                                                                           ║
 ║  Integration contract (future):                                           ║
-║    Attendance module → writes present_days, lop_days, leave_days         ║
+║    Attendance module → writes present_days, leave_days                   ║
+║    Leave Management → writes payroll LOP days                            ║
 ║    Timesheet module  → writes approved_timesheet_hours, timesheet_status  ║
 ║    Payroll module    → reads this table; NEVER writes attendance data      ║
 ║                        except is_frozen / finalized_by / finalized_at     ║
@@ -51,6 +52,9 @@ class MonthlyAttendanceSummary(Base):
     leave_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lop_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     payable_days: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    lop_source: Mapped[str] = mapped_column(String(50), default="Leave Management", nullable=False)
+    lop_status: Mapped[str] = mapped_column(String(20), default="ready", nullable=False)
+    lop_last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # ── Timesheet fields (source: Timesheet module, or manual bridge) ─────────
     approved_timesheet_hours: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)

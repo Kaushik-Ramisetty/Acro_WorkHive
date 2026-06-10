@@ -78,6 +78,9 @@ export default function ApplyLeaveDialog({ open, onClose, onSubmitted }) {
   const [error, setError] = useState('');
   // Optional supporting document; attached after the draft is created.
   const [file, setFile] = useState(null);
+  // LOP insufficient-balance flow
+  const [lopDialog, setLopDialog] = useState(null); // null | { available, requested }
+  const [lopBusy, setLopBusy] = useState(false);
 
   const visibleTypes = useMemo(
     () => (types || []).filter((t) => isLeaveTypeAllowed(t, user?.gender)),
@@ -90,7 +93,7 @@ export default function ApplyLeaveDialog({ open, onClose, onSubmitted }) {
     let cancelled = false;
     setForm({ leave_type_id: "", start_date: todayIso(), days: "", end_date: "", reason: "" });
     setFile(null);
-    setError(""); setSubmitted(false);
+    setError(""); setSubmitted(false); setLopDialog(null); setLopBusy(false);
     Promise.all([leaveApi.types(), leaveApi.myBalance()])
       .then(([t, b]) => { if (!cancelled) { setTypes(t || []); setBalances(b || []); } })
       .catch(() => {});
@@ -124,7 +127,23 @@ export default function ApplyLeaveDialog({ open, onClose, onSubmitted }) {
       onSubmitted?.();
       setTimeout(() => { onClose?.(); setSubmitted(false); }, 1600);
     } catch (ex) {
-      setError(ex?.data?.detail || ex?.message || 'Failed to apply.');
+      const detail = ex?.data?.detail || ex?.message || 'Failed to apply.';
+      // Detect insufficient balance for a paid leave → offer LOP conversion.
+      const isInsufficient = /insufficient balance/i.test(detail);
+      const selectedType = visibleTypes.find((t) => t.id === form.leave_type_id);
+      const isPaidType = selectedType ? selectedType.is_paid !== false : true;
+      if (isInsufficient && isPaidType) {
+        // Parse "available X, requested Y" from backend error message.
+        const availMatch = detail.match(/available\s+(\d+)/i);
+        const reqMatch = detail.match(/requested\s+(\d+)/i);
+        setLopDialog({
+          available: availMatch ? parseInt(availMatch[1], 10) : 0,
+          requested: reqMatch ? parseInt(reqMatch[1], 10) : (form.days || 0),
+        });
+        setError('');
+      } else {
+        setError(detail);
+      }
     } finally { setBusy(false); }
   };
 
@@ -152,6 +171,26 @@ export default function ApplyLeaveDialog({ open, onClose, onSubmitted }) {
     } catch (ex) {
       setError(ex?.data?.detail || ex?.message || 'Failed to save draft.');
     } finally { setBusy(false); }
+  };
+
+  const handleApplyAsLop = async () => {
+    if (!lopDialog) return;
+    setLopBusy(true);
+    try {
+      await leaveApi.applyLop({
+        start_date: form.start_date,
+        end_date: form.end_date,
+        reason: form.reason || 'Balance exhausted — LOP conversion',
+        original_leave_type_id: form.leave_type_id,
+      });
+      setLopDialog(null);
+      setSubmitted(true);
+      onSubmitted?.();
+      setTimeout(() => { onClose?.(); setSubmitted(false); }, 1600);
+    } catch (ex) {
+      setError(ex?.data?.detail || ex?.message || 'Failed to apply LOP leave.');
+      setLopDialog(null);
+    } finally { setLopBusy(false); }
   };
 
   return (
@@ -257,7 +296,38 @@ export default function ApplyLeaveDialog({ open, onClose, onSubmitted }) {
               </div>
             )}
 
-            {error && <p className="rounded-md bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">{error}</p>}
+            {lopDialog && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 space-y-3">
+                <div className="flex items-start gap-3">
+                  <div className="flex-shrink-0 w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center mt-0.5">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm font-semibold text-amber-900">All available leave balance has been exhausted.</p>
+                    <div className="mt-2 flex gap-6 text-xs text-amber-800">
+                      <span>Available Balance: <strong>{lopDialog.available} day{lopDialog.available !== 1 ? 's' : ''}</strong></span>
+                      <span>Requested Days: <strong>{lopDialog.requested} day{lopDialog.requested !== 1 ? 's' : ''}</strong></span>
+                    </div>
+                    <p className="mt-2 text-xs text-amber-700">You can apply this as a <strong>Loss-of-Pay (LOP)</strong> leave. LOP leaves require manager and HR approval, and the days will be deducted from your salary.</p>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setLopDialog(null)} disabled={lopBusy}
+                    className="flex-1 py-2 rounded-lg border border-amber-300 text-xs font-semibold text-amber-800 hover:bg-amber-100 transition-colors disabled:opacity-60">
+                    Cancel
+                  </button>
+                  <button type="button" onClick={handleApplyAsLop} disabled={lopBusy}
+                    className="flex-1 py-2 rounded-lg text-xs font-semibold text-white transition-colors disabled:opacity-60"
+                    style={{ background: '#d97706' }}>
+                    {lopBusy ? 'Submitting…' : 'Apply as LOP Leave'}
+                  </button>
+                </div>
+              </div>
+            )}
+            {error && !lopDialog && <p className="rounded-md bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">{error}</p>}
 
             <div className="flex gap-3 pt-1">
               <button type="button" onClick={onClose} disabled={busy}

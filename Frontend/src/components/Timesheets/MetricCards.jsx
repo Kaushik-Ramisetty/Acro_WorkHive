@@ -1,9 +1,12 @@
+import { computeWeeklyHours, ATTENDANCE_STATUS } from '../../utils/weekHelpers';
+
 export default function MetricCards({ attendanceMap, entries }) {
+  // computeWeeklyHours applies the canonical priority: FINALIZED attendance →
+  // PENDING_CHECKOUT (=0) → fallback to entry.logged_hours.  This keeps the
+  // metric card consistent with HoursCell and the SubmitModal total.
+  const total    = computeWeeklyHours(entries, attendanceMap);
   const days     = Object.values(attendanceMap || {});
-  const total    = days
-    .filter((a) => a.attendance_status === 'FINALIZED')
-    .reduce((s, a) => s + (a.effective_hours || 0), 0);
-  const pending  = days.filter((a) => a.attendance_status === 'PENDING_CHECKOUT').length;
+  const pending  = days.filter((a) => a.attendance_status === ATTENDANCE_STATUS.PENDING_CHECKOUT).length;
   const count    = entries.length;
 
   return (

@@ -6,7 +6,7 @@
  *     - under_review  → "Send To Finance Head" (approve) | Recompute | Reject
  *     - approved      → Generate Payslips
  *     - payslip_generated → Publish to ESS
- *     - published     → Close Run
+ *     - completed     → Finalized
  *
  *   Finance Head / Admin:
  *     - pending_head_approval → Final Approve | Return To Finance (head_reject)
@@ -63,9 +63,10 @@ function AuditEntry({ entry }) {
   );
 }
 
-function ConfirmModal({ title, message, variant, onConfirm, onClose }) {
+function ConfirmModal({ title, message, variant, actionLabel = 'Confirm', requireRemarks = false, onConfirm, onClose }) {
   const [remarks, setRemarks] = useState('');
   const [busy, setBusy] = useState(false);
+  const remarksMissing = requireRemarks && !remarks.trim();
   const btnCls = variant === 'danger'
     ? 'bg-rose-500 hover:bg-rose-600'
     : variant === 'success'
@@ -77,22 +78,154 @@ function ConfirmModal({ title, message, variant, onConfirm, onClose }) {
         <h2 className="text-base font-bold text-slate-800">{title}</h2>
         <p className="text-sm text-slate-500">{message}</p>
         <div>
-          <label className="block text-xs font-medium text-slate-600 mb-1">Remarks</label>
+          <label className="block text-xs font-medium text-slate-600 mb-1">
+            Remarks{requireRemarks ? ' *' : ''}
+          </label>
           <textarea
             rows={3}
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400 resize-none"
             value={remarks}
             onChange={(e) => setRemarks(e.target.value)}
           />
+          {remarksMissing && <p className="mt-1 text-xs text-rose-500">A reason is required.</p>}
         </div>
         <div className="flex gap-3 justify-end">
           <button onClick={onClose} className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50">Cancel</button>
           <button
-            disabled={busy}
-            onClick={async () => { setBusy(true); await onConfirm(remarks); setBusy(false); }}
+            disabled={busy || remarksMissing}
+            onClick={async () => { setBusy(true); await onConfirm(remarks.trim()); setBusy(false); }}
             className={`rounded-lg px-4 py-2 text-sm font-semibold text-white transition disabled:opacity-50 ${btnCls}`}
           >
-            {busy ? '…' : 'Confirm'}
+            {busy ? '...' : actionLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PayrollBreakdownModal({ employee, run, onClose }) {
+  if (!employee) return null;
+
+  const money = (value) =>
+    value != null
+      ? `₹${Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+      : '—';
+  const days = (value) => (value != null ? Number(value).toFixed(1) : '—');
+  const hasValue = (value) => Number(value || 0) !== 0;
+  const otherEarnings = [
+    ['Bonus', employee.bonus ?? employee.bonus_total],
+    ['Variable Pay', employee.variable_pay ?? employee.variable_pay_total],
+    ['Overtime', employee.overtime_amount],
+    ['Arrears', employee.arrears_total],
+  ].filter(([, value]) => hasValue(value));
+
+  function Section({ title, children }) {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-slate-50/40 p-4">
+        <p className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">{title}</p>
+        <div className="space-y-2">{children}</div>
+      </div>
+    );
+  }
+
+  function Row({ label, value, mono, strong, accent }) {
+    const valueCls = [
+      'text-xs text-right',
+      mono ? 'font-mono' : 'font-medium',
+      strong ? 'font-bold' : '',
+      accent === 'green' ? 'text-emerald-700'
+        : accent === 'red' ? 'text-rose-600'
+        : 'text-slate-700',
+    ].filter(Boolean).join(' ');
+    return (
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs text-slate-500">{label}</span>
+        <span className={valueCls}>{value ?? '—'}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[92vh] w-full max-w-3xl flex-col rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-4">
+          <div>
+            <h2 className="text-base font-bold text-slate-800">Payroll Breakdown</h2>
+            <p className="mt-0.5 text-xs text-slate-400">
+              {employee.employee_code || '—'} · {employee.employee_name || '—'}
+              {run?.month_label ? ` · ${run.month_label}` : ''}
+            </p>
+          </div>
+          <button onClick={onClose} className="text-xl leading-none text-slate-400 hover:text-slate-600">×</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <Section title="Employee Information">
+              <Row label="Employee Code" value={employee.employee_code} />
+              <Row label="Employee Name" value={employee.employee_name} />
+              <Row label="Department" value={employee.department} />
+              <Row label="Designation" value={employee.designation} />
+            </Section>
+
+            <Section title="CTC Information">
+              <Row label="Annual CTC" value={money(employee.annual_ctc)} mono strong />
+              <Row label="Monthly Gross" value={money(employee.gross_salary ?? employee.gross_earnings)} mono />
+            </Section>
+
+            <Section title="Earnings Breakdown">
+              <Row label="Basic" value={money(employee.basic_pay ?? employee.basic)} mono />
+              <Row label="HRA" value={money(employee.hra)} mono />
+              <Row label="LTA" value={money(employee.lta)} mono />
+              <Row label="Conveyance" value={money(employee.conveyance)} mono />
+              <Row label="Special Allowance" value={money(employee.special_allowance ?? employee.allowances)} mono />
+              {otherEarnings.length > 0 && (
+                <div className="mt-2 space-y-2 border-t border-slate-200 pt-2">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Other Earnings</p>
+                  {otherEarnings.map(([label, value]) => (
+                    <Row key={label} label={label} value={money(value)} mono accent="green" />
+                  ))}
+                </div>
+              )}
+            </Section>
+
+            <Section title="Attendance Breakdown">
+              <Row label="Working Days" value={days(employee.total_working_days ?? employee.working_days)} />
+              <Row label="Present Days" value={days(employee.present_days)} />
+              <Row label="Leave Days" value={days(employee.leave_days)} />
+              <Row label="LOP Days" value={days(employee.lop_days)} />
+              <Row label="Payable Days" value={days(employee.payable_days)} strong />
+            </Section>
+
+            <Section title="Deductions">
+              <Row label="Employee PF" value={money(employee.employee_pf ?? employee.pf_employee)} mono accent="red" />
+              <Row label="Employee ESI" value={money(employee.employee_esi ?? employee.esi_employee)} mono accent="red" />
+              <Row label="Professional Tax" value={money(employee.professional_tax)} mono accent="red" />
+              <Row label="TDS" value={money(employee.tds)} mono accent="red" />
+              <Row label="LOP Deduction" value={money(employee.lop_deduction)} mono accent="red" />
+              <Row label="Other Deductions" value={money(employee.other_deductions)} mono accent="red" />
+            </Section>
+
+            <Section title="Employer Contributions">
+              <Row label="Employer PF" value={money(employee.employer_pf ?? employee.pf_employer)} mono />
+              <Row label="Employer ESI" value={money(employee.employer_esi ?? employee.esi_employer)} mono />
+            </Section>
+          </div>
+
+          <div className="mt-3 rounded-xl border-2 border-emerald-200 bg-emerald-50/60 p-4">
+            <p className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">Final Payroll Summary</p>
+            <div className="grid gap-3 md:grid-cols-3">
+              <Row label="Gross Earnings" value={money(employee.gross_earnings ?? employee.gross_salary)} mono strong />
+              <Row label="Total Deductions" value={money(employee.total_deductions)} mono strong accent="red" />
+              <Row label="Net Pay" value={money(employee.net_pay ?? employee.net_salary)} mono strong accent="green" />
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-end border-t border-slate-100 px-6 py-3">
+          <button onClick={onClose} className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50">
+            Close
           </button>
         </div>
       </div>
@@ -107,9 +240,11 @@ export default function FinalApproval() {
   const [selectedId, setSelectedId] = useState(null);
   const [run, setRun] = useState(null);
   const [approvals, setApprovals] = useState([]);
+  const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [modal, setModal] = useState(null);
+  const [selectedEmployee, setSelectedEmployee] = useState(null);
   const [toast, setToast] = useState('');
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
@@ -128,17 +263,51 @@ export default function FinalApproval() {
 
   const loadDetails = (id) => {
     if (!id) return;
+    setSelectedEmployee(null);
     setLoadingDetails(true);
-    Promise.all([financeApi.getRun(id), financeApi.getRunApprovals(id)])
-      .then(([r, a]) => { setRun(r); setApprovals(a); })
+    Promise.all([
+      financeApi.getRun(id),
+      financeApi.getRunApprovals(id),
+      financeApi.getRunEmployees(id),
+    ])
+      .then(([r, a, e]) => { setRun(r); setApprovals(a); setEmployees(e || []); })
       .finally(() => setLoadingDetails(false));
   };
 
   useEffect(() => { loadDetails(selectedId); }, [selectedId]);
 
+  const openErrors = Number(
+    run?.open_errors ?? run?.open_error_count ?? employees.filter((emp) => emp.has_error).length ?? 0
+  );
+  const financeReviewed = Boolean(
+    run?.finance_reviewed
+    ?? ['approved', 'payslip_generated', 'published', 'completed', 'closed', 'disbursed'].includes(run?.status)
+  );
+  const canFinalApprove = Boolean(
+    run?.status === 'pending_head_approval' && financeReviewed && openErrors === 0
+  );
+  const finalApprovalBlockReason = !run
+    ? ''
+    : run.status !== 'pending_head_approval'
+    ? 'Run must be Pending Finance Head Approval.'
+    : !financeReviewed
+    ? 'Finance review must be completed before final approval.'
+    : openErrors > 0
+    ? `Resolve ${openErrors} open payroll error(s) before final approval.`
+    : '';
+
   const doAction = async (action, remarks) => {
     try {
-      await financeApi.runAction(run.id, action, remarks);
+      const cleanRemarks = (remarks || '').trim();
+      if (action === 'head_reject' && !cleanRemarks) {
+        showToast('A reason is required to return payroll to Finance');
+        return;
+      }
+      if ((action === 'head_approve' || action === 'finance_head_approve') && !canFinalApprove) {
+        showToast(finalApprovalBlockReason || 'Final approval is not available for this run');
+        return;
+      }
+      await financeApi.runAction(run.id, action, cleanRemarks);
       showToast(`${action.replace(/_/g, ' ')} successful`);
       loadDetails(selectedId);
       setModal(null);
@@ -166,6 +335,13 @@ export default function FinalApproval() {
           {...modal}
           onClose={() => setModal(null)}
           onConfirm={(r) => doAction(modal.action, r)}
+        />
+      )}
+      {selectedEmployee && (
+        <PayrollBreakdownModal
+          employee={selectedEmployee}
+          run={run}
+          onClose={() => setSelectedEmployee(null)}
         />
       )}
 
@@ -234,9 +410,10 @@ export default function FinalApproval() {
             </div>
 
             {/* Payroll summary */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-5">
               {[
-                { label: 'Total Employees',  value: run.total_employees },
+                { label: 'Payroll Month',    value: run.month_label },
+                { label: 'Employee Count',   value: run.total_employees },
                 { label: 'Gross Payroll',    value: fmt(run.total_gross) },
                 { label: 'Total Deductions', value: fmt(run.total_deductions) },
                 { label: 'Net Payroll',      value: fmt(run.total_net) },
@@ -247,11 +424,13 @@ export default function FinalApproval() {
                 </div>
               ))}
             </div>
-            <div className="grid grid-cols-3 gap-4 mb-6">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
               {[
                 { label: 'Total PF',  value: fmt(run.total_pf),  color: 'text-indigo-700' },
                 { label: 'Total ESI', value: fmt(run.total_esi), color: 'text-purple-700' },
                 { label: 'Total TDS', value: fmt(run.total_tds), color: 'text-rose-700' },
+                { label: 'Finance Reviewed', value: financeReviewed ? 'Yes' : 'No', color: financeReviewed ? 'text-emerald-700' : 'text-amber-700' },
+                { label: 'Open Errors', value: openErrors, color: openErrors === 0 ? 'text-emerald-700' : 'text-rose-700' },
               ].map((item) => (
                 <div key={item.label} className="bg-slate-50 rounded-xl p-4 text-center">
                   <p className="text-xs text-slate-500">{item.label}</p>
@@ -260,11 +439,93 @@ export default function FinalApproval() {
               ))}
             </div>
 
-            {/* Action buttons — role-based visibility */}
+            {/* Employee-wise payroll records */}
+            <div className="mb-6">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Employee Payroll Records</p>
+                <span className="text-xs text-slate-400">{employees.length} record(s)</span>
+              </div>
+              <div className="overflow-x-auto rounded-xl border border-slate-200">
+                <table className="min-w-[1380px] w-full text-sm">
+                  <thead className="bg-slate-50 text-xs uppercase tracking-wider text-slate-500">
+                    <tr>
+                      <th className="px-3 py-3 text-left font-semibold">Employee Code</th>
+                      <th className="px-3 py-3 text-left font-semibold">Employee Name</th>
+                      <th className="px-3 py-3 text-left font-semibold">Department</th>
+                      <th className="px-3 py-3 text-right font-semibold">Annual CTC</th>
+                      <th className="px-3 py-3 text-right font-semibold">LOP Days</th>
+                      <th className="px-3 py-3 text-right font-semibold">Gross Pay</th>
+                      <th className="px-3 py-3 text-right font-semibold">LOP Deduction</th>
+                      <th className="px-3 py-3 text-right font-semibold">PF</th>
+                      <th className="px-3 py-3 text-right font-semibold">ESI</th>
+                      <th className="px-3 py-3 text-right font-semibold">Prof Tax</th>
+                      <th className="px-3 py-3 text-right font-semibold">TDS</th>
+                      <th className="px-3 py-3 text-right font-semibold">Total Deductions</th>
+                      <th className="px-3 py-3 text-right font-semibold">Net Pay</th>
+                      <th className="px-3 py-3 text-left font-semibold">Status</th>
+                      <th className="px-3 py-3 text-left font-semibold">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {employees.length === 0 ? (
+                      <tr>
+                        <td colSpan={15} className="px-3 py-6 text-center text-slate-400">
+                          No employee payroll records found for this run
+                        </td>
+                      </tr>
+                    ) : employees.map((emp) => {
+                      const recStatus = (emp.record_status || 'COMPUTED').toUpperCase();
+                      const statusCls =
+                        recStatus === 'COMPUTED' ? 'bg-emerald-100 text-emerald-700'
+                        : recStatus === 'ERROR' || recStatus === 'FAILED' ? 'bg-rose-100 text-rose-700'
+                        : 'bg-amber-100 text-amber-700';
+                      return (
+                        <tr key={emp.id} className={emp.has_error ? 'bg-rose-50/60' : 'hover:bg-slate-50/60'}>
+                          <td className="px-3 py-3 font-mono text-xs text-slate-600 whitespace-nowrap">{emp.employee_code || '—'}</td>
+                          <td className="px-3 py-3 font-medium text-slate-800 whitespace-nowrap">{emp.employee_name || '—'}</td>
+                          <td className="px-3 py-3 text-slate-500 whitespace-nowrap">{emp.department || '—'}</td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-700 whitespace-nowrap font-semibold">
+                            {fmt(emp.annual_ctc)}
+                          </td>
+                          <td className={`px-3 py-3 text-right font-mono whitespace-nowrap font-semibold ${(emp.lop_days ?? 0) > 0 ? 'text-rose-600' : 'text-slate-500'}`}>
+                            {emp.lop_days ?? 0}
+                          </td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-700 whitespace-nowrap">{fmt(emp.gross_earnings ?? emp.gross_salary)}</td>
+                          <td className={`px-3 py-3 text-right font-mono whitespace-nowrap ${(emp.lop_deduction ?? 0) > 0 ? 'text-rose-600' : 'text-slate-500'}`}>
+                            {fmt(emp.lop_deduction)}
+                          </td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-600 whitespace-nowrap">{fmt(emp.employee_pf ?? emp.pf_employee)}</td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-600 whitespace-nowrap">{fmt(emp.employee_esi ?? emp.esi_employee)}</td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-600 whitespace-nowrap">{fmt(emp.professional_tax)}</td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-600 whitespace-nowrap">{fmt(emp.tds)}</td>
+                          <td className="px-3 py-3 text-right font-mono text-slate-700 whitespace-nowrap">{fmt(emp.total_deductions)}</td>
+                          <td className="px-3 py-3 text-right font-mono font-bold text-emerald-700 whitespace-nowrap">{fmt(emp.net_pay ?? emp.net_salary)}</td>
+                          <td className="px-3 py-3 whitespace-nowrap">
+                            <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${statusCls}`}>
+                              {emp.record_status || 'COMPUTED'}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3 whitespace-nowrap">
+                            <button
+                              onClick={() => setSelectedEmployee(emp)}
+                              className="rounded-lg border border-brand-100 bg-brand-50 px-3 py-1.5 text-xs font-semibold text-brand-600 hover:bg-brand-100 transition"
+                            >
+                              View Details
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Action buttons - role-based visibility */}
             <div className="border-t border-slate-100 pt-5">
               {(() => {
                 const r = (role || '').toLowerCase();
-                const isFinanceHead = r === 'finance_head';
+                const isFinanceHead = r === 'finance_head' || r === 'financehead';
                 const isFinance = r === 'finance' || r === 'admin';
 
                 return (
@@ -306,6 +567,7 @@ export default function FinalApproval() {
                                   message: 'Reset this run to Draft. Please provide a reason.',
                                   variant: 'danger',
                                   action: 'reject',
+                                  requireRemarks: true,
                                 })}
                                 className="flex items-center gap-2 rounded-lg bg-rose-500 px-5 py-2.5 text-sm font-semibold text-white hover:bg-rose-600 transition"
                               >
@@ -351,19 +613,11 @@ export default function FinalApproval() {
                             </button>
                           )}
 
-                          {/* Finance: Close Run */}
-                          {run.status === 'published' && (
-                            <button
-                              onClick={() => setModal({
-                                title: 'Close Payroll Run',
-                                message: 'Close this payroll run. This action marks it as complete.',
-                                variant: 'success',
-                                action: 'close',
-                              })}
-                              className="flex items-center gap-2 rounded-lg bg-slate-700 px-5 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 transition"
-                            >
-                              🔒 Close Run
-                            </button>
+                          {/* Finance: Complete Run */}
+                          {(run.status === 'published' || run.status === 'completed') && (
+                            <div className="flex items-center gap-2 rounded-lg bg-emerald-50 border border-emerald-200 px-5 py-2.5 text-sm font-semibold text-emerald-700">
+                              ✓ Payroll run complete
+                            </div>
                           )}
                         </div>
                       </>
@@ -379,13 +633,26 @@ export default function FinalApproval() {
                           {run.status === 'pending_head_approval' && (
                             <>
                               <button
-                                onClick={() => setModal({
-                                  title: 'Finance Head Final Approval',
-                                  message: `You are about to give final approval for the ${run.month_label} payroll of ${fmt(run.total_net)} for ${run.total_employees} employees. This action locks payroll permanently.`,
-                                  variant: 'success',
-                                  action: 'head_approve',
-                                })}
-                                className="flex items-center gap-2 rounded-lg bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-600 transition"
+                                disabled={!canFinalApprove}
+                                title={!canFinalApprove ? finalApprovalBlockReason : undefined}
+                                onClick={() => {
+                                  if (!canFinalApprove) {
+                                    showToast(finalApprovalBlockReason || 'Final approval is not available for this run');
+                                    return;
+                                  }
+                                  setModal({
+                                    title: 'Finance Head Final Approval',
+                                    message: `You are about to give final approval for the ${run.month_label} payroll of ${fmt(run.total_net)} for ${run.total_employees} employees. This action locks payroll permanently.`,
+                                    variant: 'success',
+                                    action: 'head_approve',
+                                    actionLabel: 'Final Approve',
+                                  });
+                                }}
+                                className={`flex items-center gap-2 rounded-lg px-5 py-2.5 text-sm font-semibold text-white transition ${
+                                  canFinalApprove
+                                    ? 'bg-emerald-500 hover:bg-emerald-600'
+                                    : 'bg-slate-300 cursor-not-allowed'
+                                }`}
                               >
                                 ✓ Final Approve
                               </button>
@@ -395,12 +662,19 @@ export default function FinalApproval() {
                                   message: 'Return this payroll run to Finance for review. Please provide a reason.',
                                   variant: 'danger',
                                   action: 'head_reject',
+                                  requireRemarks: true,
                                 })}
                                 className="flex items-center gap-2 rounded-lg bg-rose-500 px-5 py-2.5 text-sm font-semibold text-white hover:bg-rose-600 transition"
                               >
                                 ↩ Return To Finance
                               </button>
                             </>
+                          )}
+
+                          {run.status === 'pending_head_approval' && !canFinalApprove && finalApprovalBlockReason && (
+                            <p className="basis-full text-xs font-medium text-rose-600">
+                              {finalApprovalBlockReason}
+                            </p>
                           )}
 
                           {/* Finance Head: informational states */}
@@ -419,7 +693,7 @@ export default function FinalApproval() {
                               📄 Payslips generated — Finance will publish shortly
                             </div>
                           )}
-                          {(run.status === 'published' || run.status === 'closed') && (
+                          {(run.status === 'published' || run.status === 'completed' || run.status === 'closed') && (
                             <div className="flex items-center gap-2 rounded-lg bg-emerald-50 border border-emerald-200 px-5 py-2.5 text-sm font-semibold text-emerald-700">
                               ✓ Payroll cycle complete
                             </div>
@@ -440,7 +714,7 @@ export default function FinalApproval() {
                       </div>
                     )}
 
-                    {!['under_review','pending_head_approval','approved','payslip_generated','published','closed','disbursed'].includes(run.status) && (
+                    {!['under_review','pending_head_approval','approved','payslip_generated','published','completed','closed','disbursed'].includes(run.status) && (
                       <p className="text-sm text-slate-400">
                         Run must reach <strong>Finance Review</strong> status before approval actions are available.
                         Current: <span className="font-medium">{run.status.replace(/_/g,' ')}</span>

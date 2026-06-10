@@ -27,7 +27,11 @@ function RunPicker({ runs, selectedId, onChange }) {
     >
       <option value="" disabled>Select run…</option>
       {runs.map((r) => (
-        <option key={r.id} value={r.id}>{r.month_label} ({r.status.replace(/_/g, ' ')})</option>
+        <option key={r.id} value={r.id}>
+          {r.month_label} ({r.status === 'under_review' && r.head_return_reason
+            ? 'returned by Finance Head'
+            : r.status.replace(/_/g, ' ')})
+        </option>
       ))}
     </select>
   );
@@ -337,7 +341,10 @@ function AdjustmentsPanel({ run, employees, onRecompute }) {
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
 
-  const canEdit = run && EDITABLE_STATES.includes(run.status);
+  const { role: panelRole } = useAuth();
+  const isFinanceWriter = ['finance', 'admin'].includes((panelRole || '').toLowerCase());
+
+  const canEdit = run && EDITABLE_STATES.includes(run.status) && isFinanceWriter;
 
   const load = () => {
     if (!run?.id) return;
@@ -517,6 +524,7 @@ function AdjustmentsPanel({ run, employees, onRecompute }) {
 export default function FinanceReview() {
   const navigate = useNavigate();
   const { role } = useAuth();
+  const isFinanceTeam = ['finance', 'admin'].includes((role || '').toLowerCase());
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [run, setRun] = useState(null);
@@ -530,15 +538,51 @@ export default function FinanceReview() {
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
 
-  useEffect(() => {
-    financeApi.listRuns()
+  const fetchRuns = async (autoSelect = false) => {
+    const STATUS_RANK = {
+      draft: 0, attendance_frozen: 1, processing: 2,
+      under_review: 3, pending_head_approval: 4, approved: 5,
+      payslip_generated: 6, bank_advice_generated: 7, published: 8, closed: 9,
+    };
+    const getMonthYear = (r) => {
+      const m = r.month || (r.pay_period_start ? new Date(r.pay_period_start + 'T00:00:00').getMonth() + 1 : 0);
+      const y = r.year || (r.pay_period_start ? new Date(r.pay_period_start + 'T00:00:00').getFullYear() : 0);
+      return { m, y, key: `${y}-${m}` };
+    };
+    return financeApi.listRuns()
       .then((data) => {
-        setRuns(data);
-        // Auto-select the first run under_review or processing
-        const active = data.find((r) => r.status === 'under_review' || r.status === 'processing');
-        setSelectedId((active || data[0])?.id);
+        const best = {};
+        for (const r of data) {
+          const { key } = getMonthYear(r);
+          if (!best[key] || (STATUS_RANK[r.status] ?? -1) > (STATUS_RANK[best[key].status] ?? -1)) {
+            best[key] = r;
+          }
+        }
+        const deduped = Object.values(best).sort((a, b) => {
+          const { m: am, y: ay } = getMonthYear(a);
+          const { m: bm, y: by } = getMonthYear(b);
+          return by !== ay ? by - ay : bm - am;
+        });
+        const sorted = [...deduped].sort((a, b) => {
+          const aRet = a.status === 'under_review' && !!a.head_return_reason;
+          const bRet = b.status === 'under_review' && !!b.head_return_reason;
+          if (aRet && !bRet) return -1;
+          if (!aRet && bRet) return 1;
+          return 0;
+        });
+        setRuns(sorted);
+        if (autoSelect) {
+          const active =
+            sorted.find((r) => r.status === 'under_review' && r.head_return_reason) ||
+            sorted.find((r) => r.status === 'under_review' || r.status === 'processing');
+          setSelectedId((active || sorted[0])?.id);
+        }
       })
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchRuns(true);
   }, []);
 
   const loadDetails = (id) => {
@@ -561,6 +605,7 @@ export default function FinanceReview() {
     try {
       await financeApi.runAction(run.id, action, description);
       showToast(`Action '${action}' completed`);
+      await fetchRuns(false);
       loadDetails(selectedId);
     } catch (e) {
       showToast(e?.data?.detail || e.message || 'Action failed');
@@ -596,7 +641,7 @@ export default function FinanceReview() {
       <button
         onClick={() => {
           const role_ = (role || '').toLowerCase();
-          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance');
+          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance-payroll');
         }}
         className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800 transition-colors"
       >
@@ -625,7 +670,7 @@ export default function FinanceReview() {
             </div>
 
             <div className="flex gap-2 flex-wrap">
-              {run.status === 'under_review' && (
+              {isFinanceTeam && run.status === 'under_review' && (
                 <>
                   <button
                     disabled={actionBusy || openErrors.length > 0}
@@ -651,7 +696,7 @@ export default function FinanceReview() {
                   </button>
                 </>
               )}
-              {run.status === 'processing' && (
+              {isFinanceTeam && run.status === 'processing' && (
                 <>
                   <button
                     disabled={actionBusy}
@@ -662,11 +707,12 @@ export default function FinanceReview() {
                     ↺ Recompute
                   </button>
                   <button
-                    disabled={actionBusy}
-                    onClick={() => handleAction('submit_review')}
+                    disabled={actionBusy || openErrors.length > 0 || employees.length === 0}
+                    onClick={() => handleAction('start_review')}
                     className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-600 disabled:opacity-50 transition"
+                    title={openErrors.length > 0 ? 'Resolve all errors first' : 'Start Finance Review'}
                   >
-                    Submit for Finance Review
+                    Start Finance Review
                   </button>
                 </>
               )}
@@ -675,13 +721,70 @@ export default function FinanceReview() {
                   ⏳ Sent to Finance Head — Awaiting Final Approval
                 </span>
               )}
-              {run.status === 'approved' && (
-                <span className="rounded-lg bg-emerald-50 border border-emerald-200 px-4 py-2 text-sm font-semibold text-emerald-700">
-                  ✓ Finance Head Approved — Generate Payslips in Finance Head Approval tab
+              {isFinanceTeam && run.status === 'approved' && (
+                <button
+                  disabled={actionBusy}
+                  onClick={() => handleAction('generate_payslips')}
+                  className="rounded-lg bg-teal-500 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-600 disabled:opacity-50 transition"
+                >
+                  📄 Generate Payslips
+                </button>
+              )}
+              {isFinanceTeam && (run.status === 'payslip_generated' || run.status === 'bank_advice_generated') && (
+                <button
+                  disabled={actionBusy}
+                  onClick={() => handleAction('publish')}
+                  className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-white hover:bg-cyan-600 disabled:opacity-50 transition"
+                >
+                  📢 Publish to ESS
+                </button>
+              )}
+              {isFinanceTeam && run.status === 'published' && (
+                <button
+                  disabled={actionBusy}
+                  onClick={() => handleAction('close')}
+                  className="rounded-lg bg-slate-600 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50 transition"
+                >
+                  🔐 Close Payroll Run
+                </button>
+              )}
+              {run.status === 'closed' && (
+                <span className="rounded-lg bg-slate-100 border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-500">
+                  🔒 Payroll Closed
                 </span>
               )}
             </div>
           </div>
+
+          {run.head_return_reason && run.status === 'under_review' && (
+            <div className="mt-4 rounded-lg bg-amber-50 border border-amber-200 p-4">
+              <p className="text-sm font-semibold text-amber-800 mb-2">
+                ↩ Returned by Finance Head
+              </p>
+              <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-amber-700 mb-2">
+                <span>
+                  <span className="font-medium">Returned by:</span>{' '}
+                  {run.head_returned_by || 'Finance Head'}
+                </span>
+                {run.head_return_at && (
+                  <span>
+                    <span className="font-medium">On:</span>{' '}
+                    {new Date(run.head_return_at).toLocaleString('en-IN', {
+                      day: '2-digit', month: 'short', year: 'numeric',
+                      hour: '2-digit', minute: '2-digit',
+                    })}
+                  </span>
+                )}
+              </div>
+              <div className="rounded-md bg-amber-100 border border-amber-200 px-3 py-2 text-xs text-amber-900">
+                <span className="font-semibold">Return reason: </span>
+                {run.head_return_reason}
+              </div>
+              <p className="text-xs text-amber-700 mt-2">
+                Review the reason above, recompute if needed, resolve any errors, then resubmit to Finance Head.
+              </p>
+            </div>
+          )}
 
           {openErrors.length > 0 && (
             <div className="mt-4 rounded-lg bg-rose-50 border border-rose-200 p-3 text-sm text-rose-800">
@@ -691,12 +794,6 @@ export default function FinanceReview() {
               <p className="text-xs text-rose-700 mb-2">
                 {openErrors.length} unresolved error{openErrors.length > 1 ? 's' : ''} found — the Send To Finance Head button will remain disabled until all issues are resolved.
               </p>
-              <button
-                onClick={() => navigate((role || '').toLowerCase() === 'admin' ? '/admin-dashboard/payroll/errors' : '/employee-dashboard/finance/errors')}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 text-white px-3 py-1.5 text-xs font-semibold hover:bg-rose-700 transition"
-              >
-                🔍 Review Errors
-              </button>
             </div>
           )}
         </div>
@@ -715,12 +812,6 @@ export default function FinanceReview() {
                 <p className="text-sm font-semibold text-slate-700">
                   Flagged Issues ({errors.length})
                 </p>
-                <button
-                  onClick={() => navigate((role || '').toLowerCase() === 'admin' ? '/admin-dashboard/payroll/errors' : '/employee-dashboard/finance/errors')}
-                  className="text-xs text-brand-600 font-medium hover:underline"
-                >
-                  Manage all →
-                </button>
               </div>
               <div className="divide-y divide-slate-50">
                 {errors.slice(0, 5).map((e) => (
@@ -777,7 +868,14 @@ export default function FinanceReview() {
                   ) : (
                     employees.map((e) => (
                       <tr key={e.id} className={`border-b border-slate-50 hover:bg-slate-50 transition ${e.has_error ? 'bg-rose-50/40' : ''}`}>
-                        <td className="px-3 py-2.5 font-medium text-slate-700 whitespace-nowrap">{e.employee_name}</td>
+                        <td className="px-3 py-2.5 font-medium text-slate-700 whitespace-nowrap">
+                          <div>{e.employee_name}</div>
+                          {e.has_error && (
+                            <p className="mt-0.5 max-w-[260px] whitespace-normal text-[10px] font-medium leading-snug text-rose-600">
+                              {e.variance_reason || 'Payroll error flagged'}
+                            </p>
+                          )}
+                        </td>
                         <td className="px-3 py-2.5 text-slate-500">{e.department}</td>
                         <td className="px-3 py-2.5 text-slate-500">{e.present_days}/{e.working_days}</td>
                         <td className="px-3 py-2.5 text-rose-600 font-medium">{e.lop_days}</td>
@@ -788,11 +886,11 @@ export default function FinanceReview() {
                           {e.has_error ? (
                             <span className="rounded-full bg-rose-100 text-rose-700 px-2 py-0.5 text-[10px] font-semibold">Error</span>
                           ) : (
-                            <span className="rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5 text-[10px] font-semibold">OK</span>
+                            <span className="rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5 text-[10px] font-semibold">Computed</span>
                           )}
                         </td>
                         <td className="px-3 py-2.5">
-                          {(run?.status === 'under_review' || run?.status === 'processing') && (
+                          {isFinanceTeam && (run?.status === 'under_review' || run?.status === 'processing') && (
                             <button
                               onClick={() => setFlagTarget(e)}
                               className="rounded bg-rose-50 text-rose-600 border border-rose-200 px-2 py-1 text-[10px] font-medium hover:bg-rose-100 transition"

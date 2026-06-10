@@ -606,26 +606,37 @@ def send_client_approval_email(
 
     ts = db.get(Timesheet, ts_id)
     if not ts:
+        logger.info("Approval email skipped: timesheet %s not found", ts_id)
         return
 
     send_to = (ts.client_manager_email or "").strip()
     if not send_to:
+        logger.info("Approval email skipped: missing client_manager_email timesheet=%s", ts_id)
         logger.debug("No client_manager_email on timesheet %s — skipping email", ts_id)
         return
 
     employee = db.get(Employee, ts.employee_id)
     if not employee:
+        logger.info("Approval email skipped: employee %s not found timesheet=%s", ts.employee_id, ts_id)
         return
 
     if not ts.period_start or not ts.period_end:
+        logger.info("Approval email skipped: missing period dates timesheet=%s recipient=%s", ts_id, send_to)
         return
 
     token = ts.client_token
     if not token:
-        logger.warning("No client token on timesheet %s - skipping approval email", ts_id)
+        logger.warning("Approval email skipped: missing client token timesheet=%s recipient=%s", ts_id, send_to)
         return
 
     settings = get_settings()
+    logger.info(
+        "Preparing client approval email: timesheet=%s recipient=%s smtp_enabled=%s base_url=%s",
+        ts_id,
+        send_to,
+        bool((settings.SMTP_USERNAME or "").strip() and (settings.SMTP_PASSWORD or "").strip()),
+        settings.CLIENT_ACTION_BASE_URL,
+    )
     base = settings.CLIENT_ACTION_BASE_URL.rstrip("/")
     approve_url = f"{base}/timesheet/client-action?token={token}&action=approve"
     reject_url  = f"{base}/timesheet/client-action?token={token}&action=reject"

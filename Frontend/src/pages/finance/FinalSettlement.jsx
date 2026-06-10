@@ -451,7 +451,7 @@ export default function FinalSettlement() {
       <button
         onClick={() => {
           const role_ = (role || '').toLowerCase();
-          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance');
+          navigate(role_ === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance-payroll');
         }}
         className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800 transition-colors"
       >

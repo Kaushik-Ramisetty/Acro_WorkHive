@@ -15,6 +15,7 @@ import * as Finance from '../pages/finance/index.jsx';
 
 import ManagerDashboard from '../pages/manager/ManagerDashboard';
 import EmployeeDashboard from '../pages/employee/EmployeeDashboard';
+import EmployeeSelfPayrollPage from '../pages/employee/screens/PayrollPage';
 
 // ── Onboarding-domain routes (merged from the Onboarding frontend) ─────────
 import CandidateDashboard from '../pages/candidate/CandidateDashboard';
@@ -30,6 +31,10 @@ function RootRedirect() {
   return <Navigate to={isAuthenticated ? dashboardPathForRole(role) : '/login'} replace />;
 }
 
+function HrSelfPayrollRoute() {
+  return <EmployeeSelfPayrollPage />;
+}
+
 export default function AppRoutes() {
   return (
     <AuthProvider>
@@ -37,11 +42,11 @@ export default function AppRoutes() {
         <Route path="/" element={<RootRedirect />} />
         <Route path="/login" element={<LoginPage />} />
 
-        {/* Admin (shared layout + nested sub-pages) */}
+        {/* Admin / HR (shared layout + nested sub-pages) */}
         <Route
           path="/admin-dashboard"
           element={
-            <ProtectedRoute allowedRoles={['admin']}>
+            <ProtectedRoute allowedRoles={['admin', 'hr']}>
               <DashboardLayout />
             </ProtectedRoute>
           }
@@ -56,9 +61,11 @@ export default function AppRoutes() {
           <Route path="comp-off"       element={<Admin.CompOff />} />
           <Route path="regularization" element={<Admin.Regularization />} />
           <Route path="approvals"      element={<Admin.Approvals />} />
+          <Route path="my-payroll"     element={<HrSelfPayrollRoute />} />
           {/* Payroll — nested sub-routes (Finance payroll suite) */}
           <Route path="payroll">
             <Route index                       element={<Finance.PayrollHome />} />
+            <Route path="hr-attendance"        element={<Finance.HrPayrollAttendance />} />
             <Route path="payroll-runs"         element={<Finance.PayrollRunManagement />} />
             <Route path="summary"              element={<Finance.PayrollSummary />} />
             <Route path="review"               element={<Finance.FinanceReview />} />
@@ -67,7 +74,10 @@ export default function AppRoutes() {
             <Route path="payslips"             element={<Finance.PayslipBankAdvice />} />
             <Route path="analytics"            element={<Finance.PayrollAnalytics />} />
             <Route path="salary-structures"    element={<Finance.SalaryStructures />} />
-            <Route path="salary-revisions"     element={<Finance.SalaryRevisionHistory />} />
+            <Route path="salary-revisions"     element={<Finance.SalaryRevision />} />
+            <Route path="salary-revision"      element={<Finance.SalaryRevision />} />
+            <Route path="bonus-requests"       element={<Finance.BonusRequest />} />
+            <Route path="off-cycle-payments"   element={<Finance.OffCyclePayments />} />
             <Route path="reimbursements"       element={<Finance.Reimbursements />} />
             <Route path="ff"                   element={<Finance.FinalSettlement />} />
           </Route>

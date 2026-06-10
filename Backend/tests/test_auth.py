@@ -13,8 +13,8 @@ def test_login_employee_via_official_email(client, db_session):
     from api.models import Department, Designation, Employee
 
     db_session.add_all([
-        Department(id="DEP001", name="Engineering"),
-        Designation(id="D1", title="Software Engineer", level=3),
+        Department(id="DEP001", name="HR"),
+        Designation(id="D1", title="Delivery Head", level=10),
     ])
     db_session.flush()
 
@@ -54,8 +54,8 @@ def test_login_rejects_inactive_employee(client, db_session):
     from api.models import Department, Designation, Employee
 
     db_session.add_all([
-        Department(id="DEP001", name="Engineering"),
-        Designation(id="D1", title="Software Engineer", level=3),
+        Department(id="DEP001", name="HR"),
+        Designation(id="D1", title="Delivery Head", level=10),
     ])
     db_session.flush()
     db_session.add(Employee(
@@ -107,8 +107,8 @@ def test_change_password_happy_path(client, db_session):
     from api.models import Department, Designation, Employee
 
     db_session.add_all([
-        Department(id="DEP001", name="Engineering"),
-        Designation(id="D1", title="Software Engineer", level=3),
+        Department(id="DEP001", name="HR"),
+        Designation(id="D1", title="Delivery Head", level=10),
     ])
     db_session.flush()
     emp = Employee(

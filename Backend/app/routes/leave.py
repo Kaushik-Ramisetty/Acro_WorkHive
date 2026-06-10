@@ -22,7 +22,7 @@ from app.schemas.leave import (
     LeaveTypeOut, RejectIn,
 )
 from app.services.leave_engine import (
-    LeaveEngineError, apply_leave, approve_cancellation, approve_leave,
+    LeaveEngineError, apply_leave, apply_lop_leave, approve_cancellation, approve_leave,
     cancel_leave, create_draft, discard_draft, reject_leave, submit_draft,
     update_draft,
 )
@@ -71,6 +71,7 @@ def _serialize(req: LeaveRequest) -> LeaveRequestOut:
         payroll_synced_at=req.payroll_synced_at,
         payroll_sync_attempts=int(req.payroll_sync_attempts or 0),
         payroll_last_error=req.payroll_last_error,
+        is_lop=bool(getattr(req, "is_lop", False)),
         created_at=req.created_at,
         updated_at=req.updated_at,
     )
@@ -145,6 +146,37 @@ def apply_by_days(payload: LeaveApplyByDaysIn,
         db, user,
         payload.leave_type_id, payload.start_date, payload.requested_days, payload.reason,
         half_day_start=payload.half_day_start, half_day_end=payload.half_day_end,
+    ))
+    return _serialize(req)
+
+
+class LopApplyIn(BaseModel):
+    start_date: date
+    end_date: date
+    reason: Optional[str] = None
+    original_leave_type_id: Optional[str] = None
+
+
+@router.post("/apply-lop", response_model=LeaveRequestOut, status_code=201)
+def apply_lop(
+    payload: LopApplyIn,
+    db: Session = Depends(get_db),
+    user: Employee = Depends(get_current_user),
+):
+    """Apply for Loss-of-Pay leave when paid leave balance is exhausted.
+
+    Creates a leave request against LT007 (LOP_leaves) which is unpaid.
+    Routes through a two-stage manager → HR approval chain before payroll
+    deduction is recorded. No leave balance is deducted — the LOP days are
+    added directly to the payroll attendance summary after HR approval.
+    """
+    req = _engine(lambda: apply_lop_leave(
+        db,
+        user,
+        payload.start_date,
+        payload.end_date,
+        payload.reason,
+        original_leave_type_id=payload.original_leave_type_id,
     ))
     return _serialize(req)
 

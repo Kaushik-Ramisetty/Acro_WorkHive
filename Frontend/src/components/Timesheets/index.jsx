@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTimesheets } from '../../hooks/useTimesheets';
 import { useWeekAttendance } from '../../hooks/useWeekAttendance';
 import { timesheet as tsApi } from '../../services/timesheet';
-import { fmtIso, formatWeekLabel } from '../../utils/weekHelpers';
+import { fmtIso, formatWeekLabel, computeWeeklyHours, classifyWeek, ATTENDANCE_STATUS } from '../../utils/weekHelpers';
 import { exportToXlsx } from '../../utils/exportXlsx';
 import { WF } from './workflow/statuses';
 
@@ -26,6 +26,8 @@ export default function Timesheets() {
     navigateWeek,
     goThisWeek,
     saveDraft,
+    resetLocalDraft,
+    hydrateFromDB,
   } = useTimesheets();
 
   const { attendanceMap, isLoading: attendanceLoading } = useWeekAttendance(activeWeekStart);
@@ -33,47 +35,134 @@ export default function Timesheets() {
   const [filters, setFilters]               = useState({ client: '', project: '', status: '' });
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [toast, setToast]                   = useState(null); // { message, type }
-  const [submitting, setSubmitting]         = useState(false);
-  const [persistedDraft, setPersistedDraft] = useState(null);
+  const [submitting, setSubmitting]           = useState(false);
+  const [persistedDraft, setPersistedDraft]   = useState(null);
+  const [isDraftInitialized, setIsDraftInitialized] = useState(false);
+  const [serverWeekStatus, setServerWeekStatus] = useState(null); // actual DB status for this week
+  const [creatingRetroactive, setCreatingRetroactive] = useState(false);
+
+  // 'past' | 'current' | 'future' — drives init strategy and empty-state message.
+  const weekType = classifyWeek(activeWeekStart);
+
+  // Tracks the AbortController for the current in-flight init request so
+  // React StrictMode's cleanup can abort the first (stale) call and the second
+  // (real) call is the only one that updates state.
+  const initAbortRef = useRef(null);
 
   const showToast = (message, type = 'success') => setToast({ message, type });
   const closeToast = () => setToast(null);
 
-  // Total hours from attendance (finalized days only) — single source of truth
-  const totalHours = Object.values(attendanceMap)
-    .filter((a) => a.attendance_status === 'FINALIZED')
-    .reduce((s, a) => s + (a.effective_hours || 0), 0);
+  const totalHours = computeWeeklyHours(entries, attendanceMap);
 
   const weekLabel = formatWeekLabel(activeWeekStart, { includeWeekends: true });
+
+  // Shared hydration: apply a draft returned by the backend to all relevant state.
+  // IMPORTANT: when the server returns an empty entries array we do NOT reset local
+  // state — the user may have unsaved draft work in localStorage. resetLocalDraft()
+  // is only called explicitly when we know there is NO server record for a past week.
+  const applyDraft = (draft) => {
+    setPersistedDraft(draft);
+    setServerWeekStatus(draft.status || WF.DRAFT);
+    if (draft.entries?.length > 0) {
+      hydrateFromDB(draft.entries);
+    }
+    // Empty entries → keep whatever is in localStorage (don't destroy local draft)
+  };
 
   useEffect(() => {
     if (!activeWeekStart) return;
 
-    let cancelled = false;
+    setIsDraftInitialized(false);
+    setServerWeekStatus(null);
+    setPersistedDraft(null);
+
+    // Future weeks have no data yet — skip all API calls.
+    if (weekType === 'future') {
+      resetLocalDraft();
+      setIsDraftInitialized(true);
+      return;
+    }
+
+    // Abort any previous in-flight init before starting a new one.
+    // In React StrictMode (dev), the cleanup fires synchronously after the
+    // first mount — the abort cancels that first fetch so only the second
+    // (real) invocation completes and updates state.
+    const controller = new AbortController();
+    initAbortRef.current = controller;
+
     const end = new Date(activeWeekStart);
     end.setDate(end.getDate() + 6);
     const periodStart = fmtIso(activeWeekStart);
     const periodEnd = fmtIso(end);
 
-    console.log('[Timesheets] initializing draft', { periodStart, periodEnd });
-    tsApi.create({
-      period_type: 'weekly',
-      period_start: periodStart,
-      period_end: periodEnd,
-      entries: [],
-    })
-      .then((draft) => {
-        if (cancelled) return;
-        setPersistedDraft(draft);
-        console.log('[Timesheets] draft loaded', draft);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        console.error('[Timesheets] draft initialization failed', err);
-        showToast(err?.data?.detail || err?.message || 'Could not initialize timesheet draft', 'error');
-      });
+    if (weekType === 'current') {
+      // Current week: create-or-get (idempotent — backend returns existing if found).
+      console.log('[Timesheets] initializing draft', { periodStart, periodEnd });
+      tsApi.create({
+        period_type: 'weekly',
+        period_start: periodStart,
+        period_end: periodEnd,
+        entries: [],
+      }, { signal: controller.signal })
+        .then((draft) => {
+          if (controller.signal.aborted) return;
+          applyDraft(draft);
+          console.log('[Timesheets] draft loaded', draft);
+        })
+        .catch((err) => {
+          if (controller.signal.aborted) return;
+          console.error('[Timesheets] draft initialization failed', err);
+          showToast(err?.data?.detail || err?.message || 'Could not initialize timesheet draft', 'error');
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setIsDraftInitialized(true);
+        });
+    } else {
+      // Past week: look up without auto-creating a new draft.
+      // The list endpoint returns TimesheetOut (summary only, no entries[]).
+      // When a match is found we must call GET /timesheet/{id} to get the full
+      // detail response (with entries) before hydrating the UI.
+      console.log('[Timesheets] looking up past week', { periodStart, periodEnd });
+      tsApi.list({})
+        .then((list) => {
+          if (controller.signal.aborted) return;
+          const found = (Array.isArray(list) ? list : []).find(
+            (t) => t.period_start === periodStart && t.period_end === periodEnd,
+          );
+          if (found) {
+            console.log('[Timesheets] past week summary found', found.id, found.status, '— fetching detail');
+            // Fetch the full detail (with entries) before hydrating
+            tsApi.get(found.id)
+              .then((detail) => {
+                if (controller.signal.aborted) return;
+                console.log('[Timesheets] past week detail loaded, entries:', detail?.entries?.length ?? 0);
+                applyDraft(detail);
+              })
+              .catch((err) => {
+                if (controller.signal.aborted) return;
+                console.warn('[Timesheets] detail fetch failed, using summary stub', err);
+                // Fall back to the summary object — entries will be absent/empty
+                // so applyDraft preserves whatever localStorage has
+                applyDraft(found);
+              })
+              .finally(() => {
+                if (!controller.signal.aborted) setIsDraftInitialized(true);
+              });
+          } else {
+            resetLocalDraft();
+            console.log('[Timesheets] no past week record found');
+            setIsDraftInitialized(true);
+          }
+        })
+        .catch((err) => {
+          if (controller.signal.aborted) return;
+          console.error('[Timesheets] past-week lookup failed', err);
+          resetLocalDraft();
+          setIsDraftInitialized(true);
+        });
+    }
 
-    return () => { cancelled = true; };
+    return () => { controller.abort(); };
   }, [activeWeekStart]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -108,12 +197,13 @@ export default function Timesheets() {
       return found;
     }
 
+    // For past weeks, create a retroactive timesheet using finalized attendance hours.
     const payloadEntries = entries
       .map((entry) => {
         const attendance = attendanceMap[entry.date];
         return {
           entry_date: entry.date,
-          logged_hours: attendance?.attendance_status === 'FINALIZED'
+          logged_hours: attendance?.attendance_status === ATTENDANCE_STATUS.FINALIZED
             ? Number(attendance.effective_hours || 0)
             : 0,
           is_billable: true,
@@ -129,12 +219,14 @@ export default function Timesheets() {
       periodEnd,
       entryCount: payloadEntries.length,
     });
+    setCreatingRetroactive(true);
     const created = await tsApi.create({
       period_type: 'weekly',
       period_start: periodStart,
       period_end: periodEnd,
       entries: payloadEntries,
     });
+    setCreatingRetroactive(false);
     setPersistedDraft(created);
     console.log('[Timesheets] created persisted timesheet.id', created?.id);
     return created;
@@ -150,17 +242,17 @@ export default function Timesheets() {
       if (!tsId) throw new Error('No persisted timesheet id available for submit.');
 
       console.log('[Timesheets] calling POST /timesheet/%s/submit', tsId);
-      await tsApi.submit(tsId);
+      const submitResult = await tsApi.submit(tsId);
 
-      advanceWorkflow(WF.PENDING_CLIENT, {
-        step:     'employee',
-        outcome:  'done',
-        actedBy:  'You',
-        actedAt:  new Date().toISOString(),
-        comments: null,
-      });
+      // Update the displayed status to whatever the server actually set.
+      // submit_timesheet returns TimesheetOut with real status:
+      //   • client-site employees → 'pending_client_review'
+      //   • WFH/WFO employees     → 'pending_review'
+      const newStatus = submitResult?.status || WF.PENDING_CLIENT;
+      setServerWeekStatus(newStatus);
+
       setShowSubmitModal(false);
-      showToast('Timesheet submitted - awaiting Client Manager review.');
+      showToast('Timesheet submitted — awaiting review.');
     } catch (err) {
       console.error('[Timesheets] submit failed', err);
       showToast(err?.data?.detail || err?.message || 'Submit failed', 'error');
@@ -171,17 +263,6 @@ export default function Timesheets() {
 
   const handleSubmitConfirm = () => {
     submitPersistedTimesheet();
-    return;
-    // eslint-disable-next-line no-unreachable
-    advanceWorkflow(WF.PENDING_CLIENT, {
-      step:     'employee',
-      outcome:  'done',
-      actedBy:  'You',
-      actedAt:  new Date().toISOString(),
-      comments: null,
-    });
-    setShowSubmitModal(false);
-    showToast('Timesheet submitted — awaiting Client Manager review.');
   };
 
   const handleResubmit = () => {
@@ -210,11 +291,16 @@ export default function Timesheets() {
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
+  // Use the real server status when available.
+  // The hook always forces weekStatus → 'draft' via localStorage; serverWeekStatus
+  // is the authoritative value fetched/updated from the backend.
+  const effectiveWeekStatus = serverWeekStatus ?? weekStatus;
+
   return (
     <div id="timesheet-print-root" style={{ maxWidth: '100%', padding: '0.75rem 0' }}>
       <WeekHeader
         activeWeekStart={activeWeekStart}
-        weekStatus={weekStatus}
+        weekStatus={effectiveWeekStatus}
         onPrev={() => navigateWeek(-7)}
         onNext={() => navigateWeek(7)}
         onThisWeek={goThisWeek}
@@ -231,14 +317,14 @@ export default function Timesheets() {
       <EntriesTable
         entries={entries}
         filters={filters}
-        weekStatus={weekStatus}
+        weekStatus={effectiveWeekStatus}
         attendanceMap={attendanceMap}
         attendanceLoading={attendanceLoading}
         onUpdate={updateEntry}
       />
 
       <ActionBar
-        weekStatus={weekStatus}
+        weekStatus={effectiveWeekStatus}
         onSaveDraft={handleSaveDraft}
         onSubmit={() => setShowSubmitModal(true)}
         onResubmit={handleResubmit}

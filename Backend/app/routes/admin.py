@@ -265,3 +265,4 @@ def managers_for_picker(db: Session = Depends(get_db)):
         }
         for e in rows
     ]
+

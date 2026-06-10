@@ -25,7 +25,10 @@ class TimesheetEntryOut(BaseModel):
     employee_id: Optional[int] = None
     entry_date: Optional[date_t] = None
     project_id: Optional[str] = None
+    project_name: Optional[str] = None          # resolved from Project.name — populated by get_timesheet
+    client_name: Optional[str] = None           # resolved from Project.client_name — populated by get_timesheet
     task_id: Optional[str] = None
+    task_name: Optional[str] = None             # resolved from Task.name — populated by get_timesheet
     logged_hours: Optional[float] = None
     is_billable: bool = True
     source: Optional[str] = None
@@ -77,6 +80,10 @@ class TimesheetOut(BaseModel):
     client_rejected_at: Optional[datetime] = None
     client_review_comment: Optional[str] = None
     has_mismatch: bool = False
+    # Derived / joined fields — not ORM columns; populated by route handlers
+    employee_name: Optional[str] = None
+    project_name: Optional[str] = None
+    client_name: Optional[str] = None
 
 
 class TimesheetDetailOut(TimesheetOut):

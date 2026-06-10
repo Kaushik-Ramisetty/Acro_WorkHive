@@ -9,7 +9,13 @@ const URL_TO_PAGE = (path) => {
   // /employee-dashboard or /employee-dashboard/<page>
   const trimmed = path.replace(/^\/+|\/+$/g, "").split("/");
   const seg = trimmed[1];
-  return seg && seg.length ? seg : "dashboard";
+  const sub = trimmed[2];
+
+  if (!seg || !seg.length) return "dashboard";
+  if ((seg === "finance-payroll" || seg === "finance-head-payroll") && sub) {
+    return `${seg}/${sub}`;
+  }
+  return seg;
 };
 
 export const AppProvider = ({ children }) => {

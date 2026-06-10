@@ -15,11 +15,12 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from datetime import date as date_t, datetime, timedelta
+from datetime import date as date_t, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel as _PydanticBase
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
@@ -108,24 +109,125 @@ def _ensure_owner_or_manager(actor: Employee, ts: Timesheet, db: Session) -> Non
     raise HTTPException(status_code=403, detail="Not allowed.")
 
 
+def _resolve_project_client(
+    ts_ids: list[str], db: Session
+) -> dict[str, tuple[Optional[str], Optional[str]]]:
+    """Return {ts_id: (project_name, client_name)} for each timesheet.
+
+    Uses one batched query against timesheet_entries + projects rather than
+    per-row lookups, so it is safe even for lists of ~200 rows.
+    """
+    if not ts_ids:
+        return {}
+    # Join entries → projects and group by timesheet_id so we get one project
+    # reference per timesheet regardless of how many entries it has.
+    from sqlalchemy import func as _agg
+    rows = (
+        db.query(
+            TimesheetEntry.timesheet_id,
+            _agg.min(Project.name),
+            _agg.min(Project.client_name),
+        )
+        .join(Project, Project.id == TimesheetEntry.project_id)
+        .filter(
+            TimesheetEntry.timesheet_id.in_(ts_ids),
+            TimesheetEntry.project_id.isnot(None),
+        )
+        .group_by(TimesheetEntry.timesheet_id)
+        .all()
+    )
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _enrich_ts_list(rows: list[Timesheet], db: Session) -> list:
+    """Bulk-enrich a list of Timesheet ORM objects into TimesheetOut dicts
+    that include employee_name, project_name, and client_name.
+
+    Three queries total (employees, entries+projects, tasks) regardless of list length.
+    """
+    if not rows:
+        return []
+
+    # 1. Batch-fetch employees
+    emp_ids  = list({r.employee_id for r in rows})
+    emp_map  = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+
+    # 2. Resolve project + client per timesheet
+    ts_ids       = [r.id for r in rows]
+    proj_client  = _resolve_project_client(ts_ids, db)
+
+    out = []
+    for r in rows:
+        obj = TimesheetOut.model_validate(r)
+        emp = emp_map.get(r.employee_id)
+        obj.employee_name = emp.full_name if emp else None
+        pc = proj_client.get(r.id)
+        if pc:
+            obj.project_name, obj.client_name = pc
+        out.append(obj)
+    return out
+
+
+def _enrich_ts_detail(ts: Timesheet, db: Session) -> TimesheetDetailOut:
+    """Enrich a single Timesheet into a TimesheetDetailOut with:
+    - employee_name
+    - project_name / client_name (from entries)
+    - entry-level client_name / project_name / task_name (batch-fetched)
+    """
+    out = TimesheetDetailOut.model_validate(ts)
+
+    # Employee name
+    emp = db.get(Employee, ts.employee_id)
+    out.employee_name = emp.full_name if emp else None
+
+    # Collect project/task IDs from entries once so detail views stay O(1) queries.
+    proj_ids = list({e.project_id for e in ts.entries if e.project_id})
+    task_ids = list({e.task_id for e in ts.entries if e.task_id})
+
+    projs = {p.id: p for p in db.query(Project).filter(Project.id.in_(proj_ids)).all()} if proj_ids else {}
+    tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_(task_ids)).all()} if task_ids else {}
+
+    # Set header-level project/client from first project found.
+    for pid in proj_ids:
+        proj = projs.get(pid)
+        if proj:
+            out.project_name = proj.name
+            out.client_name = proj.client_name
+            break
+
+    enriched = []
+    for e in ts.entries:
+        entry_out = TimesheetEntryOut.model_validate(e)
+        proj = projs.get(e.project_id) if e.project_id else None
+        task = tasks.get(e.task_id) if e.task_id else None
+        entry_out.project_name = proj.name if proj else None
+        entry_out.client_name = proj.client_name if proj else None
+        entry_out.task_name = task.name if task else None
+        enriched.append(entry_out)
+    out.entries = enriched
+
+    return out
+
+
 # ── Payroll cycle helper ─────────────────────────────────────────────
 
 def _payroll_cycle_dates(today: date_t) -> tuple[date_t, date_t]:
-    """Returns (period_start, period_end) for the current 25→25 payroll cycle.
+    """Returns (period_start, period_end) for the current 26→25 billing cycle.
 
-    If today ≤ 25: cycle is 25th of prev month → 25th of current month.
-    If today > 25: cycle is 25th of current month → 25th of next month.
+    If today ≤ 25: cycle is 26th of prev month → 25th of current month.
+    If today > 25: cycle is 26th of current month → 25th of next month.
     """
     if today.day <= 25:
-        prev_month = today.month - 1 if today.month > 1 else 12
-        prev_year  = today.year if today.month > 1 else today.year - 1
-        start = date_t(prev_year, prev_month, 25)
-        end   = date_t(today.year, today.month, 25)
+        first_of_month = today.replace(day=1)
+        last_of_prev   = first_of_month - timedelta(days=1)
+        start = last_of_prev.replace(day=26)
+        end   = today.replace(day=25)
     else:
-        start     = date_t(today.year, today.month, 25)
-        next_month = today.month + 1 if today.month < 12 else 1
-        next_year  = today.year if today.month < 12 else today.year + 1
-        end = date_t(next_year, next_month, 25)
+        start = today.replace(day=26)
+        if today.month == 12:
+            end = date_t(today.year + 1, 1, 25)
+        else:
+            end = date_t(today.year, today.month + 1, 25)
     return start, end
 
 
@@ -306,11 +408,11 @@ def client_token_action_post(
 
     # ── Approve ──────────────────────────────────────────────────────
     if action == "approve":
-        ts.status             = "pending_reporting_manager_review"
-        ts.client_approved_at = datetime.now()
-        ts.client_token       = None   # invalidate — single use
+        ts.status                = "pending_reporting_manager_review"
+        ts.client_approved_at    = now_utc()
+        ts.client_token          = None   # invalidate — single use
         if clean_comments:
-            ts.review_comment = clean_comments
+            ts.client_review_comment = clean_comments
 
         step_meta = _get_step_meta("client")
         _record_step(db, ts_id, "client", step_meta.get("sequence_order", 2),
@@ -330,7 +432,7 @@ def client_token_action_post(
 
         write_audit(db, actor_id=None, action="client_token_approve",
                     target_table="timesheets", target_id=ts.id,
-                    new_value={"status": ts.status, "review_comment": clean_comments or None})
+                    new_value={"status": ts.status, "client_review_comment": clean_comments or None})
         db.commit()
 
         return HTMLResponse(
@@ -350,10 +452,10 @@ def client_token_action_post(
             status_code=400,
         )
 
-    ts.status         = "client_rejected"
-    ts.is_locked      = False
-    ts.client_token   = None   # invalidate
-    ts.review_comment = clean_comments
+    ts.status                = "client_rejected"
+    ts.is_locked             = False
+    ts.client_token          = None   # invalidate
+    ts.client_review_comment = clean_comments
 
     step_meta = _get_step_meta("client")
     _record_step(db, ts_id, "client", step_meta.get("sequence_order", 2),
@@ -384,6 +486,220 @@ def client_token_action_post(
             "The employee and their reporting manager have been notified.",
         )
     )
+
+
+# ── Client-review JSON API (React approval page — no auth) ──────────
+
+class _ClientReviewIn(_PydanticBase):
+    token:   str
+    action:  str             # "approve" | "reject"
+    remarks: Optional[str] = None
+
+
+@router.get("/client-review")
+def client_review_info(token: str = Query(...), db: Session = Depends(get_db)):
+    """JSON — no auth required — timesheet info for the React client approval page."""
+    from app.services.timesheet_email import _CAL, _WEEKDAYS, _day_code, _fmt_date
+
+    payload = verify_client_token(token)
+    if not payload:
+        return {"valid": False, "error": "expired"}
+
+    ts_id = payload["ts_id"]
+    ts    = db.get(Timesheet, ts_id)
+    if not ts:
+        return {"valid": False, "error": "not_found"}
+
+    if ts.client_token != token:
+        return {"valid": False, "error": "already_processed"}
+
+    if ts.status not in {"pending_client_review", "pending"}:
+        return {"valid": False, "error": "already_processed"}
+
+    employee = db.get(Employee, ts.employee_id)
+    emp_name = employee.full_name if employee else f"Employee #{ts.employee_id}"
+    emp_code = (employee.employee_code or "—") if employee else "—"
+    desig    = (
+        getattr(employee.designation, "title", "N/A")
+        if employee and employee.designation else "N/A"
+    )
+
+    calendar: list[dict] = []
+    summary = {"present": 0, "absent": 0, "weekend_worked": 0, "holiday_worked": 0, "total_hours": 0.0}
+
+    if ts.period_start and ts.period_end:
+        att_records = (
+            db.query(AttendanceRecord)
+            .filter(
+                AttendanceRecord.employee_id == ts.employee_id,
+                AttendanceRecord.date >= ts.period_start,
+                AttendanceRecord.date <= ts.period_end,
+            )
+            .all()
+        )
+        att_map = {r.date: r for r in att_records}
+        cur = ts.period_start
+        while cur <= ts.period_end:
+            wd    = cur.weekday()
+            is_we = wd >= 5
+            rec   = att_map.get(cur)
+            s     = (rec.status if rec else "") or ""
+            code  = _day_code(s, is_we, bool(rec and rec.check_in_time))
+            hours = (rec.working_hours or 0.0) if rec else 0.0
+            summary["total_hours"] += hours
+            if code == "P":   summary["present"] += 1
+            elif code == "A": summary["absent"] += 1
+            elif code == "WW": summary["weekend_worked"] += 1
+            elif code == "HW": summary["holiday_worked"] += 1
+            calendar.append({
+                "date":       cur.isoformat(),
+                "day":        cur.day,
+                "day_abbr":   _WEEKDAYS[wd][:3],
+                "weekday":    wd,
+                "code":       code,
+                "is_weekend": is_we,
+                "hours":      round(hours, 2),
+                "bg":         _CAL[code][0],
+                "fg":         _CAL[code][1],
+            })
+            cur += timedelta(days=1)
+
+    project_name: Optional[str] = None
+    entry = (
+        db.query(TimesheetEntry)
+        .filter(TimesheetEntry.timesheet_id == ts_id, TimesheetEntry.project_id.isnot(None))
+        .first()
+    )
+    if entry and entry.project_id:
+        proj = db.get(Project, entry.project_id)
+        project_name = proj.name if proj else None
+
+    def _fmt_date_local(d) -> str:
+        from app.services.timesheet_email import _fmt_date as _fe_fmt
+        return _fe_fmt(d)
+
+    period_label = (
+        f"{_fmt_date_local(ts.period_start)} – {_fmt_date_local(ts.period_end)}"
+        if ts.period_start and ts.period_end else ""
+    )
+
+    return {
+        "valid":            True,
+        "ts_id":            ts_id,
+        "emp_name":         emp_name,
+        "emp_code":         emp_code,
+        "designation":      desig,
+        "period_start":     ts.period_start.isoformat() if ts.period_start else None,
+        "period_end":       ts.period_end.isoformat()   if ts.period_end   else None,
+        "period_label":     period_label,
+        "total_hours":      round(ts.total_logged_hours or 0.0, 2),
+        "status":           ts.status,
+        "submitted_at":     ts.submitted_at.isoformat() if ts.submitted_at else None,
+        "project_name":     project_name,
+        "employee_remarks": ts.review_comment or None,
+        "calendar":         calendar,
+        "summary":          {**summary, "total_hours": round(summary["total_hours"], 2)},
+    }
+
+
+@router.post("/client-review")
+def client_review_submit(body: _ClientReviewIn, db: Session = Depends(get_db)):
+    """JSON — no auth required — process client approval/rejection from the React page."""
+    payload = verify_client_token(body.token)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Invalid or expired approval link.")
+
+    ts_id = payload["ts_id"]
+    ts    = db.get(Timesheet, ts_id)
+    if not ts:
+        raise HTTPException(status_code=404, detail="Timesheet not found.")
+
+    if ts.client_token != body.token:
+        raise HTTPException(status_code=409, detail="This timesheet has already been reviewed.")
+
+    if ts.status not in {"pending_client_review", "pending"}:
+        raise HTTPException(status_code=409, detail=f"Already processed (status: {ts.status}).")
+
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'.")
+
+    clean_remarks = (body.remarks or "").strip()
+    if body.action == "reject" and not clean_remarks:
+        raise HTTPException(status_code=422, detail="A rejection reason is required.")
+
+    employee = db.get(Employee, ts.employee_id)
+    emp_name = employee.full_name if employee else f"Employee #{ts.employee_id}"
+
+    if body.action == "approve":
+        ts.status                = "pending_reporting_manager_review"
+        ts.client_approved_at    = now_utc()
+        ts.client_token          = None
+        if clean_remarks:
+            ts.client_review_comment = clean_remarks
+
+        step_meta = _get_step_meta("client")
+        _record_step(db, ts_id, "client", step_meta.get("sequence_order", 2),
+                     "approved", None, clean_remarks or "Approved via email link")
+
+        notify(db, recipient_id=ts.employee_id, type_="timesheet_review",
+               title="Timesheet Approved by Client Manager",
+               body=f"Your timesheet ({ts.period_start} → {ts.period_end}) has been approved.",
+               reference_table="timesheets", reference_id=ts.id)
+
+        if employee and employee.reporting_manager_id:
+            notify(db, recipient_id=employee.reporting_manager_id,
+                   type_="timesheet_submitted",
+                   title=f"Timesheet ready for review — {emp_name}",
+                   body=f"Client approved {ts.period_start} → {ts.period_end}.",
+                   reference_table="timesheets", reference_id=ts.id)
+
+        write_audit(db, actor_id=None, action="client_json_approve",
+                    target_table="timesheets", target_id=ts.id,
+                    new_value={"status": ts.status, "client_review_comment": clean_remarks or None})
+        db.commit()
+        return {
+            "success": True,
+            "action":  "approve",
+            "message": (
+                f"Timesheet for {ts.period_start} → {ts.period_end} has been approved "
+                "and forwarded to the Reporting Manager."
+            ),
+        }
+
+    # ── Reject ────────────────────────────────────────────────────────
+    ts.status                = "client_rejected"
+    ts.is_locked             = False
+    ts.client_token          = None
+    ts.client_review_comment = clean_remarks
+
+    step_meta = _get_step_meta("client")
+    _record_step(db, ts_id, "client", step_meta.get("sequence_order", 2),
+                 "rejected", None, clean_remarks)
+
+    notify(db, recipient_id=ts.employee_id, type_="timesheet_review",
+           title="Timesheet Rejected by Client Manager",
+           body=f"Reason: {clean_remarks[:200]}",
+           reference_table="timesheets", reference_id=ts.id)
+
+    if employee and employee.reporting_manager_id:
+        notify(db, recipient_id=employee.reporting_manager_id,
+               type_="timesheet_review",
+               title=f"Timesheet Rejected by Client — {emp_name}",
+               body=f"Client rejected {ts.period_start} → {ts.period_end}. Reason: {clean_remarks[:200]}",
+               reference_table="timesheets", reference_id=ts.id)
+
+    write_audit(db, actor_id=None, action="client_json_reject",
+                target_table="timesheets", target_id=ts.id,
+                new_value={"status": "client_rejected", "client_review_comment": clean_remarks})
+    db.commit()
+    return {
+        "success": True,
+        "action":  "reject",
+        "message": (
+            f"Timesheet for {ts.period_start} → {ts.period_end} has been rejected. "
+            "The employee has been notified."
+        ),
+    }
 
 
 # ── Monthly T&M payroll-cycle report ─────────────────────────────────
@@ -494,7 +810,7 @@ def submit_monthly_report(
         # Resubmit — update the existing record in-place
         ts = existing
         ts.status             = "pending_client_review"
-        ts.submitted_at       = datetime.now()
+        ts.submitted_at       = now_utc()
         ts.total_logged_hours = round(total_hours, 2)
         ts.review_comment     = payload.remarks
         ts.reviewed_by        = None
@@ -521,7 +837,7 @@ def submit_monthly_report(
             period_end=end,
             total_logged_hours=round(total_hours, 2),
             status="pending_client_review",
-            submitted_at=datetime.now(),
+            submitted_at=now_utc(),
             client_manager_id=payload.client_manager_id or None,
             client_manager_name=resolved_name,
             client_manager_email=resolved_email,
@@ -656,6 +972,20 @@ def create_timesheet(
     if payload.period_end < payload.period_start:
         raise HTTPException(status_code=400, detail="period_end must be >= period_start.")
 
+    # Idempotent create: return existing record if one already exists for this
+    # period rather than crashing with IntegrityError on the UniqueConstraint.
+    existing = (
+        db.query(Timesheet)
+        .filter(
+            Timesheet.employee_id == user.id,
+            Timesheet.period_start == payload.period_start,
+            Timesheet.period_end == payload.period_end,
+        )
+        .first()
+    )
+    if existing:
+        return _enrich_ts_detail(existing, db)
+
     ts = Timesheet(
         id=_next_ts_id(db),
         employee_id=user.id,
@@ -678,9 +1008,7 @@ def create_timesheet(
     )
     db.commit()
     db.refresh(ts)
-    out = TimesheetDetailOut.model_validate(ts)
-    out.entries = [TimesheetEntryOut.model_validate(e) for e in ts.entries]
-    return out
+    return _enrich_ts_detail(ts, db)
 
 
 @router.patch("/{ts_id}", response_model=TimesheetDetailOut)
@@ -784,8 +1112,13 @@ def submit_timesheet(
     if is_client_site and ts.client_token:
         try:
             send_client_approval_email(db, ts.id)
-        except Exception:
-            logger.warning("submit_timesheet: failed to send client approval email for %s", ts.id)
+        except Exception as exc:
+            logger.exception(
+                "submit_timesheet: failed to send client approval email for %s recipient=%s error=%s",
+                ts.id,
+                ts.client_manager_email,
+                exc,
+            )
 
     return TimesheetOut.model_validate(ts)
 
@@ -818,9 +1151,19 @@ def list_timesheets(
         q = q.filter(Timesheet.employee_id == user.id)
 
     if status:
-        q = q.filter(Timesheet.status == status.lower())
+        s = status.lower()
+        if s == "pending_review":
+            # "pending_review" is the manager's canonical pending status.
+            # Client-site timesheets land in "pending_reporting_manager_review"
+            # after the client email approval, which is functionally the same
+            # queue for the reporting manager.
+            q = q.filter(
+                Timesheet.status.in_(["pending_review", "pending_reporting_manager_review"])
+            )
+        else:
+            q = q.filter(Timesheet.status == s)
     rows = q.order_by(Timesheet.period_start.desc()).limit(200).all()
-    return [TimesheetOut.model_validate(r) for r in rows]
+    return _enrich_ts_list(rows, db)
 
 
 @router.get("/{ts_id}/monthly-detail", response_model=MonthlyReportDetailOut)
@@ -937,9 +1280,7 @@ def get_timesheet(
     if not ts:
         raise HTTPException(status_code=404, detail="Timesheet not found.")
     _ensure_owner_or_manager(user, ts, db)
-    out = TimesheetDetailOut.model_validate(ts)
-    out.entries = [TimesheetEntryOut.model_validate(e) for e in ts.entries]
-    return out
+    return _enrich_ts_detail(ts, db)
 
 
 # ── Step 14 + 15: Manager review + locking ───────────────────────────
@@ -961,7 +1302,10 @@ def review_timesheet(
     target = db.get(Employee, ts.employee_id)
     if role == "manager" and (not target or target.reporting_manager_id != user.id):
         raise HTTPException(status_code=403, detail="Not in your team.")
-    if (ts.status or "").lower() != "pending_review":
+    cur_status = (ts.status or "").lower()
+    # Accept both the standard pending status AND the client-site post-client-approval status.
+    _MANAGER_REVIEWABLE = {"pending_review", "pending_reporting_manager_review"}
+    if cur_status not in _MANAGER_REVIEWABLE:
         raise HTTPException(status_code=400, detail=f"Timesheet is in {ts.status} state.")
 
     decision = payload.decision.lower()
@@ -970,16 +1314,24 @@ def review_timesheet(
 
     old = {"status": ts.status}
     if decision == "approve":
-        ts.status = "approved"
-        ts.is_locked = True             # Step 15: lock on approval
-        ts.locked_at = now_utc()
+        if cur_status == "pending_reporting_manager_review":
+            # Client-site workflow: RM approval advances to reporting_manager_approved.
+            # HR/Finance still need to process — do NOT lock yet.
+            ts.status    = "reporting_manager_approved"
+            ts.is_locked = False
+            _record_step(db, ts.id, "rm", 3, "approved", user.id, payload.review_comment)
+        else:
+            # Standard (WFH / WFO) single-stage manager approval.
+            ts.status    = "approved"
+            ts.is_locked = True
+            ts.locked_at = now_utc()
     else:
-        ts.status = "rejected"
+        ts.status    = "rejected"
         ts.is_locked = False
 
-    ts.reviewed_by = user.id
+    ts.reviewed_by    = user.id
     ts.review_comment = payload.review_comment
-    ts.reviewed_at = now_utc()
+    ts.reviewed_at    = now_utc()
 
     notify(
         db,

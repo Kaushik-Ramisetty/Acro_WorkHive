@@ -336,7 +336,7 @@ export default function SalaryRevisionHistory() {
           </p>
           {revisions.length === 0 && (
             <p className="text-xs text-slate-400 mt-2">
-              Revisions are created automatically when salary structures are updated from the Salary Structures page.
+              Revisions are created automatically when salary master records are updated from the Salary Master page.
             </p>
           )}
         </div>

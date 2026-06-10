@@ -1,3 +1,15 @@
+/**
+ * Attendance finalization states shared across hooks and components.
+ * FINALIZED: attendance record is complete (check-in + check-out processed).
+ * PENDING_CHECKOUT: employee has checked in but not yet checked out.
+ * NO_ATTENDANCE: no record exists for this day.
+ */
+export const ATTENDANCE_STATUS = {
+  FINALIZED: 'FINALIZED',
+  PENDING_CHECKOUT: 'PENDING_CHECKOUT',
+  NO_ATTENDANCE: 'NO_ATTENDANCE',
+};
+
 export function fmtIso(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
@@ -43,4 +55,43 @@ export function formatWeekLabel(weekStart, { includeWeekends = false } = {}) {
   const fmt = (d) =>
     `${d.getDate()} ${d.toLocaleString('en-US', { month: 'short' })} ${d.getFullYear()}`;
   return `${fmt(start)} – ${fmt(end)}`;
+}
+
+/**
+ * Classify a week relative to today.
+ * Returns 'past' | 'current' | 'future'.
+ * Boundaries: Monday (weekStart) through Sunday (weekStart + 6 days) inclusive.
+ */
+export function classifyWeek(weekStart) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(weekStart);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  if (today < start) return 'future';
+  if (today > end) return 'past';
+  return 'current';
+}
+
+/**
+ * Canonical weekly-hours calculation shared by MetricCards, SubmitModal, and
+ * any other consumer that needs to display or validate the total for a week.
+ *
+ * Priority per day (mirrors HoursCell display logic):
+ *   1. FINALIZED attendance  → use effective_hours
+ *   2. PENDING_CHECKOUT      → 0  (not yet confirmed)
+ *   3. No / missing record   → fall back to entry.logged_hours
+ */
+export function computeWeeklyHours(entries, attendanceMap) {
+  return (entries || []).reduce((sum, entry) => {
+    const att = (attendanceMap || {})[entry.date];
+    if (att?.attendance_status === ATTENDANCE_STATUS.FINALIZED && att.effective_hours) {
+      return sum + att.effective_hours;
+    }
+    if (att?.attendance_status === ATTENDANCE_STATUS.PENDING_CHECKOUT) {
+      return sum;
+    }
+    return sum + (entry.logged_hours || 0);
+  }, 0);
 }

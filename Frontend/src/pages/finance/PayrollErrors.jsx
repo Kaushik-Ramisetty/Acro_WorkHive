@@ -5,6 +5,8 @@
  * and resolve errors with a resolution note.
  */
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
 import financeApi from '../../services/financeApi';
 
 const SEVERITY_META = {
@@ -93,6 +95,9 @@ function RunPicker({ runs, selectedId, onChange }) {
 }
 
 export default function PayrollErrors() {
+  const navigate = useNavigate();
+  const { role } = useAuth();
+  const isFinanceOnly = ['finance', 'admin'].includes((role || '').toLowerCase());
   const [runs, setRuns] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [errors, setErrors] = useState([]);
@@ -147,6 +152,14 @@ export default function PayrollErrors() {
           onResolved={() => loadErrors(selectedId)}
         />
       )}
+
+      <button
+        onClick={() => navigate('/employee-dashboard/finance-payroll')}
+        className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800 transition-colors"
+      >
+        <span className="text-lg leading-none">‹</span>
+        <span>Back to Dashboard</span>
+      </button>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -250,17 +263,18 @@ export default function PayrollErrors() {
                       )}
                     </div>
                   </div>
-                  {!e.is_resolved ? (
+                  {e.is_resolved && (
+                    <span className="rounded-lg bg-emerald-100 text-emerald-700 px-3 py-1.5 text-xs font-semibold flex-shrink-0">
+                      ✓ Resolved
+                    </span>
+                  )}
+                  {!e.is_resolved && isFinanceOnly && (
                     <button
                       onClick={() => setResolveTarget(e)}
                       className="rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-1.5 text-xs font-semibold hover:bg-emerald-100 transition flex-shrink-0"
                     >
                       Resolve
                     </button>
-                  ) : (
-                    <span className="rounded-lg bg-emerald-100 text-emerald-700 px-3 py-1.5 text-xs font-semibold flex-shrink-0">
-                      ✓ Resolved
-                    </span>
                   )}
                 </div>
               </div>

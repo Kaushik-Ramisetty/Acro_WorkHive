@@ -12,15 +12,22 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, role_required
 from app.models.employee import Employee
+try:
+    from app.models.onboarding import Candidate as _Candidate
+    _CANDIDATE_MODEL = _Candidate
+except ImportError:
+    _CANDIDATE_MODEL = None
 from app.models.payroll_extended import (
     StatutorySettings,
     PayrollAdjustment,
     Payslip,
 )
+from app.models.payroll import PayrollApproval, PayrollError
 from app.schemas.payroll import (
     PayrollRunCreate,
     PayrollRunOut,
@@ -56,6 +63,7 @@ from app.schemas.payroll_extended import (
     ReimbursementOut,
 )
 from app.services import payroll_service
+from app.services.payroll_bridge import aggregate_leave_days_for_payroll_month
 from app.services import statutory_service
 from app.services import payslip_service
 from app.services import payroll_schema_service
@@ -64,17 +72,41 @@ from app.services.ctc_engine import compute_from_ctc
 router = APIRouter(
     prefix="/finance",
     tags=["Finance"],
-    dependencies=[Depends(role_required("finance", "admin", "finance_head"))],
+    dependencies=[Depends(role_required("finance", "admin", "finance_head", "hr"))],
 )
 
 FinanceUser = Depends(role_required("finance", "admin", "finance_head"))
-FinanceHeadUser = Depends(role_required("finance_head", "admin"))
-# Finance-only actions (Finance Head is excluded — they cannot publish or generate payslips)
+PayrollRecordsUser = Depends(role_required("finance", "admin", "finance_head", "hr"))
+FinanceHeadUser = Depends(role_required("finance_head"))
+# Finance-only actions (Finance Head and HR are excluded)
 FinanceOnlyUser = Depends(role_required("finance", "admin"))
+# HR/Admin actions (attendance freeze) — Finance cannot freeze; HR cannot generate payroll
+HrAdminUser = Depends(role_required("hr", "admin"))
+SalaryStructureWriteUser = Depends(role_required("hr", "admin", "finance"))
+# Compliance/export reports: Finance + Finance Head only — HR is explicitly excluded
+# (bank advice, PF/ESI/PT/TDS registers, payroll register, bonus/variable/reimbursement/gratuity reports, Form 16)
+ComplianceReportUser = Depends(role_required("finance", "admin", "finance_head"))
+
+SALARY_REVISION_WORKFLOW_REQUIRED = (
+    "Salary revisions must follow the HR request -> Finance review -> "
+    "Finance Head approval workflow. Direct salary revision writes are not allowed."
+)
 
 _FINANCE_REVIEW_ACTIONS = {"approve", "finance_review", "reject"}
-_FINANCE_HEAD_ACTIONS = {"head_approve", "finance_head_approve", "head_reject"}
+_FINANCE_HEAD_ACTIONS = {"head_approve", "finance_head_approve", "head_reject", "hr_confirm"}
 _REJECT_ACTIONS = {"reject", "head_reject"}
+_FINANCE_HEAD_APPROVED_STATUSES = {
+    "approved",
+    "payslip_generated",
+    "bank_advice_generated",
+    "published",
+    "completed",
+    "closed",
+    "disbursed",
+}
+FINAL_APPROVAL_REQUIRED_DETAIL = (
+    "Finance Head final approval is required before generating or downloading payroll completion reports."
+)
 
 
 def _actor_role(actor: Employee) -> str:
@@ -101,6 +133,112 @@ def _require_reject_reason(action: str, remarks: Optional[str]) -> None:
         )
 
 
+def _block_direct_salary_revision() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=SALARY_REVISION_WORKFLOW_REQUIRED,
+    )
+
+
+def _block_existing_salary_structure_revision(db: Session, employee_id: int) -> None:
+    if payroll_service.get_salary_structure(db, employee_id):
+        _block_direct_salary_revision()
+
+
+def _require_payroll_records(db: Session, run_id: int) -> int:
+    """Gate that ensures payroll records were generated before finance actions."""
+    try:
+        return payroll_service.ensure_payroll_records_exist(db, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _require_final_approved_run(db: Session, run_id: int):
+    run = payroll_service.get_payroll_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not payroll_service.is_final_approved_run(run):
+        raise HTTPException(status_code=400, detail=FINAL_APPROVAL_REQUIRED_DETAIL)
+    _require_payroll_records(db, run_id)
+    return run
+
+
+def _require_run_editable(db: Session, run_id: int) -> None:
+    run = payroll_service.get_payroll_run(db, run_id)
+    if run and (run.payroll_locked or run.status in _FINANCE_HEAD_APPROVED_STATUSES):
+        raise HTTPException(status_code=400, detail="Final approved payroll cannot be edited.")
+
+
+def _finance_review_completed(db: Session, run_id: int, status_value: str) -> bool:
+    if db.query(PayrollApproval).filter(
+        PayrollApproval.run_id == run_id,
+        PayrollApproval.approval_level == "FINANCE_REVIEW",
+        PayrollApproval.approval_status == "APPROVED",
+    ).first() is not None:
+        return True
+    return status_value in _FINANCE_HEAD_APPROVED_STATUSES
+
+
+def _decorate_run_review_fields(db: Session, run):
+    if not run:
+        return run
+    payroll_service.normalize_payroll_run_period(run)
+
+    open_errors = (
+        db.query(PayrollError)
+        .filter(PayrollError.run_id == run.id, PayrollError.is_resolved.is_(False))
+        .count()
+    )
+    payslip_generated_count = db.query(Payslip).filter(Payslip.run_id == run.id).count()
+    payslip_published_count = (
+        db.query(Payslip)
+        .filter(Payslip.run_id == run.id, Payslip.is_published.is_(True))
+        .count()
+    )
+
+    run.open_errors = open_errors
+    run.finance_reviewed = _finance_review_completed(db, run.id, run.status)
+    run.finance_head_approved = run.status in _FINANCE_HEAD_APPROVED_STATUSES
+    run.payslip_generation_unlocked = run.status == "approved"
+    run.payslip_generated_count = payslip_generated_count
+    run.payslip_published_count = payslip_published_count
+    run.is_read_only = bool(
+        run.payroll_locked
+        or run.status in (
+            "approved", "payslip_generated", "bank_advice_generated",
+            "published", "completed", "closed", "disbursed", "cancelled",
+        )
+    )
+
+    # Expose Finance Head return info so Finance users can see who returned it and why.
+    # Only meaningful while the run is back in under_review after a head_reject.
+    head_rejection = None
+    if run.status == "under_review":
+        head_rejection = (
+            db.query(PayrollApproval)
+            .filter(
+                PayrollApproval.run_id == run.id,
+                PayrollApproval.approval_level == "FINANCE_HEAD_APPROVAL",
+                PayrollApproval.approval_status == "REJECTED",
+            )
+            .order_by(PayrollApproval.created_at.desc())
+            .first()
+        )
+    if head_rejection:
+        actor = head_rejection.actor
+        run.head_return_reason = head_rejection.remarks or head_rejection.comments or ""
+        run.head_return_at = head_rejection.created_at
+        run.head_returned_by = (
+            f"{actor.first_name} {actor.last_name or ''}".strip() if actor else "Finance Head"
+        )
+    else:
+        run.head_return_reason = None
+        run.head_return_at = None
+        run.head_returned_by = None
+
+    return run
+
+
 def _pre_gross(row) -> float:
     return float(row.gross_earnings or 0.0)
 
@@ -110,7 +248,12 @@ def _pre_basic(row) -> float:
 
 
 def _pre_allowance(row) -> float:
-    return float(row.special_allowance or 0.0)
+    return round(
+        payroll_service.payslip_earnings_total(row)
+        - float(row.basic_pay or 0.0)
+        - float(row.hra or 0.0),
+        2,
+    )
 
 
 def _pre_employee_pf(row) -> float:
@@ -138,10 +281,12 @@ def _pre_net(row) -> float:
 @router.get("/dashboard", summary="Finance dashboard stats")
 def finance_dashboard(
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     stats = payroll_service.get_dashboard_stats(db)
     run = stats["current_run"]
+    if run:
+        _decorate_run_review_fields(db, run)
     return {
         "current_run": PayrollRunOut.model_validate(run) if run else None,
         "total_payroll_runs": stats["total_payroll_runs"],
@@ -173,9 +318,10 @@ def list_runs(
     limit: int = 20,
     offset: int = 0,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
-    return payroll_service.list_payroll_runs(db, limit=limit, offset=offset)
+    runs = payroll_service.list_payroll_runs(db, limit=limit, offset=offset)
+    return [_decorate_run_review_fields(db, run) for run in runs]
 
 
 @router.post("/runs", response_model=PayrollRunOut, status_code=status.HTTP_201_CREATED,
@@ -183,21 +329,22 @@ def list_runs(
 def create_run(
     body: PayrollRunCreate,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
-    return payroll_service.create_payroll_run(db, body.model_dump(), actor)
+    run = payroll_service.create_payroll_run(db, body.model_dump(), actor)
+    return _decorate_run_review_fields(db, run)
 
 
 @router.get("/runs/{run_id}", response_model=PayrollRunOut, summary="Get payroll run details")
 def get_run(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     run = payroll_service.get_payroll_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Payroll run not found")
-    return run
+    return _decorate_run_review_fields(db, run)
 
 
 @router.post("/runs/{run_id}/action", response_model=PayrollRunOut,
@@ -212,13 +359,15 @@ def run_action(
     if action in _FINANCE_REVIEW_ACTIONS:
         _require_action_role(actor, {"finance", "admin"}, action)
     if action in _FINANCE_HEAD_ACTIONS:
-        _require_action_role(actor, {"finance_head", "admin"}, action)
+        _require_action_role(actor, {"finance_head"}, action)
+    # Attendance freeze is an HR/Admin action — Finance cannot freeze attendance.
+    if action == "freeze_attendance":
+        _require_action_role(actor, {"hr", "admin"}, action)
     _require_reject_reason(action, body.remarks)
 
-    # Finance Head may NOT generate payslips or publish — those are Finance-only actions
-    _finance_head_blocked = {"generate_payslips", "publish", "recompute", "generate", "process"}
+    # Finance Head can only perform final approval or return-to-Finance actions.
     actor_role = _actor_role(actor)
-    if actor_role == "finance_head" and action in _finance_head_blocked:
+    if actor_role == "finance_head" and action not in _FINANCE_HEAD_ACTIONS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -226,16 +375,25 @@ def run_action(
                 "Finance Head may only perform Final Approval or Return to Finance."
             ),
         )
+    # If Finance clicks "Generate Payroll" on a run already in processing state
+    # (e.g. after a prior partial failure that left 0 employee records), treat the
+    # action as a recompute so they get fresh records rather than a 400 error.
+    effective_action = action
+    if action == "generate":
+        existing_run = payroll_service.get_payroll_run(db, run_id)
+        if existing_run and existing_run.status == "processing" and existing_run.total_employees == 0:
+            effective_action = "recompute"
+
     try:
-        run = payroll_service.advance_run_status(db, run_id, action, body.remarks, actor)
+        run = payroll_service.advance_run_status(db, run_id, effective_action, body.remarks, actor)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if action in ("approve", "head_approve", "finance_head_approve", "hr_confirm", "finalize", "disburse", "close"):
+    if effective_action in ("approve", "head_approve", "finance_head_approve", "hr_confirm", "finalize", "close"):
         try:
             payroll_schema_service.populate_tax_deductions_for_run(db, run)
         except Exception:
             pass
-    return run
+    return _decorate_run_review_fields(db, run)
 
 
 @router.post("/runs/{run_id}/process", response_model=PayrollRunOut,
@@ -243,10 +401,11 @@ def run_action(
 def process_run(
     run_id: int,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     try:
-        return payroll_service.advance_run_status(db, run_id, "process", "Payroll processed", actor)
+        run = payroll_service.advance_run_status(db, run_id, "process", "Payroll processed", actor)
+        return _decorate_run_review_fields(db, run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -256,10 +415,11 @@ def process_run(
 def submit_run_for_approval(
     run_id: int,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     try:
-        return payroll_service.advance_run_status(db, run_id, "submit_for_approval", None, actor)
+        run = payroll_service.advance_run_status(db, run_id, "submit_for_approval", None, actor)
+        return _decorate_run_review_fields(db, run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -279,7 +439,7 @@ def approve_run_level(
     if level == "FINANCE_REVIEW":
         _require_action_role(actor, {"finance", "admin"}, "finance_review")
     if level == "FINANCE_HEAD_APPROVAL":
-        _require_action_role(actor, {"finance_head", "admin"}, "finance_head_approve")
+        _require_action_role(actor, {"finance_head"}, "finance_head_approve")
     if level == "HR_CONFIRMATION":
         _require_action_role(actor, {"admin"}, "hr_confirm")
 
@@ -296,7 +456,8 @@ def approve_run_level(
         raise HTTPException(status_code=400, detail=f"Unsupported approval level '{level}'")
     _require_reject_reason(action, comments)
     try:
-        return payroll_service.advance_run_status(db, run_id, action, comments, actor)
+        run = payroll_service.advance_run_status(db, run_id, action, comments, actor)
+        return _decorate_run_review_fields(db, run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -309,7 +470,7 @@ def final_approve_run(
     db: Session = Depends(get_db),
     actor: Employee = FinanceHeadUser,
 ):
-    """Only users with the 'finance_head' or 'admin' role may call this endpoint.
+    """Only users with the 'finance_head' role may call this endpoint.
     Approving locks the payroll permanently; recompute/edit are blocked afterwards.
     """
     body = body or {}
@@ -318,7 +479,8 @@ def final_approve_run(
     action = "finance_head_approve" if approved else "head_reject"
     _require_reject_reason(action, comments)
     try:
-        return payroll_service.advance_run_status(db, run_id, action, comments, actor)
+        run = payroll_service.advance_run_status(db, run_id, action, comments, actor)
+        return _decorate_run_review_fields(db, run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -329,12 +491,13 @@ def finalize_run(
     run_id: int,
     body: Optional[dict] = None,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     try:
-        return payroll_service.advance_run_status(
+        run = payroll_service.advance_run_status(
             db, run_id, "finalize", (body or {}).get("remarks"), actor
         )
+        return _decorate_run_review_fields(db, run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -342,18 +505,30 @@ def finalize_run(
 @router.post("/runs/{run_id}/publish", summary="Publish generated payslips (Finance/Admin only)")
 def publish_run(
     run_id: int,
-    send_email: bool = False,
     db: Session = Depends(get_db),
     actor: Employee = FinanceOnlyUser,  # Finance Head cannot publish — Finance team only
 ):
     try:
-        count = payroll_service.bulk_publish_payslips(db, run_id, actor)
+        # send_notification_email=False here because we handle HTML emails below
+        # via notify_payslips_published (same as the action-route publish path).
+        # Bell notifications are still written by _dispatch_payslip_published_notifications.
+        count = payroll_service.bulk_publish_payslips(
+            db,
+            run_id,
+            actor,
+            send_notification_email=False,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    email_result = {"sent": 0, "failed": 0, "skipped": 0}
-    if send_email:
-        email_result = payslip_service.send_payslip_emails_for_run(db, run_id)
-    return {"published": count, "email": email_result}
+    # Send HTML payslip emails to each employee via WorkHive SMTP
+    try:
+        from app.services import payroll_notifications as _pn
+        run = payroll_service.get_payroll_run(db, run_id)
+        if run:
+            _pn.notify_payslips_published(db, run)
+    except Exception:
+        pass
+    return {"published": count}
 
 
 # ─── Run Employees ────────────────────────────────────────────────────────────
@@ -363,9 +538,31 @@ def publish_run(
 def run_employees(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
+    from app.models.payroll import PayrollRun
+    from app.models.monthly_attendance_summary import MonthlyAttendanceSummary as _MAS
+
+    _run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    if not _run:
+        raise HTTPException(status_code=404, detail=f"Payroll run {run_id} not found")
+
     rows = payroll_service.list_run_employees(db, run_id)
+    if not rows:
+        return []
+
+    # Build a MAS lop_days lookup to overlay stored values — ensures Finance always
+    # shows the same LOP as HR/Admin (monthly_attendance_summary is the source of truth).
+    _mas_lop: dict[int, int] = {}
+    if _run.pay_period_start:
+        _m = _run.pay_period_start.month
+        _y = _run.pay_period_start.year
+        _mas_rows = (
+            db.query(_MAS)
+            .filter(_MAS.month == _m, _MAS.year == _y)
+            .all()
+        )
+        _mas_lop = {r.employee_id: int(r.lop_days or 0) for r in _mas_rows}
 
     # Pre-load adjustments for this run to avoid N+1 queries
     all_adjustments = payroll_service.list_adjustments(db, run_id)
@@ -373,10 +570,21 @@ def run_employees(
     for a in all_adjustments:
         adj_by_emp.setdefault(a.employee_id, []).append(a)
 
+    open_errors = (
+        db.query(PayrollError)
+        .filter(PayrollError.run_id == run_id, PayrollError.is_resolved.is_(False))
+        .all()
+    )
+    error_by_emp: dict[int, PayrollError] = {}
+    for err in open_errors:
+        error_by_emp.setdefault(err.employee_id, err)
+
     result = []
     for row in rows:
         emp = row.employee
         adjs = adj_by_emp.get(row.employee_id, [])
+        row_error = error_by_emp.get(row.employee_id)
+        row_reason = row.variance_reason or (row_error.description if row_error else None)
         bonus_total = round(sum(
             a.amount for a in adjs
             if a.adjustment_type == "bonus" and a.direction == "addition"
@@ -392,28 +600,50 @@ def run_employees(
         gross = _pre_gross(row)
         basic = _pre_basic(row)
         allowance = _pre_allowance(row)
+        earnings_components = payroll_service.payslip_earning_components(row)
+        earnings_total = round(sum(c["amount"] for c in earnings_components), 2)
+        earnings_delta = round(gross - earnings_total, 2)
+        attendance_summary = payroll_service.payslip_attendance_summary(row)
+        # Overlay LOP from MAS if available — same source as HR/Admin view
+        if row.employee_id in _mas_lop:
+            mas_lop = _mas_lop[row.employee_id]
+            attendance_summary = dict(attendance_summary)
+            attendance_summary["lop_days"] = mas_lop
+            # Recalculate payable_days = working_days - lop (keep present+leave as-is)
+            wd = attendance_summary.get("working_days") or 0
+            attendance_summary["payable_days"] = float(max(0, wd - mas_lop))
         employee_pf = _pre_employee_pf(row)
         employer_pf = _pre_employer_pf(row)
         employee_esi = _pre_employee_esi(row)
         employer_esi = _pre_employer_esi(row)
         net = _pre_net(row)
+        ss = row.salary_structure
+        row_variance_flag = bool(row.variance_flag)
+        if payroll_service.is_false_salary_assignment_variance(row):
+            row_variance_flag = False
+            row_reason = None
         out = PayrollRunEmployeeOut(
             id=row.id,
             payroll_record_id=row.id,
             run_id=row.run_id,
             payroll_run_id=row.run_id,
             employee_id=row.employee_id,
+            employee_code=(emp.employee_code or f"EMP{emp.id:04d}") if emp else None,
             employee_name=f"{emp.first_name} {emp.last_name}" if emp else "—",
             department=emp.department.name if emp and emp.department else "—",
             designation=emp.designation.title if emp and emp.designation else "—",
             salary_structure_id=row.salary_structure_id,
             salary_assignment_id=row.salary_assignment_id,
+            annual_ctc=ss.annual_ctc if ss else 0.0,
             total_working_days=row.total_working_days or row.working_days,
-            working_days=row.working_days,
-            payable_days=row.payable_days or row.present_days,
-            present_days=row.present_days,
-            leave_days=row.leave_days,
-            lop_days=row.lop_days,
+            working_days=attendance_summary["working_days"],
+            payable_days=attendance_summary["payable_days"],
+            present_days=attendance_summary["present_days"],
+            leave_days=attendance_summary["leave_days"],
+            lop_days=attendance_summary["lop_days"],
+            holiday_days=attendance_summary["holiday_days"],
+            attendance_reconciled=attendance_summary["attendance_reconciled"],
+            attendance_reconciliation_delta=attendance_summary["attendance_reconciliation_delta"],
             gross_salary=gross,
             gross_earnings=gross,
             basic=basic,
@@ -427,6 +657,9 @@ def run_employees(
             variable_pay=row.variable_pay,
             overtime_amount=row.overtime_amount,
             allowances=allowance,
+            earnings_components=earnings_components,
+            earnings_total=earnings_total,
+            earnings_reconciliation_delta=earnings_delta,
             employee_pf=employee_pf,
             pf_employee=employee_pf,
             pf_employer=employer_pf,
@@ -449,8 +682,8 @@ def run_employees(
             is_locked=row.is_locked,
             payslip_generated=row.payslip_generated,
             record_status=row.record_status,
-            variance_flag=row.variance_flag,
-            variance_reason=row.variance_reason,
+            variance_flag=row_variance_flag,
+            variance_reason=row_reason,
             payslip_url=row.payslip_url,
             migration_completed=row.migration_completed,
         )
@@ -464,9 +697,12 @@ def mark_payslip(
     run_id: int,
     employee_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = FinanceOnlyUser,
 ):
-    ok = payroll_service.mark_payslip_generated(db, run_id, employee_id)
+    try:
+        ok = payroll_service.mark_payslip_generated(db, run_id, employee_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not ok:
         raise HTTPException(status_code=404, detail="Employee record not found in this run")
     return {"detail": "Payslip marked as generated"}
@@ -479,7 +715,7 @@ def mark_payslip(
 def run_approvals(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     from app.models.payroll import PayrollApproval
     approvals = (
@@ -521,7 +757,7 @@ def list_errors(
     run_id: int,
     resolved: Optional[bool] = None,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     errors = payroll_service.list_payroll_errors(db, run_id, resolved)
     result = []
@@ -549,11 +785,15 @@ def create_error(
     run_id: int,
     body: PayrollErrorCreate,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
+    _require_run_editable(db, run_id)
     data = body.model_dump()
     data["run_id"] = run_id
-    return payroll_service.create_payroll_error(db, data, actor)
+    try:
+        return payroll_service.create_payroll_error(db, data, actor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.patch("/errors/{error_id}/resolve", response_model=PayrollErrorOut,
@@ -562,7 +802,7 @@ def resolve_error(
     error_id: int,
     body: PayrollErrorResolve,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     try:
         err = payroll_service.resolve_payroll_error(db, error_id, body.resolution_note, actor)
@@ -581,7 +821,8 @@ def resolve_error(
             created_at=err.created_at,
         )
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        status_code = 400 if "Final approved" in str(e) else 404
+        raise HTTPException(status_code=status_code, detail=str(e))
 
 
 # ─── Employees list (for dropdowns / payroll assignment) ─────────────────────
@@ -589,7 +830,7 @@ def resolve_error(
 @router.get("/employees", summary="List active employees for payroll assignment")
 def list_employees_for_payroll(
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     employees = (
         db.query(Employee)
@@ -606,6 +847,7 @@ def list_employees_for_payroll(
             "email": emp.email or "",
             "department": emp.department.name if emp.department else "—",
             "designation": emp.designation.title if emp.designation else "—",
+            "date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
         })
     return result
 
@@ -616,7 +858,7 @@ def list_employees_for_payroll(
             summary="List all salary structures")
 def list_structures(
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     structures = payroll_service.list_salary_structures(db)
     result = []
@@ -634,7 +876,7 @@ def list_structures(
 def get_structure(
     employee_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     ss = payroll_service.get_salary_structure(db, employee_id)
     if not ss:
@@ -651,7 +893,7 @@ def get_structure(
 def get_structure_history(
     employee_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     history = payroll_service.list_salary_structure_history(db, employee_id)
     result = []
@@ -669,8 +911,9 @@ def get_structure_history(
 def upsert_structure(
     body: SalaryStructureIn,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = SalaryStructureWriteUser,
 ):
+    _block_existing_salary_structure_revision(db, body.employee_id)
     struct = payroll_service.upsert_salary_structure(db, body.model_dump(), actor)
     try:
         payroll_schema_service.sync_employee_salary_from_structure(db, struct)
@@ -684,8 +927,9 @@ def upsert_structure(
 def structure_from_ctc(
     body: CTCComputeIn,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = SalaryStructureWriteUser,
 ):
+    _block_existing_salary_structure_revision(db, body.employee_id)
     struct = payroll_service.upsert_salary_structure_from_ctc(
         db,
         employee_id=body.employee_id,
@@ -709,7 +953,7 @@ def structure_from_ctc(
 def preview_ctc(
     body: CTCComputeIn,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = SalaryStructureWriteUser,
 ):
     b = compute_from_ctc(body.annual_ctc, db)
     return CTCComputeOut(
@@ -814,76 +1058,7 @@ def create_salary_revision(
     updates employee_salary_assignments, and writes a SalaryRevisionLog audit
     entry.  Existing payroll runs and payslips are never modified.
     """
-    try:
-        new_struct = payroll_service.create_salary_revision(
-            db=db,
-            employee_id=body.employee_id,
-            new_ctc_annual=body.new_ctc_annual,
-            effective_from=body.effective_from,
-            assigned_by=actor,
-            revision_reason=body.revision_reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    revisions = payroll_service.list_salary_revisions(
-        db, employee_id=body.employee_id, limit=1
-    )
-    if revisions:
-        rev = revisions[0]
-        emp = new_struct.employee
-        revised_by = rev.revised_by
-        return SalaryRevisionOut(
-            id=rev.id,
-            employee_id=rev.employee_id,
-            employee_name=(
-                f"{emp.first_name} {emp.last_name or ''}".strip() if emp else None
-            ),
-            employee_code=(
-                (emp.employee_code or f"EMP{emp.id:04d}") if emp else None
-            ),
-            old_annual_ctc=rev.old_annual_ctc,
-            new_annual_ctc=rev.new_annual_ctc,
-            ctc_difference=rev.ctc_difference,
-            ctc_change_pct=rev.ctc_change_pct,
-            old_gross_monthly=rev.old_gross_monthly,
-            new_gross_monthly=rev.new_gross_monthly,
-            old_net_monthly=rev.old_net_monthly,
-            new_net_monthly=rev.new_net_monthly,
-            effective_from=rev.effective_from,
-            revision_reason=rev.revision_reason,
-            revised_by_id=rev.revised_by_id,
-            revised_by_name=(
-                f"{revised_by.first_name} {revised_by.last_name or ''}".strip()
-                if revised_by else None
-            ),
-            created_at=rev.created_at,
-        )
-
-    emp = new_struct.employee
-    return SalaryRevisionOut(
-        id=new_struct.id,
-        employee_id=body.employee_id,
-        employee_name=(
-            f"{emp.first_name} {emp.last_name or ''}".strip() if emp else None
-        ),
-        employee_code=(
-            (emp.employee_code or f"EMP{emp.id:04d}") if emp else None
-        ),
-        old_annual_ctc=0.0,
-        new_annual_ctc=new_struct.annual_ctc,
-        ctc_difference=new_struct.annual_ctc,
-        ctc_change_pct=0.0,
-        old_gross_monthly=0.0,
-        new_gross_monthly=new_struct.gross_monthly,
-        old_net_monthly=0.0,
-        new_net_monthly=new_struct.net_monthly,
-        effective_from=new_struct.effective_from,
-        revision_reason=body.revision_reason,
-        revised_by_id=actor.id,
-        revised_by_name=f"{actor.first_name} {actor.last_name or ''}".strip(),
-        created_at=new_struct.created_at,
-    )
+    _block_direct_salary_revision()
 
 
 @router.get("/salary-revisions",
@@ -976,8 +1151,9 @@ def add_adjustment(
     run_id: int,
     body: PayrollAdjustmentIn,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
+    _require_run_editable(db, run_id)
     data = body.model_dump()
     data["run_id"] = run_id
     try:
@@ -990,8 +1166,12 @@ def add_adjustment(
 def delete_adjustment(
     adj_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = FinanceOnlyUser,
 ):
+    adj = db.query(PayrollAdjustment).filter(PayrollAdjustment.id == adj_id).first()
+    if not adj:
+        raise HTTPException(status_code=404, detail="Adjustment not found")
+    _require_run_editable(db, adj.run_id)
     try:
         ok = payroll_service.delete_adjustment(db, adj_id)
     except ValueError as e:
@@ -1007,7 +1187,7 @@ def delete_adjustment(
 def list_run_payslips(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
     slips = payroll_service.list_payslips(db, run_id=run_id)
     return [_payslip_to_out(s) for s in slips]
@@ -1019,8 +1199,12 @@ def download_payslip_pdf(
     run_id: int,
     employee_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = PayrollRecordsUser,
 ):
+    _require_final_approved_run(db, run_id)
+    slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=employee_id).first()
+    if not slip:
+        raise HTTPException(status_code=400, detail="Generate payslips before downloading payslip PDFs.")
     pdf_bytes = payslip_service.generate_payslip_pdf(db, run_id, employee_id)
     if pdf_bytes is None:
         raise HTTPException(
@@ -1028,7 +1212,6 @@ def download_payslip_pdf(
             detail="PDF generation unavailable. Install 'reportlab' to enable payslip PDFs."
         )
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
-    slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=employee_id).first()
     if slip:
         slip.download_count = (slip.download_count or 0) + 1
         db.commit()
@@ -1047,16 +1230,20 @@ def publish_payslip(
     run_id: int,
     employee_id: int,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     slip = db.query(Payslip).filter_by(run_id=run_id, employee_id=employee_id).first()
     if not slip:
         raise HTTPException(status_code=404, detail="Payslip record not found")
     run = payroll_service.get_payroll_run(db, run_id)
-    if run and run.status not in ("approved", "payslip_generated", "published", "closed", "disbursed"):
+    if (
+        not run
+        or not payroll_service.is_final_approved_run(run)
+        or run.status not in ("bank_advice_generated", "published", "completed", "closed", "disbursed")
+    ):
         raise HTTPException(
             status_code=400,
-            detail="Payslip cannot be published before finance head approval."
+            detail="Generate bank advice after payslip generation before publishing to ESS."
         )
     try:
         slip = payroll_service.publish_payslip(db, slip.id, actor)
@@ -1071,15 +1258,26 @@ def publish_all_payslips(
     run_id: int,
     send_email: bool = True,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
     run = payroll_service.get_payroll_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status not in ("approved", "payslip_generated", "published", "disbursed", "closed"):
-        raise HTTPException(status_code=400, detail="Run must be approved before publishing payslips")
+    if (
+        not payroll_service.is_final_approved_run(run)
+        or run.status not in ("bank_advice_generated", "published", "completed", "disbursed", "closed")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Generate bank advice before bulk-publishing payslips to ESS.",
+        )
     try:
-        count = payroll_service.bulk_publish_payslips(db, run_id, actor)
+        count = payroll_service.bulk_publish_payslips(
+            db,
+            run_id,
+            actor,
+            send_notification_email=not send_email,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     email_result = {"sent": 0, "failed": 0, "skipped": 0}
@@ -1094,17 +1292,95 @@ def publish_all_payslips(
 
 # ─── Bank Advice Export ───────────────────────────────────────────────────────
 
+@router.post("/runs/{run_id}/generate-bank-advice",
+             summary="Generate and store bank advice for a payroll run")
+def generate_bank_advice(
+    run_id: int,
+    db: Session = Depends(get_db),
+    actor: Employee = FinanceOnlyUser,
+):
+    """Generate bank advice and advance run status: payslip_generated → bank_advice_generated.
+
+    Sprint 3: this step is now mandatory before payslips can be published to employees.
+    Calling this endpoint when the run is already in bank_advice_generated or later
+    is idempotent — the CSV is regenerated and downloaded but the status is not re-advanced.
+    """
+    from datetime import datetime as _dt
+    run = payroll_service.get_payroll_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Payroll run not found")
+    if not payroll_service.is_final_approved_run(run) and run.status not in ("payslip_generated",):
+        raise HTTPException(
+            status_code=400,
+            detail="Bank advice can only be generated after Finance Head approval and payslip generation.",
+        )
+    try:
+        payslip_service.generate_bank_advice_csv(db, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    period = (run.month_label or f"run{run_id}").replace(" ", "_")
+    now = _dt.utcnow()
+    try:
+        run.bank_advice_path = f"bank_advice/{period}_{run_id}.csv"
+        db.commit()
+    except Exception:
+        pass
+    # Advance state machine: payslip_generated → bank_advice_generated
+    if run.status == "payslip_generated":
+        try:
+            payroll_service.advance_run_status(
+                db, run_id, "generate_bank_advice",
+                f"Bank advice generated for {run.month_label}.",
+                actor,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        # Already past this step — just log the re-download
+        try:
+            payroll_service._log_audit(db, run_id, actor.id, "bank_advice_downloaded",
+                                       f"Bank advice re-generated for {run.month_label}")
+            db.commit()
+        except Exception:
+            pass
+    return {
+        "detail": "Bank advice generated successfully",
+        "run_id": run_id,
+        "bank_advice_path": getattr(run, "bank_advice_path", None),
+        "bank_advice_generated_at": now.isoformat(),
+        "bank_advice_status": "generated",
+    }
+
+
 @router.get("/runs/{run_id}/bank-advice",
             summary="Download bank advice CSV for salary transfer")
 def download_bank_advice(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,  # HR excluded — bank advice contains salary-sensitive data
 ):
-    run = payroll_service.get_payroll_run(db, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    csv_content = payslip_service.generate_bank_advice_csv(db, run_id)
+    run = _require_final_approved_run(db, run_id)
+    try:
+        csv_content = payslip_service.generate_bank_advice_csv(db, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Mark as generated if not already done
+    if not getattr(run, "bank_advice_status", None):
+        try:
+            from datetime import datetime as _dt
+            period = (run.month_label or f"run{run_id}").replace(" ", "_")
+            run.bank_advice_path = f"bank_advice/{period}_{run_id}.csv"
+            run.bank_advice_generated_at = _dt.utcnow()
+            run.bank_advice_status = "generated"
+            db.commit()
+        except Exception:
+            pass
+    try:
+        payroll_service._log_audit(db, run_id, actor.id, "bank_advice_downloaded",
+                                   f"Bank advice downloaded for {run.month_label}")
+        db.commit()
+    except Exception:
+        pass
     filename = f"bank_advice_{run.month_label.replace(' ', '_')}.csv"
     return Response(
         content=csv_content.encode("utf-8"),
@@ -1119,8 +1395,9 @@ def download_bank_advice(
 def compliance_summary(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
+    _require_final_approved_run(db, run_id)
     return statutory_service.get_compliance_summary(db, run_id)
 
 
@@ -1129,11 +1406,11 @@ def compliance_summary(
 def pf_register(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = [
         "Employee Code,Employee Name,Basic,Employee PF (12%),Employer PF (12%),Total PF"
     ]
@@ -1162,11 +1439,11 @@ def pf_register(
 def esi_register(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = [
         "Employee Code,Employee Name,Gross Salary,Employee ESI (0.75%),Employer ESI (3.25%),Total ESI,ESI Applicable"
     ]
@@ -1208,6 +1485,7 @@ def analytics_summary(
     )
     trend = []
     for r in reversed(runs):
+        payroll_service.normalize_payroll_run_period(r)
         trend.append({
             "month": r.month_label,
             "gross": r.total_gross,
@@ -1439,11 +1717,11 @@ def employees_missing_structure(
 def pt_register(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = ["Employee Code,Employee Name,Gross Salary,Professional Tax"]
     for row in rows:
         emp = row.employee
@@ -1465,12 +1743,12 @@ def pt_register(
 def tds_report(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
     from app.models.payroll_extended import EmployeeTaxDeclaration
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = [
         "Employee Code,Employee Name,Gross Salary,Annual Gross (Est.),Tax Regime,"
         "80C,80D,HRA Exemption,Monthly TDS"
@@ -1509,11 +1787,11 @@ def tds_report(
 def payroll_register(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = [
         "Employee Code,Employee Name,Department,Designation,"
         "Working Days,Present Days,LOP Days,"
@@ -1546,20 +1824,156 @@ def payroll_register(
     )
 
 
+@router.get("/runs/{run_id}/payroll-summary/export",
+            summary="Export full payroll summary as Excel (.xlsx)")
+def payroll_summary_export(
+    run_id: int,
+    db: Session = Depends(get_db),
+    _: Employee = ComplianceReportUser,
+):
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from sqlalchemy import func as sqlfunc
+    from app.models.payroll import PayrollRun, PayrollRunEmployee
+    from app.models.payroll_extended import PayrollAdjustment
+
+    run = db.query(PayrollRun).filter_by(id=run_id).first()
+    if not run:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Payroll run not found")
+
+    rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
+
+    # Build bonus/adjustment totals per employee for this run (additions only)
+    adj_rows = (
+        db.query(PayrollAdjustment.employee_id, sqlfunc.sum(PayrollAdjustment.amount))
+        .filter(
+            PayrollAdjustment.run_id == run_id,
+            PayrollAdjustment.direction == "addition",
+        )
+        .group_by(PayrollAdjustment.employee_id)
+        .all()
+    )
+    bonus_by_emp = {emp_id: float(total or 0) for emp_id, total in adj_rows}
+
+    run_month = run.month or (run.pay_period_start.month if run.pay_period_start else "")
+    run_year = run.year or (run.pay_period_start.year if run.pay_period_start else "")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Payroll Summary"
+
+    headers = [
+        "Employee Code", "Employee Name", "Department", "Designation",
+        "Bank Name", "Account Number", "IFSC",
+        "Gross Pay", "Basic", "HRA", "Allowances",
+        "Bonus/Adjustments", "Deductions", "PF", "ESI", "PT", "TDS",
+        "LOP Days", "LOP Deduction", "Net Pay",
+        "Payroll Month", "Payroll Year", "Status",
+    ]
+
+    header_fill = PatternFill("solid", fgColor="0A1731")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws.append(headers)
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+    ws.row_dimensions[1].height = 30
+
+    col_widths = [14, 22, 18, 18, 18, 18, 14, 12, 12, 10, 14,
+                  16, 12, 10, 10, 10, 10, 10, 14, 12, 14, 12, 14]
+    for idx, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = w
+
+    money_fmt = '#,##0.00'
+    for row in rows:
+        emp = row.employee
+        if not emp:
+            continue
+        ss = row.salary_structure
+
+        emp_code = emp.employee_code or f"EMP{emp.id:04d}"
+        emp_name = f"{emp.first_name} {emp.last_name or ''}".strip()
+        dept = emp.department.name if emp.department else ""
+        desig = emp.designation.title if emp.designation else ""
+
+        bank_name  = (ss.bank_name       if ss else None) or ""
+        account_no = (ss.account_number  if ss else None) or ""
+        ifsc       = (ss.ifsc_code       if ss else None) or ""
+
+        # Fallback to employee-level bank fields (set during onboarding) when
+        # the salary structure has no bank details.
+        if not account_no and emp.bank_account_encrypted:
+            from utils.crypto import decrypt_pii_optional
+            account_no = decrypt_pii_optional(emp.bank_account_encrypted) or ""
+        if not ifsc and emp.bank_ifsc:
+            ifsc = emp.bank_ifsc or ""
+
+        bank_name  = bank_name  or "Bank Name Missing"
+        account_no = account_no or "Bank Details Missing"
+        ifsc       = ifsc       or "Bank Details Missing"
+
+        gross = float(row.gross_earnings or 0)
+        basic = float(row.basic_pay or 0)
+        hra = float(row.hra or 0)
+        allowances = round(gross - basic - hra, 2)
+        bonus_adj = bonus_by_emp.get(emp.id, 0.0)
+        deductions = float(row.total_deductions or 0)
+        pf = float(row.employee_pf or 0) or float(row.pf_employee or 0)
+        esi = float(row.employee_esi or 0) or float(row.esi_employee or 0)
+        pt = float(row.professional_tax or 0)
+        tds = float(row.tds or 0)
+        lop_days = row.lop_days or 0
+        lop_ded = float(row.lop_deduction or 0)
+        net = float(row.net_pay or row.net_salary or 0)
+
+        data_row = [
+            emp_code, emp_name, dept, desig,
+            bank_name, account_no, ifsc,
+            gross, basic, hra, allowances,
+            bonus_adj, deductions, pf, esi, pt, tds,
+            lop_days, lop_ded, net,
+            run_month, run_year, row.record_status or run.status,
+        ]
+        ws.append(data_row)
+        r_idx = ws.max_row
+        for c_idx in range(8, 21):  # columns H–T are monetary/numeric
+            cell = ws.cell(row=r_idx, column=c_idx)
+            if c_idx != 18:  # skip LOP Days (integer)
+                cell.number_format = money_fmt
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    period = (run.month_label or f"run{run_id}").replace(" ", "_")
+    filename = f"payroll_summary_{period}.xlsx"
+    return Response(
+        content=output.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/runs/{run_id}/bonus-report",
             summary="Download bonus report CSV for a payroll run")
 def bonus_report(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll_extended import PayrollAdjustment
+    run = _require_final_approved_run(db, run_id)
     rows = (
         db.query(PayrollAdjustment)
         .filter_by(run_id=run_id, adjustment_type="bonus")
         .all()
     )
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = ["Employee Code,Employee Name,Department,Bonus Type,Direction,Amount,Taxable,Description"]
     for adj in rows:
         emp = adj.employee
@@ -1586,15 +2000,15 @@ def bonus_report(
 def variable_pay_report(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll_extended import PayrollAdjustment
+    run = _require_final_approved_run(db, run_id)
     rows = (
         db.query(PayrollAdjustment)
         .filter_by(run_id=run_id, adjustment_type="variable_pay")
         .all()
     )
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = ["Employee Code,Employee Name,Department,Type,Direction,Amount,Taxable,Description"]
     for adj in rows:
         emp = adj.employee
@@ -1621,15 +2035,15 @@ def variable_pay_report(
 def reimbursement_report(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll_extended import Reimbursement
+    run = _require_final_approved_run(db, run_id)
     rows = (
         db.query(Reimbursement)
         .filter_by(payroll_run_id=run_id)
         .all()
     )
-    run = payroll_service.get_payroll_run(db, run_id)
     lines = ["Employee Code,Employee Name,Claim Type,Claim Amount,Approved Amount,Status,Remarks"]
     for r in rows:
         emp = r.employee
@@ -1655,12 +2069,12 @@ def reimbursement_report(
 def gratuity_report(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee, SalaryStructure
     from app.services.statutory_service import get_active_settings
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
-    run = payroll_service.get_payroll_run(db, run_id)
     s = get_active_settings(db)
     gratuity_rate = s.gratuity_rate if s else 0.0481
     min_years = s.gratuity_eligibility_years if s else 5.0
@@ -1715,8 +2129,10 @@ def gratuity_report(
             summary="Admin dashboard — real-time payroll status for Admin role")
 def admin_dashboard_stats(
     run_id: Optional[int] = None,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,   # finance_head must also reach this endpoint
+    _: Employee = PayrollRecordsUser,   # HR can also access dashboard stats
 ):
     """Read-only view of payroll status for Admin dashboard.
     Pass run_id to switch between historical payroll runs.
@@ -1725,16 +2141,28 @@ def admin_dashboard_stats(
     from app.models.payroll_extended import Payslip
     stats = payroll_service.get_dashboard_stats(db)
 
-    # If run_id given, use that specific run; otherwise use current
+    # If run_id given, use that specific run; if month/year given, find matching run
     if run_id:
         run = db.query(PayrollRun).filter(PayrollRun.id == run_id).first()
+    elif month and year:
+        run = (
+            db.query(PayrollRun)
+            .filter(PayrollRun.month == month, PayrollRun.year == year)
+            .order_by(PayrollRun.created_at.desc())
+            .first()
+        )
     else:
         run = stats["current_run"]
+    payroll_service.normalize_payroll_run_period(run)
 
     total_active = stats["total_employees"]
+    from sqlalchemy import or_ as _or
     structured_count = (
         db.query(SalaryStructure)
-        .filter(SalaryStructure.is_active.is_(True), SalaryStructure.gross_monthly > 0)
+        .filter(
+            SalaryStructure.is_active.is_(True),
+            _or(SalaryStructure.gross_monthly > 0, SalaryStructure.annual_ctc > 0),
+        )
         .count()
     )
 
@@ -1767,21 +2195,50 @@ def admin_dashboard_stats(
                 "is_locked": row.is_locked,
                 "payslip_generated": row.payslip_generated,
                 "record_status": row.record_status,
-                "variance_flag": row.variance_flag,
-                "variance_reason": row.variance_reason,
+                "variance_flag": (
+                    False if payroll_service.is_false_salary_assignment_variance(row)
+                    else row.variance_flag
+                ),
+                "variance_reason": (
+                    None if payroll_service.is_false_salary_assignment_variance(row)
+                    else row.variance_reason
+                ),
             })
-        variance_count = db.query(PRE).filter_by(run_id=run.id, variance_flag=True).count()
+        variance_count = payroll_service.visible_variance_count(db, run.id)
         approval_status = payroll_service._approval_status_summary(db, run.id)
 
-    recent_runs = (
+    _all_runs_raw = (
         db.query(PayrollRun)
         .filter(PayrollRun.status.notin_(["cancelled"]))
         .order_by(PayrollRun.pay_period_start.desc())
-        .limit(12)
         .all()
     )
+    # Normalize first — DB month/year columns are Optional; derive from pay_period_start
+    _all_runs_raw = [payroll_service.normalize_payroll_run_period(r) for r in _all_runs_raw if r]
+    # Deduplicate: keep only one run per month/year (highest-status priority)
+    _STATUS_RANK = {
+        "draft": 0, "attendance_frozen": 1, "processing": 2,
+        "under_review": 3, "pending_head_approval": 4, "approved": 5,
+        "payslip_generated": 6, "bank_advice_generated": 7, "published": 8, "closed": 9,
+    }
+    _dedup: dict = {}
+    for _r in _all_runs_raw:
+        _m = _r.month or (_r.pay_period_start.month if _r.pay_period_start else 0)
+        _y = _r.year or (_r.pay_period_start.year if _r.pay_period_start else 0)
+        _k = (_m, _y)
+        if _k not in _dedup or _STATUS_RANK.get(_r.status, -1) > _STATUS_RANK.get(_dedup[_k].status, -1):
+            _dedup[_k] = _r
+    recent_runs = sorted(
+        _dedup.values(),
+        key=lambda r: (
+            r.year or (r.pay_period_start.year if r.pay_period_start else 0),
+            r.month or (r.pay_period_start.month if r.pay_period_start else 0),
+        ),
+        reverse=True,
+    )[:12]
 
-    is_closed = run and run.status in ("closed", "published", "payslip_generated", "approved")
+    _CLOSED_LIKE = ("closed", "published", "bank_advice_generated", "completed", "payslip_generated", "approved")
+    is_closed = run and run.status in _CLOSED_LIKE
 
     # Build department summary for the SELECTED run (not always the live run)
     department_summary = payroll_service._build_dept_summary(db, run) if run else []
@@ -1790,7 +2247,7 @@ def admin_dashboard_stats(
     # For final/closed runs this is always 0 errors and 100% complete.
     from app.models.payroll import PayrollError as _RunPayrollError
     if run:
-        if run.status in ("closed", "published", "payslip_generated", "approved"):
+        if run.status in _CLOSED_LIKE:
             run_open_errors = 0
             run_completion_pct = 100.0
         else:
@@ -1850,12 +2307,14 @@ def admin_dashboard_stats(
             "attendance_frozen": bool(run.attendance_locked or run.status not in ("draft",)),
             "finance_reviewed": run.status in (
                 "under_review", "error_found", "pending_head_approval",
-                "approved", "payslip_generated", "published", "closed",
+                "approved", "payslip_generated", "bank_advice_generated",
+                "published", "completed", "closed",
             ),
             "finance_head_approved": run.status in (
-                "approved", "payslip_generated", "published", "closed",
+                "approved", "payslip_generated", "bank_advice_generated",
+                "published", "completed", "closed",
             ),
-            "payslips_published": run.status in ("published", "closed"),
+            "payslips_published": run.status in ("published", "completed", "closed"),
         } if run else None,
         "run_employees": run_employees,
         "department_summary": department_summary,
@@ -1864,6 +2323,8 @@ def admin_dashboard_stats(
                 "id": r.id,
                 "payroll_run_code": r.payroll_run_code,
                 "month_label": r.month_label,
+                "month": r.month,
+                "year": r.year,
                 "status": r.status,
                 "lifecycle_status": payroll_service.document_lifecycle_status(r.status, r.payroll_locked),
                 "total_employees": r.total_employees,
@@ -1876,6 +2337,382 @@ def admin_dashboard_stats(
         ],
         "pending_approval_count": stats["pending_approval_count"],
         "last_run_net": stats["last_run_net"],
+    }
+
+
+# ─── Demo Reset ────────────────────────────────────────────────────────────────
+
+def _seed_demo_lop_requests(
+    db: Session,
+    active_employees: list,
+    seed_months: list,
+    year: int,
+    now: "datetime",
+) -> dict:
+    """Seed demo LOP leave requests for *seed_months* using a deterministic pattern.
+
+    No employee names or IDs are hardcoded.  The LOP_CYCLE array provides a
+    repeating pattern of LOP days indexed by (employee_sort_position +
+    month_offset) % cycle_length.  Rotating the offset per month ensures
+    different employees have LOP in different months for realistic variety.
+
+    These approved LeaveRequest rows are picked up automatically by
+    _refresh_leave_lop_overlays() when HR runs validate_attendance or
+    freeze_attendance — no manual MonthlyAttendanceSummary edits are needed.
+
+    July is intentionally excluded from seed_months because LR001/LR002/LR003
+    are already seeded in the DB and will be re-applied on the next freeze.
+    """
+    import calendar as _cal
+    from datetime import date as _date
+    from sqlalchemy import text as _text
+    from app.models.leave import LeaveRequest, LeaveType
+
+    _DEMO_REASON = "_demo_lop_seed_"
+
+    # Find the unpaid / LOP leave type (is_paid = False)
+    lop_type = (
+        db.query(LeaveType)
+        .filter(LeaveType.is_paid.is_(False))
+        .first()
+    )
+    if not lop_type:
+        return {"ok": False, "error": "No unpaid leave type found — cannot seed LOP"}
+
+    # Resolve an approver ID (any hr/admin employee, fall back to any employee)
+    approver_id = (
+        db.execute(
+            _text(
+                "SELECT e.id FROM employees e "
+                "JOIN roles r ON r.id = e.role_id "
+                "WHERE r.name IN ('hr','admin') "
+                "  AND (e.is_deleted = 0 OR e.is_deleted IS NULL) "
+                "LIMIT 1"
+            )
+        ).scalar()
+        or db.execute(_text("SELECT id FROM employees LIMIT 1")).scalar()
+    )
+
+    # LOP days per sorted employee position.  Rotates by +1 per month so each
+    # month a different subset of employees carries LOP days.
+    # 4 non-zero values → up to 4 employees have LOP each month out of 8.
+    LOP_CYCLE = [2, 0, 1, 3, 0, 0, 1, 0]  # length 8
+
+    sorted_emps = sorted(active_employees, key=lambda e: e.id)
+
+    # Remove any previously seeded demo LOP requests to stay idempotent
+    db.query(LeaveRequest).filter(
+        LeaveRequest.reason == _DEMO_REASON
+    ).delete(synchronize_session=False)
+    for m in seed_months:
+        for emp in sorted_emps:
+            db.query(LeaveRequest).filter(
+                LeaveRequest.id == f"DEMO-LOP-{m}-{emp.id}"
+            ).delete(synchronize_session=False)
+    db.flush()
+
+    seeded: list[dict] = []
+
+    for month_offset, month in enumerate(sorted(seed_months)):
+        month_last_day = _cal.monthrange(year, month)[1]
+        # All Mon–Fri dates in this month
+        working_dates = [
+            _date(year, month, d)
+            for d in range(1, month_last_day + 1)
+            if _date(year, month, d).weekday() < 5
+        ]
+        total_wd = len(working_dates)
+
+        for i, emp in enumerate(sorted_emps):
+            lop_days = LOP_CYCLE[(i + month_offset) % len(LOP_CYCLE)]
+            if lop_days <= 0:
+                continue
+
+            # Stagger start dates by employee index so all LOP employees are not
+            # absent on the same calendar dates (more realistic)
+            safe_range = max(1, total_wd - lop_days)
+            start_idx = (i * 2) % safe_range
+            leave_dates = working_dates[start_idx: start_idx + lop_days]
+            if len(leave_dates) < lop_days:
+                leave_dates = working_dates[:lop_days]
+
+            db.add(LeaveRequest(
+                id=f"DEMO-LOP-{month}-{emp.id}",
+                employee_id=emp.id,
+                leave_type_id=lop_type.id,
+                start_date=leave_dates[0],
+                end_date=leave_dates[-1],
+                total_days=lop_days,
+                consumed_days=lop_days,
+                is_lop=True,
+                reason=_DEMO_REASON,
+                status="approved",
+                next_approver_role=None,
+                manager_approved_by=approver_id,
+                manager_approved_at=now,
+                hr_approved_by=approver_id,
+                hr_approved_at=now,
+                approved_by=approver_id,
+                approved_at=now,
+                payroll_sync_status="na",
+                payroll_sync_attempts=0,
+            ))
+            seeded.append({
+                "employee_id": emp.id,
+                "month": month,
+                "lop_days": lop_days,
+                "start_date": str(leave_dates[0]),
+                "end_date": str(leave_dates[-1]),
+            })
+
+    db.flush()
+    return {"ok": True, "seeded_count": len(seeded), "records": seeded}
+
+
+@router.post("/demo-reset",
+             summary="[DEMO ONLY] Clear payroll runs for target months so a fresh flow can run")
+def demo_reset_payroll(
+    months: Optional[list] = None,
+    year: int = 2026,
+    db: Session = Depends(get_db),
+    _: Employee = HrAdminUser,
+):
+    """Delete all payroll run data for months (default 5,6,7) in year (default 2026).
+
+    Deletes: payroll_runs, payroll_run_employees, payroll_approvals,
+             payroll_adjustments, payroll_errors, payroll_audit_logs,
+             payroll_lock_history, payslips
+
+    Preserves: employees, salary_structures, employee_salary_assignments,
+               monthly_attendance_summary, leave_requests, leave_balances
+
+    Also resets monthly_attendance_summary rows to unfrozen so HR can
+    re-validate and re-freeze for a clean demo run.
+    """
+    from app.models.payroll import (
+        PayrollRun, PayrollRunEmployee, PayrollApproval,
+        PayrollError, PayrollLockHistory,
+    )
+    from app.models.payroll_extended import PayrollAdjustment, Payslip
+    from app.models.monthly_attendance_summary import MonthlyAttendanceSummary
+
+    target_months = list(months) if months else [5, 6, 7]
+
+    run_ids = [
+        r.id
+        for r in db.query(PayrollRun.id)
+        .filter(PayrollRun.month.in_(target_months), PayrollRun.year == year)
+        .all()
+    ]
+
+    deleted: dict = {}
+
+    if run_ids:
+        deleted["payslips"] = (
+            db.query(Payslip).filter(Payslip.run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        deleted["payroll_run_employees"] = (
+            db.query(PayrollRunEmployee).filter(PayrollRunEmployee.run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        deleted["payroll_approvals"] = (
+            db.query(PayrollApproval).filter(PayrollApproval.run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        deleted["payroll_adjustments"] = (
+            db.query(PayrollAdjustment).filter(PayrollAdjustment.run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        deleted["payroll_errors"] = (
+            db.query(PayrollError).filter(PayrollError.run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        deleted["payroll_lock_history"] = (
+            db.query(PayrollLockHistory).filter(PayrollLockHistory.payroll_run_id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+        # PayrollAuditLog may not exist in all deployments
+        try:
+            from app.models.payroll_extended import PayrollAuditLog
+            deleted["payroll_audit_logs"] = (
+                db.query(PayrollAuditLog).filter(PayrollAuditLog.run_id.in_(run_ids))
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            pass
+        deleted["payroll_runs"] = (
+            db.query(PayrollRun).filter(PayrollRun.id.in_(run_ids))
+            .delete(synchronize_session=False)
+        )
+
+    # Unfreeze existing monthly_attendance_summary rows so HR can freeze again.
+    # Also creates rows for any employee/month combinations that are missing, and
+    # resets total_working_days to the correct Mon-Fri calendar count so that
+    # LOP proration is accurate (older rows may have stale working-day counts).
+    import calendar as _cal
+    from datetime import datetime as _dt
+
+    active_employees = (
+        db.query(Employee)
+        .filter((Employee.is_deleted.is_(False)) | (Employee.is_deleted.is_(None)))
+        .all()
+    )
+
+    mas_rows = (
+        db.query(MonthlyAttendanceSummary)
+        .filter(
+            MonthlyAttendanceSummary.month.in_(target_months),
+            MonthlyAttendanceSummary.year == year,
+        )
+        .all()
+    )
+
+    # Pre-compute correct working day counts for each target month
+    _wd_map = {
+        month: sum(
+            1
+            for week in _cal.monthcalendar(year, month)
+            for day in week[:5]
+            if day != 0
+        )
+        for month in target_months
+    }
+
+    # Unfreeze existing rows and correct any stale working-day counts
+    for row in mas_rows:
+        correct_wd = _wd_map[row.month]
+        row.is_frozen = False
+        row.finalized_at = None
+        row.finalized_by = None
+        row.attendance_status = "pending"
+        row.is_ready_for_payroll = False
+        # Fix stale total_working_days and reset attendance fields
+        row.total_working_days = correct_wd
+        row.present_days = correct_wd          # full attendance (LOP is a separate overlay)
+        row.leave_days = 0
+        row.lop_days = 0                        # LOP recomputed from leave requests on validate/freeze
+        row.payable_days = float(correct_wd)
+        row.lop_source = "Leave Management"
+        row.lop_status = "ready"
+
+    # Ensure every active employee has a row for every target month
+    existing_keys = {(r.employee_id, r.month, r.year) for r in mas_rows}
+    rows_created = 0
+    _now = _dt.utcnow()
+    for month in target_months:
+        _wd = _wd_map[month]
+        for emp in active_employees:
+            if (emp.id, month, year) not in existing_keys:
+                db.add(MonthlyAttendanceSummary(
+                    employee_id=emp.id,
+                    month=month,
+                    year=year,
+                    total_working_days=_wd,
+                    present_days=_wd,
+                    leave_days=0,
+                    lop_days=0,
+                    payable_days=float(_wd),
+                    lop_source="Leave Management",
+                    lop_status="ready",
+                    approved_timesheet_hours=0.0,
+                    attendance_status="pending",
+                    timesheet_status="approved",
+                    validation_status="passed",
+                    issues_count=0,
+                    is_ready_for_payroll=False,
+                    is_frozen=False,
+                ))
+                existing_keys.add((emp.id, month, year))
+                rows_created += 1
+
+    # Seed demo LOP leave requests for May and June.
+    # July is excluded — LR001/LR002/LR003 already provide July LOP data.
+    # These requests are automatically picked up by _refresh_leave_lop_overlays
+    # when HR runs validate_attendance or freeze_attendance, so MAS.lop_days
+    # is set correctly before payroll generation — no manual DB edits needed.
+    lop_seed_months = [m for m in target_months if m != 7]
+    lop_result = _seed_demo_lop_requests(
+        db, active_employees, lop_seed_months, year, _now
+    )
+
+    # ── Clean up salary revision / hike / bonus workflow records ─────────────
+    from app.models.salary_hike_request import SalaryHikeRequest
+    from app.models.salary_revision import SalaryRevisionLog
+    from app.models.bonus_request import BonusRequest
+    from app.models.off_cycle_payment import OffCyclePayment, OffCycleAuditLog
+    from app.models.pms import CompensationRevision
+    from app.models.payroll import SalaryStructure
+    from app.models.payroll_extended import EmployeeSalaryAssignment
+
+    # Identify revision-created salary structures before deleting the logs
+    rev_logs = db.query(SalaryRevisionLog).all()
+    revision_new_ss_ids = {r.new_salary_structure_id for r in rev_logs if r.new_salary_structure_id}
+    revision_old_ss_ids = {r.old_salary_structure_id for r in rev_logs if r.old_salary_structure_id}
+    # True originals = those that appear as "old" but were never themselves a "new" revision
+    original_ss_ids = revision_old_ss_ids - revision_new_ss_ids
+
+    # 1. Remove assignments that point to revision-created structures
+    deleted["employee_salary_assignments"] = (
+        db.query(EmployeeSalaryAssignment)
+        .filter(EmployeeSalaryAssignment.salary_structure_id.in_(revision_new_ss_ids))
+        .delete(synchronize_session=False)
+    ) if revision_new_ss_ids else 0
+
+    # 2. Delete revision logs (frees FK references to salary_structures)
+    deleted["salary_revision_logs"] = db.query(SalaryRevisionLog).delete(synchronize_session=False)
+
+    # 3. Delete the revision-created salary structures
+    deleted["revision_salary_structures"] = (
+        db.query(SalaryStructure)
+        .filter(SalaryStructure.id.in_(revision_new_ss_ids))
+        .delete(synchronize_session=False)
+    ) if revision_new_ss_ids else 0
+
+    # 4. Restore is_active=True on original structures deactivated by revisions
+    if original_ss_ids:
+        db.query(SalaryStructure).filter(
+            SalaryStructure.id.in_(original_ss_ids),
+            SalaryStructure.is_active.is_(False),
+        ).update({"is_active": True}, synchronize_session=False)
+    deleted["salary_structures_restored"] = len(original_ss_ids)
+
+    # 5. Delete hike requests and PMS compensation revisions
+    deleted["salary_hike_requests"] = db.query(SalaryHikeRequest).delete(synchronize_session=False)
+    deleted["pms_compensation_revisions"] = db.query(CompensationRevision).delete(synchronize_session=False)
+
+    # 6. Delete bonus workflow records
+    try:
+        deleted["off_cycle_audit_log"] = db.query(OffCycleAuditLog).delete(synchronize_session=False)
+    except Exception:
+        deleted["off_cycle_audit_log"] = 0
+    deleted["off_cycle_payments"] = db.query(OffCyclePayment).delete(synchronize_session=False)
+    deleted["bonus_requests"] = db.query(BonusRequest).delete(synchronize_session=False)
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "year": year,
+        "months_reset": target_months,
+        "run_ids_deleted": run_ids,
+        "deleted": deleted,
+        "attendance_rows_unfrozen": len(mas_rows),
+        "attendance_rows_created": rows_created,
+        "lop_requests_seeded": lop_result.get("seeded_count", 0),
+        "lop_seed_detail": lop_result.get("records", []),
+        "message": (
+            f"Demo reset complete. Deleted {deleted.get('payroll_runs', 0)} run(s) "
+            f"for months {target_months} of {year}. "
+            f"Attendance unfrozen ({len(mas_rows)} rows), {rows_created} row(s) created. "
+            f"Cleared {deleted.get('salary_hike_requests', 0)} hike request(s), "
+            f"{deleted.get('salary_revision_logs', 0)} revision log(s), "
+            f"{deleted.get('bonus_requests', 0)} bonus request(s), "
+            f"{deleted.get('off_cycle_payments', 0)} off-cycle payment(s). "
+            f"Restored {deleted.get('salary_structures_restored', 0)} original salary structure(s). "
+            f"Seeded {lop_result.get('seeded_count', 0)} LOP leave request(s) for "
+            f"months {lop_seed_months}."
+        ),
     }
 
 
@@ -2013,6 +2850,7 @@ def _reimb_extra(r) -> dict:
 
 
 def _payslip_to_out(s: Payslip) -> PayslipOut:
+    payroll_service.normalize_payslip_period(s)
     emp = s.employee
     return PayslipOut(
         id=s.id,
@@ -2054,137 +2892,82 @@ def _payslip_to_out(s: Payslip) -> PayslipOut:
 # ─── Attendance Freeze / Hardening ────────────────────────────────────────────
 
 @router.get("/runs/{run_id}/attendance-summary",
-            summary="Attendance snapshot for a payroll run")
+            summary="[DEPRECATED] Legacy attendance snapshot — use /payroll/attendance-summary instead")
 def get_attendance_summary(
     run_id: int,
     db: Session = Depends(get_db),
     _: Employee = FinanceUser,
 ):
-    from app.models.attendance_records import PayrollAttendanceSummary
-    rows = db.query(PayrollAttendanceSummary).filter_by(payroll_run_id=run_id).all()
-    result = []
-    for r in rows:
-        emp = db.query(Employee).filter(Employee.id == r.employee_id).first()
-        result.append({
-            "id": r.id,
-            "employee_id": r.employee_id,
-            "employee_name": f"{emp.first_name} {emp.last_name or ''}".strip() if emp else "—",
-            "working_days": r.total_working_days,
-            "total_working_days": r.total_working_days,
-            "present_days": r.present_days,
-            "leave_days": r.leave_days,
-            "lop_days": r.lop_days,
-            "holiday_days": r.holiday_count,
-            "payable_days": getattr(r, "payable_days", r.present_days),
-            "overtime_hours": getattr(r, "overtime_hours", 0),
-            "is_finalized": r.is_finalized,
-            "attendance_status": getattr(r, "attendance_status", "pending"),
-        })
-    return result
+    """DEPRECATED — Sprint 3: payroll_attendance_summary table is no longer the payroll input source.
+    Use GET /payroll/attendance-summary?month=M&year=Y to read the canonical MonthlyAttendanceSummary.
+    This endpoint now returns an empty list; the table is retained for historical data only.
+    """
+    return []
 
 
 @router.post("/runs/{run_id}/attendance-summary/freeze",
-             summary="Freeze attendance for all employees in a run")
+             summary="[DEPRECATED] Use POST /payroll/attendance-summary/freeze instead")
 def freeze_attendance(
     run_id: int,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = HrAdminUser,
 ):
-    from app.models.attendance_records import PayrollAttendanceSummary
-    rows = db.query(PayrollAttendanceSummary).filter_by(payroll_run_id=run_id).all()
-    if not rows:
-        try:
-            payroll_service.advance_run_status(
-                db, run_id, "freeze_attendance",
-                "No finalized attendance rows yet; payroll will use temporary fallback values.",
-                actor,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        return {
-            "detail": "No attendance summary rows found; payroll fallback values will be used.",
-            "frozen_count": 0,
-        }
-    unfrozen = [r for r in rows if getattr(r, "attendance_status", "pending") != "frozen"]
-    for r in unfrozen:
-        r.attendance_status = "frozen"
-    run = payroll_service.get_payroll_run(db, run_id)
-    if run and run.status == "draft":
-        try:
-            payroll_service.advance_run_status(db, run_id, "freeze_attendance", "Attendance summary frozen", actor)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-    db.commit()
-    return {"detail": f"Attendance frozen for {len(rows)} employee(s)", "frozen_count": len(rows)}
+    """DEPRECATED — Sprint 3: payroll_attendance_summary is no longer the freeze source.
+    Use POST /payroll/attendance-summary/freeze (month/year body) to freeze MonthlyAttendanceSummary,
+    then call POST /finance/runs/{run_id}/action with action=freeze_attendance to advance the run.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "This endpoint is deprecated. "
+            "Freeze attendance via POST /payroll/attendance-summary/freeze (HR endpoint), "
+            "then advance the payroll run via POST /finance/runs/{run_id}/action "
+            "with body {\"action\": \"freeze_attendance\"}."
+        ),
+    )
 
 
 @router.post("/runs/{run_id}/attendance-summary/unfreeze",
-             summary="Unfreeze attendance (revert to pending) for corrections")
+             summary="[DEPRECATED] Use POST /payroll/attendance-summary/reset-freeze instead")
 def unfreeze_attendance(
     run_id: int,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = HrAdminUser,
 ):
-    run = payroll_service.get_payroll_run(db, run_id)
-    if run and run.status not in ("draft", "attendance_frozen"):
-        raise HTTPException(status_code=400, detail="Cannot unfreeze attendance after payroll generation has started.")
-    from app.models.attendance_records import PayrollAttendanceSummary
-    rows = db.query(PayrollAttendanceSummary).filter_by(payroll_run_id=run_id).all()
-    for r in rows:
-        r.attendance_status = "pending"
-    db.commit()
-    return {"detail": f"Attendance unfrozen for {len(rows)} employee(s)"}
+    """DEPRECATED — Sprint 3: payroll_attendance_summary is no longer the attendance source.
+    Use POST /payroll/attendance-summary/reset-freeze (DEV ONLY) to reset MonthlyAttendanceSummary.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "This endpoint is deprecated. "
+            "Use POST /payroll/attendance-summary/reset-freeze (admin/hr, DEV only) "
+            "to reset MonthlyAttendanceSummary freeze state."
+        ),
+    )
 
 
 @router.post("/runs/{run_id}/attendance-summary/upsert",
-             status_code=201,
-             summary="Upsert attendance summary for an employee in a run")
+             status_code=status.HTTP_410_GONE,
+             summary="[DEPRECATED] Use POST /payroll/attendance-summary/manual instead")
 def upsert_attendance_summary(
     run_id: int,
     body: dict,
     db: Session = Depends(get_db),
-    actor: Employee = FinanceUser,
+    actor: Employee = FinanceOnlyUser,
 ):
-    from app.models.attendance_records import PayrollAttendanceSummary
-    employee_id = body.get("employee_id")
-    if not employee_id:
-        raise HTTPException(status_code=400, detail="employee_id required")
-
-    record = db.query(PayrollAttendanceSummary).filter_by(
-        payroll_run_id=run_id, employee_id=employee_id
-    ).first()
-    if not record:
-        run = payroll_service.get_payroll_run(db, run_id)
-        next_id = db.query(PayrollAttendanceSummary).count() + 1
-        record = PayrollAttendanceSummary(
-            id=f"PAS{next_id:05d}",
-            payroll_run_id=run_id,
-            employee_id=employee_id,
-            month=run.pay_period_start.strftime("%B") if run else body.get("month"),
-            year=run.pay_period_start.year if run else body.get("year"),
-        )
-        db.add(record)
-
-    field_map = {
-        "working_days": "total_working_days",
-        "total_working_days": "total_working_days",
-        "present_days": "present_days",
-        "leave_days": "leave_days",
-        "lop_days": "lop_days",
-        "holiday_days": "holiday_count",
-        "holiday_count": "holiday_count",
-        "payable_days": "payable_days",
-        "overtime_hours": "overtime_hours",
-        "attendance_status": "attendance_status",
-        "is_finalized": "is_finalized",
-    }
-    for field, attr in field_map.items():
-        if field in body:
-            setattr(record, attr, body[field])
-
-    db.commit()
-    db.refresh(record)
-    return {"detail": "Attendance summary upserted", "id": record.id}
+    """DEPRECATED — Sprint 3: payroll_attendance_summary writes are disabled.
+    Use POST /payroll/attendance-summary/manual (HR/Admin) to update MonthlyAttendanceSummary.
+    Finance cannot write attendance data — only HR and Admin may.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "This endpoint is deprecated and writes to payroll_attendance_summary are disabled. "
+            "Use POST /payroll/attendance-summary/manual (HR/Admin only) to update "
+            "the canonical monthly_attendance_summary table."
+        ),
+    )
 
 
 # ─── Reimbursement Manager Approval ──────────────────────────────────────────
@@ -2339,13 +3122,20 @@ def submit_tax_declaration_proof(
              summary="Send payslip emails to all published employees in a run")
 def send_payslip_emails(
     run_id: int,
+    force: bool = False,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = FinanceOnlyUser,
 ):
+    """Send payslip notification emails.
+
+    Pass ?force=true to re-send even when email_sent is already set
+    (useful after an SMTP outage or to send to a corrected email address).
+    """
     run = payroll_service.get_payroll_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    result = payslip_service.send_payslip_emails_for_run(db, run_id)
+    _require_payroll_records(db, run_id)
+    result = payslip_service.send_payslip_emails_for_run(db, run_id, force=force)
     return result
 
 
@@ -2405,10 +3195,11 @@ def form16(
         f"",
         f"Month,Gross Salary (Est.),TDS Deducted,PF,ESI,Professional Tax",
     ]
-    MONTHS = ["", "April", "May", "June", "July", "August", "September",
-              "October", "November", "December", "January", "February", "March"]
     for d in deductions:
-        m = MONTHS[d.month] if 1 <= d.month <= 12 else str(d.month)
+        m = (
+            payroll_service.payroll_month_label_from_parts(d.month, d.year).rsplit(" ", 1)[0]
+            if 1 <= d.month <= 12 else str(d.month)
+        )
         lines.append(
             f"{m} {d.year},{d.total_tax_deductions:.2f},{d.tds:.2f},{d.pf_employee:.2f},{d.esi_employee:.2f},{d.professional_tax:.2f}"
         )
@@ -2442,13 +3233,11 @@ def form16(
 def form16_batch(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
     from app.models.payroll_extended import TaxDeduction, EmployeeTaxDeclaration
-    run = payroll_service.get_payroll_run(db, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+    run = _require_final_approved_run(db, run_id)
 
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
     fy_start = run.pay_period_start.year if run.pay_period_start.month >= 4 else run.pay_period_start.year - 1
@@ -2505,12 +3294,10 @@ def form16_batch(
 def pf_challan(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
-    run = payroll_service.get_payroll_run(db, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
     lines = [
         "#,UAN,Employee Name,Gross Wages,EPF Wages,EPS Wages,EPF Contribution,EPS Contribution,"
@@ -2545,12 +3332,10 @@ def pf_challan(
 def esi_filing(
     run_id: int,
     db: Session = Depends(get_db),
-    _: Employee = FinanceUser,
+    _: Employee = ComplianceReportUser,
 ):
     from app.models.payroll import PayrollRunEmployee
-    run = payroll_service.get_payroll_run(db, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+    run = _require_final_approved_run(db, run_id)
     rows = db.query(PayrollRunEmployee).filter_by(run_id=run_id).all()
     lines = [
         "IP No (ESIC),Employee Name,Days/Hours Worked,Total Wages,"
@@ -2703,8 +3488,8 @@ def acknowledge_payroll_variance(
         result = payroll_service.acknowledge_variance(
             db=db,
             run_id=run_id,
-            actor_id=actor.id,
-            row_ids=body.row_ids or None,   # None → all rows
+            actor=actor,
+            employee_ids=body.row_ids or None,   # None → all rows
             note=body.note,
         )
         return result

@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import employeePayrollApi from '../../../services/employeePayrollApi';
+import { api } from '../../../services/api';
 
 function fmt(n) {
-  if (!n) return '₹0';
+  if (n == null || n === undefined) return '—';
   return `₹${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -36,6 +38,28 @@ function PayslipsTab() {
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [downloading, setDownloading] = useState(null);
+
+  const downloadPdf = async (runId, label) => {
+    setDownloading(runId);
+    try {
+      const { blob, contentType, filename } = await api.downloadBlob(
+        employeePayrollApi.payslipPdfUrl(runId)
+      );
+      const objectUrl = URL.createObjectURL(new Blob([blob], { type: contentType }));
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = filename || `payslip_${label || runId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+    } catch (e) {
+      alert(e.status === 403 ? 'Access denied' : e.message || 'Download failed');
+    } finally {
+      setDownloading(null);
+    }
+  };
 
   useEffect(() => {
     employeePayrollApi.listPayslips()
@@ -59,7 +83,7 @@ function PayslipsTab() {
       {slips.length === 0 ? (
         <div style={{ textAlign: 'center', padding: 60, color: 'var(--text-muted)' }}>
           <div style={{ fontSize: 40, marginBottom: 12 }}>📄</div>
-          <p>No payslips available yet. Check back after payroll is published.</p>
+          <p>Payslip will be available after payroll is published.</p>
         </div>
       ) : (
         <div style={{ display: 'grid', gap: 12 }}>
@@ -84,24 +108,29 @@ function PayslipsTab() {
                   <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Net Pay</div>
                   <div style={{ fontWeight: 700, fontSize: 16, color: '#10B981' }}>{fmt(slip.net_salary)}</div>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button
-                    onClick={() => openDetail(slip.run_id)}
-                    className="btn btn-ghost"
-                    style={{ padding: '6px 14px', fontSize: 12 }}
-                  >
-                    View
-                  </button>
-                  <a
-                    href={employeePayrollApi.payslipPdfUrl(slip.run_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="btn btn-primary"
-                    style={{ padding: '6px 14px', fontSize: 12, textDecoration: 'none', display: 'inline-flex', alignItems: 'center' }}
-                  >
-                    ↓ PDF
-                  </a>
-                </div>
+                {slip.is_published ? (
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      onClick={() => openDetail(slip.run_id)}
+                      className="btn btn-ghost"
+                      style={{ padding: '6px 14px', fontSize: 12 }}
+                    >
+                      View
+                    </button>
+                    <button
+                      onClick={() => downloadPdf(slip.run_id, slip.month_label)}
+                      disabled={downloading === slip.run_id}
+                      className="btn btn-primary"
+                      style={{ padding: '6px 14px', fontSize: 12 }}
+                    >
+                      {downloading === slip.run_id ? '…' : '↓ PDF'}
+                    </button>
+                  </div>
+                ) : (
+                  <span style={{ fontSize: 12, color: '#94A3B8', fontStyle: 'italic' }}>
+                    Payslip will be available after payroll is published.
+                  </span>
+                )}
               </div>
             </div>
           ))}
@@ -126,7 +155,9 @@ function PayslipsTab() {
               <div style={{ background: '#F8FAFC', borderRadius: 8, padding: '10px 14px', marginBottom: 16, display: 'flex', gap: 20, fontSize: 13 }}>
                 <span>Working: <strong>{detail.working_days}d</strong></span>
                 <span>Present: <strong>{detail.present_days}d</strong></span>
-                {detail.lop_days > 0 && <span style={{ color: '#EF4444' }}>LOP: <strong>{detail.lop_days}d</strong></span>}
+                <span>Leave: <strong>{detail.leave_days || 0}d</strong></span>
+                <span>Holidays: <strong>{detail.holiday_days || 0}d</strong></span>
+                <span style={{ color: detail.lop_days > 0 ? '#EF4444' : 'inherit' }}>LOP: <strong>{detail.lop_days || 0}d</strong></span>
               </div>
             )}
 
@@ -157,15 +188,14 @@ function PayslipsTab() {
             </div>
 
             <div style={{ marginTop: 16, textAlign: 'right' }}>
-              <a
-                href={employeePayrollApi.payslipPdfUrl(detail.run_id)}
-                target="_blank"
-                rel="noreferrer"
+              <button
+                onClick={() => downloadPdf(detail.run_id, detail.month_label)}
+                disabled={downloading === detail.run_id}
                 className="btn btn-primary"
-                style={{ textDecoration: 'none', fontSize: 13 }}
+                style={{ fontSize: 13 }}
               >
-                Download PDF
-              </a>
+                {downloading === detail.run_id ? 'Downloading…' : 'Download PDF'}
+              </button>
             </div>
           </div>
         </div>
@@ -414,7 +444,11 @@ function SalaryStructureTab() {
         {[
           { label: 'Annual CTC',            value: fmt(data.annual_ctc),    color: '#3B5BDB' },
           { label: 'Monthly Gross',         value: fmt(data.gross_monthly), color: '#0EA5E9' },
-          { label: 'Net Monthly Take Home', value: fmt(data.net_monthly),   color: '#10B981' },
+          {
+            label: 'Net Monthly Take Home',
+            value: data.net_monthly != null ? fmt(data.net_monthly) : '—',
+            color: data.net_monthly != null ? '#10B981' : '#94A3B8',
+          },
         ].map(c => (
           <div key={c.label} className="card" style={{ padding: '14px 16px' }}>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>{c.label}</div>
@@ -469,10 +503,15 @@ function SalaryStructureTab() {
           )}
 
           {/* Net Take Home */}
-          <div style={{ background: '#F0FDF4', borderRadius: 10, padding: '12px 14px',
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16 }}>
-            <span style={{ fontWeight: 700, fontSize: 13, color: '#059669' }}>Net Take Home</span>
-            <span style={{ fontWeight: 800, fontSize: 18, color: '#059669' }}>{fmt(data.net_monthly)}</span>
+          <div style={{
+            background: data.net_monthly != null ? '#F0FDF4' : '#F8FAFC',
+            borderRadius: 10, padding: '12px 14px',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16,
+          }}>
+            <span style={{ fontWeight: 700, fontSize: 13, color: data.net_monthly != null ? '#059669' : '#94A3B8' }}>Net Take Home</span>
+            <span style={{ fontWeight: 800, fontSize: 18, color: data.net_monthly != null ? '#059669' : '#94A3B8' }}>
+              {data.net_monthly != null ? fmt(data.net_monthly) : 'Available after first payroll run'}
+            </span>
           </div>
         </div>
       </div>
@@ -754,11 +793,67 @@ function PayrollStatusCard() {
 
   if (!status) return null;
 
+  if (status.payroll_cycle_started === false) {
+    return (
+      <div style={{
+        background: '#F8FAFC',
+        border: '1px solid #E2E8F0',
+        borderRadius: 12,
+        padding: '14px 20px',
+        marginBottom: 20,
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: 16,
+        alignItems: 'center',
+      }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: '#64748B', textTransform: 'uppercase', letterSpacing: '0.06em', marginRight: 4 }}>
+          Current Payroll Status
+        </div>
+        <div style={{ fontWeight: 700, fontSize: 14, color: '#334155' }}>
+          {status.message || 'No payroll cycle started yet.'}
+        </div>
+      </div>
+    );
+  }
+
   const attLabel = status.attendance_frozen
     ? 'Finalized'
     : (status.attendance_status || 'not_available')
         .replace(/_/g, ' ')
         .replace(/\b\w/g, c => c.toUpperCase());
+
+  const statusItems = [
+    (status.net_monthly != null || status.gross_monthly != null) && {
+      label: 'Salary',
+      value: status.net_monthly != null
+        ? fmt(status.net_monthly)
+        : `${fmt(status.gross_monthly)} (est.)`,
+      color: '#10B981',
+    },
+    {
+      label: 'Payroll Month',
+      value: status.payroll_month || '—',
+      color: '#1e293b',
+    },
+    {
+      label: 'Attendance',
+      value: attLabel,
+      color: status.attendance_frozen ? '#059669' : '#D97706',
+    },
+    status.payslip_status && {
+      label: 'Payslip',
+      value: status.payslip_status === 'published'
+        ? `Published (${status.latest_payslip_month || status.payroll_month})`
+        : status.payslip_status === 'generated'
+          ? 'Generated'
+          : 'Pending',
+      color: status.payslip_status === 'published'
+        ? '#059669'
+        : status.payslip_status === 'generated'
+          ? '#0F766E'
+          : '#94A3B8',
+    },
+  ].filter(Boolean);
 
   return (
     <div style={{
@@ -776,30 +871,7 @@ function PayrollStatusCard() {
         Current Payroll Status
       </div>
 
-      {[
-        {
-          label: 'Salary',
-          value: status.net_monthly != null ? fmt(status.net_monthly) : '—',
-          color: '#10B981',
-        },
-        {
-          label: 'Payroll Month',
-          value: status.payroll_month,
-          color: '#1e293b',
-        },
-        {
-          label: 'Attendance',
-          value: attLabel,
-          color: status.attendance_frozen ? '#059669' : '#D97706',
-        },
-        {
-          label: 'Payslip',
-          value: status.payslip_status === 'published'
-            ? `Published (${status.latest_payslip_month})`
-            : 'Pending',
-          color: status.payslip_status === 'published' ? '#059669' : '#94A3B8',
-        },
-      ].map(item => (
+      {statusItems.map(item => (
         <div key={item.label}>
           <div style={{ fontSize: 10, color: '#94A3B8', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
             {item.label}
@@ -819,10 +891,47 @@ function PayrollStatusCard() {
 const TABS = ['Payslips', 'Salary Structure', 'Reimbursements', 'Tax Declaration'];
 
 export default function PayrollPage() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [tab, setTab] = useState('Payslips');
+  const isAdminSelfPayroll = location.pathname.startsWith('/admin-dashboard/my-payroll');
+  const backToPayrollDashboard = location.state?.fromPayrollDashboard || isAdminSelfPayroll
+    ? location.state?.backTo || '/admin-dashboard/payroll'
+    : null;
+  const payrollDashboardState = location.state?.payrollDashboardState || {};
+
+  const handleBackToPayrollDashboard = () => {
+    if (!backToPayrollDashboard) return;
+    navigate(backToPayrollDashboard, {
+      state: { payrollDashboardState },
+    });
+  };
+
   return (
     <div className="fade-in">
       <div className="page-header" style={{ marginBottom: 20 }}>
+        {backToPayrollDashboard && (
+          <button
+            type="button"
+            onClick={handleBackToPayrollDashboard}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              marginBottom: 10,
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              color: '#64748B',
+              fontSize: 16,
+              fontWeight: 500,
+              cursor: 'pointer',
+            }}
+          >
+            <span aria-hidden="true" style={{ fontSize: 22, lineHeight: 1 }}>&lsaquo;</span>
+            <span>Back to Payroll Dashboard</span>
+          </button>
+        )}
         <h1 style={{ margin: 0 }}>My Payroll</h1>
         <p style={{ margin: '4px 0 0', color: 'var(--text-muted)', fontSize: 13 }}>
           Download payslips, view your salary structure, manage reimbursements and tax declarations.

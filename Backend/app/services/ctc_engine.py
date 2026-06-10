@@ -322,16 +322,19 @@ def apply_lop(breakup: SalaryBreakup, lop_days: int, working_days: int) -> Salar
     transport = scale(breakup.transport_allowance)
     medical   = scale(breakup.medical_allowance)
     other     = scale(breakup.other_allowances)
-    pf_employer  = scale(breakup.pf_employer)
+    # Employer PF is NOT scaled — fixed at ₹1,800 per policy
+    pf_employer  = breakup.pf_employer
     gross        = _sum_money(basic, hra, da, lta, special, transport, medical, other, pf_employer)
 
-    pf_employee  = scale(breakup.pf_employee)
+    # Employee PF is NOT scaled — fixed at ₹1,800 per policy
+    pf_employee  = breakup.pf_employee
     esi_employee = scale(breakup.esi_employee)
     esi_employer = scale(breakup.esi_employer)
     pt           = breakup.professional_tax  # PT is NOT reduced for LOP
     tds          = scale(breakup.tds)
 
-    total_deductions = _sum_money(pf_employee, pf_employer, esi_employee, pt, tds)
+    # Employer PF is NOT in employee deductions — only employee-side deductions affect net_pay
+    total_deductions = _sum_money(pf_employee, esi_employee, pt, tds)
     net = _subtract_money(gross, total_deductions)
 
     return SalaryBreakup(

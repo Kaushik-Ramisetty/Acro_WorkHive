@@ -26,7 +26,7 @@ const BASE = '/employee-dashboard/finance-head-payroll';
 const WORKFLOW_STEPS = [
   { key: 'draft',                 label: 'Initiated',             short: 'Init' },
   { key: 'attendance_frozen',     label: 'Attendance Frozen',      short: 'Frozen' },
-  { key: 'processing',            label: 'Processing',             short: 'Processing' },
+  { key: 'processing',            label: 'Generated',              short: 'Generated' },
   { key: 'under_review',          label: 'Finance Review',         short: 'Review' },
   { key: 'error_found',           label: 'Error Found',            short: 'Error' },
   { key: 'pending_head_approval', label: 'Finance Head Approval',  short: 'Head Appr.' },
@@ -113,6 +113,36 @@ const ACTION_CARDS = [
     isPrimary: true,
   },
   {
+    id:       'salary-revision',
+    title:    'Salary Revision',
+    desc:     'Final approve or reject salary revision requests recommended by Finance',
+    icon:     '✏️',
+    gradient: 'from-amber-50 to-amber-100/60',
+    border:   'border-amber-200',
+    iconBg:   'bg-amber-100 text-amber-700',
+    titleClr: 'text-amber-800',
+  },
+  {
+    id:       'bonus-requests',
+    title:    'Bonus Requests',
+    desc:     'Final approve or reject one-time bonus requests recommended by Finance',
+    icon:     '🎁',
+    gradient: 'from-violet-50 to-violet-100/60',
+    border:   'border-violet-200',
+    iconBg:   'bg-violet-100 text-violet-700',
+    titleClr: 'text-violet-800',
+  },
+  {
+    id:       'off-cycle-payments',
+    title:    'Off-Cycle Payments',
+    desc:     'Review off-cycle bonus payments — return for rework or reject if not in order',
+    icon:     '💳',
+    gradient: 'from-amber-50 to-amber-100/60',
+    border:   'border-amber-200',
+    iconBg:   'bg-amber-100 text-amber-700',
+    titleClr: 'text-amber-800',
+  },
+  {
     id:       'summary',
     title:    'Payroll Summary',
     desc:     'Total payroll cost, department breakdown and per-employee details',
@@ -123,7 +153,7 @@ const ACTION_CARDS = [
     titleClr: 'text-blue-800',
   },
   {
-    id:       'bank-advice',
+    id:       'payslips',
     title:    'Payslips & Bank',
     desc:     'Payslip generation, bank transfer advice and compliance registers',
     icon:     '🏦',
@@ -156,7 +186,10 @@ function runStatusStyle(status) {
 }
 
 function runStatusLabel(status) {
-  if (status === 'pending_head_approval') return '⏳ Awaiting Your Approval';
+  if (status === 'pending_head_approval') return '⏳ Awaiting Finance Head Approval';
+  if (status === 'processing')            return 'Generated — Awaiting Finance Review';
+  if (status === 'under_review')          return 'Finance Review in Progress';
+  if (status === 'error_found')           return 'Errors Found — Awaiting Finance Resolution';
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
@@ -166,14 +199,32 @@ export default function FinanceHeadHome() {
   const [stats, setStats]   = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]   = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [hikeRequests, setHikeRequests] = useState([]);
+  const [hikePendingCount, setHikePendingCount] = useState(0);
+  const [bonusPendingCount, setBonusPendingCount] = useState(0);
+  const [hikeReviewingId, setHikeReviewingId] = useState(null);
+  const [rejectingHikeId, setRejectingHikeId] = useState(null);
+  const [hikeRejectComment, setHikeRejectComment] = useState('');
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
+    setNotice(null);
     financeApi.getAdminDashboardStats()
       .then(setStats)
       .catch((e) => setError(e?.data?.detail || e.message || 'Failed to load dashboard'))
       .finally(() => setLoading(false));
+    financeApi.listHikeRequests({ statusFilter: 'pending_finance_head_approval', limit: 10 })
+      .then((data) => {
+        const rows = Array.isArray(data) ? data : [];
+        setHikeRequests(rows);
+        setHikePendingCount(rows.length);
+      })
+      .catch(() => { setHikeRequests([]); setHikePendingCount(0); });
+    financeApi.getPendingBonusCount()
+      .then((data) => setBonusPendingCount(data?.head_count ?? data?.pending_count ?? 0))
+      .catch(() => setBonusPendingCount(0));
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -208,8 +259,106 @@ export default function FinanceHeadHome() {
   const recentRuns        = stats?.recent_runs || [];
   const isPendingApproval = runStatus === 'pending_head_approval';
 
+  const finalApprovalMessage = (status) => {
+    if (status === 'processing') {
+      return 'Payroll has been generated. Finance is reviewing employee-wise breakdown before submitting for your approval.';
+    }
+    if (status === 'under_review') {
+      return 'Finance team has submitted a correction. Awaiting Finance re-submission to your approval queue.';
+    }
+    if (status === 'error_found') {
+      return 'Payroll errors have been flagged by Finance. Awaiting resolution before submission.';
+    }
+    if (['approved', 'payslip_generated', 'published', 'closed'].includes(status)) {
+      return 'Finance Head approval is already complete for this payroll run.';
+    }
+    return 'Final approval opens after Finance submits the payroll run for Finance Head Approval.';
+  };
+
+  const APPROVAL_NAVIGABLE = [
+    'pending_head_approval', 'approved', 'payslip_generated', 'published', 'closed',
+  ];
+
+  const openFinalApproval = (status = runStatus) => {
+    if (APPROVAL_NAVIGABLE.includes(status)) {
+      setNotice(null);
+      navigate(`${BASE}/final-approval`);
+      return;
+    }
+    setNotice(finalApprovalMessage(status));
+  };
+
+  const openActionCard = (id) => {
+    if (id === 'final-approval') {
+      openFinalApproval();
+      return;
+    }
+    setNotice(null);
+    navigate(`${BASE}/${id}`);
+  };
+
+  const handleHeadApproveHike = async (id) => {
+    setHikeReviewingId(id);
+    try {
+      await financeApi.headApproveHikeRequest(id);
+      setNotice('Salary hike approved. New salary structure version created.');
+      load();
+    } catch (e) {
+      setNotice(e?.data?.detail || e.message || 'Failed to approve salary hike.');
+    } finally {
+      setHikeReviewingId(null);
+    }
+  };
+
+  const handleHeadRejectHike = async () => {
+    if (!rejectingHikeId) return;
+    setHikeReviewingId(rejectingHikeId);
+    try {
+      await financeApi.headRejectHikeRequest(rejectingHikeId, hikeRejectComment);
+      setRejectingHikeId(null);
+      setHikeRejectComment('');
+      setNotice('Salary hike rejected.');
+      load();
+    } catch (e) {
+      setNotice(e?.data?.detail || e.message || 'Failed to reject salary hike.');
+    } finally {
+      setHikeReviewingId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
+
+      {rejectingHikeId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6">
+            <h3 className="text-sm font-bold text-slate-800 mb-1">Final Reject — Salary Hike Request</h3>
+            <p className="text-xs text-slate-500 mb-3">This is the final rejection. The request will be closed.</p>
+            <textarea
+              value={hikeRejectComment}
+              onChange={e => setHikeRejectComment(e.target.value)}
+              rows={3}
+              placeholder="Reason for final rejection (required)..."
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-brand-400 resize-none"
+            />
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => { setRejectingHikeId(null); setHikeRejectComment(''); }}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleHeadRejectHike}
+                disabled={!hikeRejectComment.trim() || hikeReviewingId === rejectingHikeId}
+                className="rounded-lg bg-rose-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-600 disabled:opacity-50"
+              >
+                {hikeReviewingId === rejectingHikeId ? 'Rejecting...' : 'Final Reject'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Page header ──────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -223,14 +372,20 @@ export default function FinanceHeadHome() {
         </div>
         {isPendingApproval && (
           <button
-            onClick={() => navigate(`${BASE}/final-approval`)}
+            onClick={() => openFinalApproval()}
             className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 transition shadow-sm"
           >
             <span>✅</span>
-            <span>Approve Now</span>
+            <span>Review Approval</span>
           </button>
         )}
       </div>
+
+      {notice && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+          {notice}
+        </div>
+      )}
 
       {/* ── Pending-approval banner ───────────────────────────────────────── */}
       {isPendingApproval && (
@@ -248,7 +403,7 @@ export default function FinanceHeadHome() {
             </p>
           </div>
           <button
-            onClick={() => navigate(`${BASE}/final-approval`)}
+            onClick={() => openFinalApproval()}
             className="flex-shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 transition"
           >
             Review →
@@ -319,13 +474,23 @@ export default function FinanceHeadHome() {
           {ACTION_CARDS.map((card) => (
             <button
               key={card.id}
-              onClick={() => navigate(`${BASE}/${card.id}`)}
+              onClick={() => openActionCard(card.id)}
               className={`relative text-left rounded-xl border p-5 bg-gradient-to-br transition-all duration-200 hover:shadow-md hover:-translate-y-0.5 active:scale-[0.98] ${card.gradient} ${card.border}`}
             >
-              {/* Pending-approval badge on the Final Approval card */}
+              {/* Pending badges */}
               {card.id === 'final-approval' && isPendingApproval && (
                 <span className="absolute -top-2 -right-2 flex h-5 w-5 items-center justify-center rounded-full bg-rose-500 text-white text-[10px] font-bold shadow">
                   !
+                </span>
+              )}
+              {card.id === 'salary-revision' && hikePendingCount > 0 && (
+                <span className="absolute -top-2 -right-2 flex h-5 min-w-[20px] px-1 items-center justify-center rounded-full bg-amber-500 text-white text-[10px] font-bold shadow">
+                  {hikePendingCount}
+                </span>
+              )}
+              {card.id === 'bonus-requests' && bonusPendingCount > 0 && (
+                <span className="absolute -top-2 -right-2 flex h-5 min-w-[20px] px-1 items-center justify-center rounded-full bg-violet-500 text-white text-[10px] font-bold shadow">
+                  {bonusPendingCount}
                 </span>
               )}
 
@@ -422,12 +587,91 @@ export default function FinanceHeadHome() {
       )}
 
       {/* ── Recent payroll runs ───────────────────────────────────────────── */}
+      {hikeRequests.length > 0 && (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-soft">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-semibold text-slate-700">Salary Revision Requests</p>
+              <span className="inline-flex items-center rounded-full bg-blue-100 text-blue-800 px-2.5 py-0.5 text-xs font-bold">
+                {hikeRequests.length} Pending Final Approval
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => navigate(`${BASE}/bonus-requests`)}
+                className="text-xs text-violet-600 font-medium hover:underline"
+              >
+                Bonus Requests →
+              </button>
+              <button
+                onClick={() => navigate(`${BASE}/salary-revision`)}
+                className="text-xs text-brand-600 font-medium hover:underline"
+              >
+                Manage all revisions →
+              </button>
+            </div>
+          </div>
+          <div className="divide-y divide-slate-50">
+            {hikeRequests.map((req) => (
+              <div key={req.id} className="flex items-center justify-between px-5 py-3 hover:bg-slate-50 transition gap-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-semibold text-slate-800 truncate">{req.employee_name || '—'}</p>
+                    {req.employee_code && (
+                      <span className="text-xs text-slate-400 font-mono">{req.employee_code}</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {fmt(req.old_ctc)}
+                    {' → '}
+                    <span className="text-emerald-700 font-medium">{fmt(req.new_ctc)}</span>
+                    {' · Effective '}
+                    {req.effective_from || '—'}
+                  </p>
+                  {req.reviewed_by_name && (
+                    <p className="text-xs text-slate-400 truncate max-w-xs">
+                      Finance Reviewed by {req.reviewed_by_name}
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {req.finance_recommendation && (
+                    <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                      req.finance_recommendation === 'recommend_approval'
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-rose-100 text-rose-800'
+                    }`}>
+                      Finance: {req.finance_recommendation === 'recommend_approval' ? 'Recommends Approval' : 'Recommends Rejection'}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => handleHeadApproveHike(req.id)}
+                    disabled={hikeReviewingId === req.id}
+                    className="rounded bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 text-xs font-medium hover:bg-emerald-100 transition disabled:opacity-50"
+                    title="Give final approval and activate salary revision"
+                  >
+                    {hikeReviewingId === req.id ? '...' : 'Final Approve'}
+                  </button>
+                  <button
+                    onClick={() => { setRejectingHikeId(req.id); setHikeRejectComment(''); }}
+                    className="rounded bg-rose-50 text-rose-700 border border-rose-200 px-2.5 py-1 text-xs font-medium hover:bg-rose-100 transition"
+                    title="Reject this salary hike request"
+                  >
+                    Final Reject
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {recentRuns.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 shadow-soft">
           <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
             <p className="text-sm font-semibold text-slate-700">Recent Payroll Runs</p>
             <button
-              onClick={() => navigate(`${BASE}/final-approval`)}
+              onClick={() => openFinalApproval()}
               className="text-xs text-brand-600 font-medium hover:underline"
             >
               Open Approval →
@@ -438,7 +682,7 @@ export default function FinanceHeadHome() {
               <div
                 key={r.id}
                 className="flex items-center justify-between px-5 py-3 hover:bg-slate-50 transition cursor-pointer"
-                onClick={() => navigate(`${BASE}/final-approval`)}
+                onClick={() => openFinalApproval(r.status)}
               >
                 <div>
                   <p className="text-sm font-semibold text-slate-800">{r.month_label}</p>

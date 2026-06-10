@@ -1,6 +1,7 @@
 """Pydantic schemas for the Finance / Payroll module."""
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime
 from typing import Optional
 
@@ -32,6 +33,7 @@ class SalaryStructureBase(BaseModel):
 
 class SalaryStructureIn(SalaryStructureBase):
     employee_id: int
+    annual_ctc: float = 0.0
     revision_reason: Optional[str] = None
 
 
@@ -77,10 +79,17 @@ class SalaryStructureOut(SalaryStructureBase):
 class PayrollRunCreate(BaseModel):
     pay_period_start: date
     pay_period_end: date
-    month_label: str = Field(..., example="April 2025")
+    month_label: Optional[str] = Field(default=None, example="April 2025")
     month: Optional[int] = None
     year: Optional[int] = None
     notes: Optional[str] = None
+
+    @model_validator(mode='after')
+    def _derive_period_fields(self) -> 'PayrollRunCreate':
+        self.month_label = f"{calendar.month_name[self.pay_period_start.month]} {self.pay_period_start.year}"
+        self.month = self.pay_period_start.month
+        self.year = self.pay_period_start.year
+        return self
 
 
 class PayrollRunStatusUpdate(BaseModel):
@@ -117,6 +126,13 @@ class PayrollRunOut(BaseModel):
     total_pt: float
     attendance_locked: bool = False
     payroll_locked: bool = False
+    finance_reviewed: bool = False
+    finance_head_approved: bool = False
+    open_errors: int = 0
+    payslip_generation_unlocked: bool = False
+    payslip_generated_count: int = 0
+    payslip_published_count: int = 0
+    is_read_only: bool = False
     initiated_at: Optional[datetime]
     processed_at: Optional[datetime]
     approved_at: Optional[datetime]
@@ -126,6 +142,21 @@ class PayrollRunOut(BaseModel):
     notes: Optional[str]
     created_at: datetime
     updated_at: datetime
+    # Populated when Finance Head has returned the run (head_reject action)
+    head_return_reason: Optional[str] = None
+    head_return_at: Optional[datetime] = None
+    head_returned_by: Optional[str] = None
+    # Bank advice tracking
+    bank_advice_path: Optional[str] = None
+    bank_advice_generated_at: Optional[datetime] = None
+    bank_advice_status: Optional[str] = None
+
+    @model_validator(mode='after')
+    def _derive_period_fields(self) -> 'PayrollRunOut':
+        self.month_label = f"{calendar.month_name[self.pay_period_start.month]} {self.pay_period_start.year}"
+        self.month = self.pay_period_start.month
+        self.year = self.pay_period_start.year
+        return self
 
     class Config:
         from_attributes = True
@@ -133,12 +164,18 @@ class PayrollRunOut(BaseModel):
 
 # ─── Payroll Run Employee ─────────────────────────────────────────────────────
 
+class PayrollComponentOut(BaseModel):
+    label: str
+    amount: float
+
+
 class PayrollRunEmployeeOut(BaseModel):
     id: int
     payroll_record_id: Optional[int] = None
     run_id: int
     payroll_run_id: Optional[int] = None
     employee_id: int
+    employee_code: Optional[str] = None
     employee_name: Optional[str] = None
     department: Optional[str] = None
     designation: Optional[str] = None
@@ -146,12 +183,16 @@ class PayrollRunEmployeeOut(BaseModel):
     # Null only for rows generated before the versioning migration.
     salary_structure_id: Optional[int] = None
     salary_assignment_id: Optional[int] = None
+    annual_ctc: float = 0.0
     total_working_days: int = 0
     working_days: int
     payable_days: float = 0.0
     present_days: int
     leave_days: int
     lop_days: int
+    holiday_days: int = 0
+    attendance_reconciled: bool = True
+    attendance_reconciliation_delta: int = 0
     gross_salary: float
     gross_earnings: float = 0.0
     basic: float
@@ -165,6 +206,9 @@ class PayrollRunEmployeeOut(BaseModel):
     variable_pay: float = 0.0
     overtime_amount: float = 0.0
     allowances: float
+    earnings_components: list[PayrollComponentOut] = Field(default_factory=list)
+    earnings_total: float = 0.0
+    earnings_reconciliation_delta: float = 0.0
     employee_pf: float = 0.0
     pf_employee: float
     pf_employer: float = 0.0

@@ -54,6 +54,13 @@ const TYPE_PAGE = {
   announcement: 'announcements', policy_published: 'policies',
   sla_escalation: 'approvals', hr_escalation: 'approvals',
   compliance_alert: 'reports',
+  // PMS Phase 1
+  pms_goals_assigned: 'performance', pms_goals_discussed: 'performance',
+  pms_goals_approved: 'performance', pms_goals_locked: 'performance',
+  // PMS Phase 2
+  pms_mid_cycle_created: 'performance', pms_progress_submitted: 'performance',
+  pms_manager_reviewed_progress: 'performance', pms_mid_cycle_manager_approved: 'performance',
+  pms_mid_cycle_hr_reviewed: 'performance', pms_mid_cycle_locked: 'performance',
 };
 
 const REF_PAGE = {
@@ -66,6 +73,8 @@ const REF_PAGE = {
   payroll_runs: 'payroll',
   announcements: 'announcements',
   policies: 'policies',
+  pms_goal_assignments: 'performance',
+  pms_mid_cycle_reviews: 'performance',
 };
 
 /**

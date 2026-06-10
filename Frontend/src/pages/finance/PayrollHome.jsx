@@ -1,13 +1,13 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import financeApi from '../../services/financeApi';
 import SalaryHikeModal from '../../components/SalaryHikeModal';
 
 const WORKFLOW_STEPS = [
   { key: 'draft',                   label: 'Initiated',                     short: 'Init' },
-  { key: 'attendance_frozen',       label: 'Attendance Frozen',             short: 'Frozen' },
-  { key: 'processing',              label: 'Processing',                    short: 'Processing' },
+  { key: 'attendance_frozen',       label: 'Payroll Input Frozen',          short: 'Frozen' },
+  { key: 'processing',              label: 'Generated',                     short: 'Generated' },
   { key: 'under_review',            label: 'Finance Review',                short: 'Review' },
   { key: 'error_found',             label: 'Error Found',                   short: 'Error' },
   { key: 'pending_head_approval',   label: 'Finance Head Approval',         short: 'Head Appr.' },
@@ -117,9 +117,10 @@ function DeptTable({ rows }) {
 }
 
 const HIKE_STATUS_STYLES = {
-  pending_finance_review: { bg: 'bg-amber-100 text-amber-800', label: 'Pending Review' },
-  approved:  { bg: 'bg-emerald-100 text-emerald-800', label: 'Approved' },
-  rejected:  { bg: 'bg-rose-100 text-rose-800', label: 'Rejected' },
+  pending_finance_review: { bg: 'bg-amber-100 text-amber-800', label: 'Pending Finance Review' },
+  pending_finance_head_approval: { bg: 'bg-blue-100 text-blue-800', label: 'Finance Reviewed / Pending Finance Head Approval' },
+  approved: { bg: 'bg-emerald-100 text-emerald-800', label: 'Approved' },
+  rejected: { bg: 'bg-rose-100 text-rose-800', label: 'Rejected' },
 };
 
 function HikeStatusBadge({ status }) {
@@ -131,26 +132,23 @@ function HikeStatusBadge({ status }) {
   );
 }
 
-// ── Temporary payroll bridge — current payroll period ─────────────────────────
-// Temporary payroll bridge until Attendance/Timesheet modules integrate.
-const _NOW = new Date();
-const CUR_PAYROLL_MONTH = _NOW.getMonth() + 1; // 1-based (1=Jan … 12=Dec)
-const CUR_PAYROLL_YEAR  = _NOW.getFullYear();
-const _MONTH_NAMES = [
-  'January','February','March','April','May','June',
-  'July','August','September','October','November','December',
-];
+const formatPayrollMonth = (month, year) => (
+  new Date(year, month - 1, 1).toLocaleString('en-IN', { month: 'long', year: 'numeric' })
+);
 
 export default function FinanceHome() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { role } = useAuth();
   // Base path for admin payroll navigation.
   const r = (role || '').toLowerCase();
-  const FINANCE_BASE = r === 'admin' ? '/admin-dashboard/payroll' : '/employee-dashboard/finance-payroll';
+  const isAdminOrHr = r === 'admin' || r === 'hr';
+  const FINANCE_BASE = (r === 'admin' || r === 'hr') ? '/admin-dashboard/payroll' : '/employee-dashboard/finance-payroll';
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [selectedRunId, setSelectedRunId] = useState(null);
+  const restoredDashboardState = location.state?.payrollDashboardState || {};
+  const [selectedRunId, setSelectedRunId] = useState(restoredDashboardState.selectedRunId ?? null);
 
   // Salary hike state
   const [showHikeModal, setShowHikeModal] = useState(false);
@@ -165,17 +163,23 @@ export default function FinanceHome() {
   // Temporary payroll bridge until Attendance/Timesheet modules integrate.
   const [attSummary, setAttSummary]           = useState(null);
   const [attLoading, setAttLoading]           = useState(false);
-  const [attActionLoading, setAttActionLoading] = useState(null); // 'seed'|'validate'|'freeze'
+  const [attActionLoading, setAttActionLoading] = useState(null); // 'validate'|'freeze'|'reset'
   const [attNotification, setAttNotification] = useState(null);  // {type:'success'|'warning'|'error', msg}
+  const [attMonth, setAttMonth]               = useState(restoredDashboardState.attMonth ?? null);
+  const [attYear, setAttYear]                 = useState(restoredDashboardState.attYear ?? null);
+  const [availableMonths, setAvailableMonths] = useState([]);
 
-  const load = useCallback((runId) => {
+  const load = useCallback((runId, month, year) => {
     setLoading(true);
     setError(null);
-    financeApi.getAdminDashboardStats(runId)
+    financeApi.getAdminDashboardStats(runId, month, year)
       .then((data) => {
         setStats(data);
-        if (!runId && data.current_run?.id) {
-          setSelectedRunId(data.current_run.id);
+        // Always sync selectedRunId to whatever the backend returned.
+        // When month+year were passed and no run exists, current_run is null →
+        // selectedRunId becomes null so the workflow shows the "no run" state.
+        if (!runId) {
+          setSelectedRunId(data.current_run?.id ?? null);
         }
       })
       .catch((e) => setError(e?.data?.detail || e.message || 'Failed to load dashboard'))
@@ -192,20 +196,63 @@ export default function FinanceHome() {
   }, []);
 
   // Temporary payroll bridge until Attendance/Timesheet modules integrate.
-  const loadAttendanceSummary = useCallback(() => {
+  const loadAttendanceSummary = useCallback((month, year) => {
+    if (!month || !year) return;
     setAttLoading(true);
-    financeApi.getPayrollAttendanceSummary(CUR_PAYROLL_MONTH, CUR_PAYROLL_YEAR)
+    financeApi.getPayrollAttendanceSummary(month, year)
       .then(setAttSummary)
       .catch(() => setAttSummary(null))
       .finally(() => setAttLoading(false));
   }, []);
 
-  useEffect(() => { load(null); loadHikeData(); loadAttendanceSummary(); }, [load, loadHikeData, loadAttendanceSummary]);
+  useEffect(() => {
+    const restored = location.state?.payrollDashboardState || {};
+    const restoredRunId = restored.selectedRunId ?? null;
+    loadHikeData();
+
+    const initDashboard = (month, year) => {
+      loadAttendanceSummary(month, year);
+      if (restoredRunId) {
+        // Restored navigation state: honour the specific run the user was viewing.
+        setSelectedRunId(restoredRunId);
+        load(restoredRunId);
+      } else {
+        // Normal entry: load the workflow run that belongs to the selected month.
+        // Backend returns current_run=null when no run exists for that month.
+        load(null, month, year);
+      }
+    };
+
+    financeApi.getOpenPayrollMonth()
+      .then(data => {
+        const month = restored.attMonth ?? data.month;
+        const year = restored.attYear ?? data.year;
+        setAttMonth(month);
+        setAttYear(year);
+        setAvailableMonths(data.available_months || []);
+        initDashboard(month, year);
+      })
+      .catch(() => {
+        const n = new Date();
+        const m = restored.attMonth ?? (n.getMonth() + 1);
+        const y = restored.attYear ?? n.getFullYear();
+        setAttMonth(m);
+        setAttYear(y);
+        initDashboard(m, y);
+      });
+  }, [load, loadHikeData, loadAttendanceSummary, location.state]);
 
   const handleRunChange = (e) => {
     const val = e.target.value ? parseInt(e.target.value, 10) : null;
     setSelectedRunId(val);
     load(val);
+    // Keep attendance month in sync with the selected run.
+    const selectedRun = recentRuns.find((r) => r.id === val);
+    if (selectedRun?.month && selectedRun?.year) {
+      setAttMonth(selectedRun.month);
+      setAttYear(selectedRun.year);
+      loadAttendanceSummary(selectedRun.month, selectedRun.year);
+    }
   };
 
   const handleHikeSubmitted = (result) => {
@@ -221,7 +268,7 @@ export default function FinanceHome() {
       await financeApi.approveHikeRequest(reqId);
       loadHikeData();
     } catch (err) {
-      console.error('Approve failed:', err);
+      console.error('Recommend approval failed:', err);
     } finally {
       setReviewingId(null);
     }
@@ -236,7 +283,7 @@ export default function FinanceHome() {
       setRejectComment('');
       loadHikeData();
     } catch (err) {
-      console.error('Reject failed:', err);
+      console.error('Recommend rejection failed:', err);
     } finally {
       setReviewingId(null);
     }
@@ -244,26 +291,12 @@ export default function FinanceHome() {
 
   // ── Payroll Input Readiness handlers — Temporary payroll bridge ───────────
   // Temporary payroll bridge until Attendance/Timesheet modules integrate.
-  const handleCreateDummy = async () => {
-    setAttActionLoading('seed');
-    setAttNotification(null);
-    try {
-      await financeApi.seedPayrollAttendanceDummy(CUR_PAYROLL_MONTH, CUR_PAYROLL_YEAR);
-      loadAttendanceSummary();
-      setAttNotification({ type: 'success', msg: 'Dummy attendance summary created for all employees.' });
-    } catch (e) {
-      setAttNotification({ type: 'error', msg: e?.data?.detail || 'Failed to create dummy summary.' });
-    } finally {
-      setAttActionLoading(null);
-    }
-  };
-
   const handleValidateSummary = async () => {
     setAttActionLoading('validate');
     setAttNotification(null);
     try {
-      const res = await financeApi.validatePayrollAttendance(CUR_PAYROLL_MONTH, CUR_PAYROLL_YEAR);
-      loadAttendanceSummary();
+      const res = await financeApi.validatePayrollAttendance(attMonth, attYear);
+      loadAttendanceSummary(attMonth, attYear);
       const msg = res?.can_freeze
         ? `Validation passed — all ${res.validation_passed} employees ready for payroll.`
         : `Validation done — ${res.validation_failed || 0} issue(s) found.`;
@@ -279,9 +312,9 @@ export default function FinanceHome() {
     setAttActionLoading('freeze');
     setAttNotification(null);
     try {
-      await financeApi.freezePayrollAttendance(CUR_PAYROLL_MONTH, CUR_PAYROLL_YEAR);
-      loadAttendanceSummary();
-      setAttNotification({ type: 'success', msg: 'Attendance frozen for payroll. Finance team has been notified.' });
+      await financeApi.freezePayrollAttendance(attMonth, attYear);
+      loadAttendanceSummary(attMonth, attYear);
+      setAttNotification({ type: 'success', msg: 'Payroll input frozen. Finance team has been notified.' });
     } catch (e) {
       setAttNotification({ type: 'error', msg: e?.data?.detail || 'Freeze failed.' });
     } finally {
@@ -294,13 +327,31 @@ export default function FinanceHome() {
     setAttActionLoading('reset');
     setAttNotification(null);
     try {
-      await financeApi.resetPayrollAttendanceFreeze(CUR_PAYROLL_MONTH, CUR_PAYROLL_YEAR);
-      loadAttendanceSummary();
+      await financeApi.resetPayrollAttendanceFreeze(attMonth, attYear);
+      loadAttendanceSummary(attMonth, attYear);
       setAttNotification({ type: 'warning', msg: '[DEV] Freeze reset — rows are ready for re-testing. Validate and freeze again.' });
     } catch (e) {
       setAttNotification({ type: 'error', msg: e?.data?.detail || 'Reset failed.' });
     } finally {
       setAttActionLoading(null);
+    }
+  };
+
+  // DEMO ONLY — clears payroll runs for May/June/July 2026 so demo can run from scratch.
+  const [demoResetBusy, setDemoResetBusy] = useState(false);
+  const [demoResetMsg, setDemoResetMsg]   = useState('');
+  const handleDemoReset = async () => {
+    if (!window.confirm('Reset ALL payroll data for May, June, July 2026?\n\nThis will delete payroll runs and unfreeze attendance summary rows. Employee data, salary structures and attendance records are preserved.')) return;
+    setDemoResetBusy(true);
+    setDemoResetMsg('');
+    try {
+      const res = await financeApi.demoReset({ months: [5, 6, 7], year: 2026 });
+      setDemoResetMsg(`Demo reset complete — ${res.deleted?.payroll_runs ?? 0} run(s) deleted. Page will reload.`);
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (e) {
+      setDemoResetMsg(`Reset failed: ${e?.data?.detail || e?.message || 'Unknown error'}`);
+    } finally {
+      setDemoResetBusy(false);
     }
   };
 
@@ -322,7 +373,26 @@ export default function FinanceHome() {
 
   const run = stats?.current_run;
   const runStatus = run?.status || 'none';
-  const recentRuns = stats?.recent_runs || [];
+  // Deduplicate recent_runs client-side as a safety net (backend already deduplicates)
+  const _rawRecentRuns = stats?.recent_runs || [];
+  const _STATUS_RANK_HOME = {
+    draft: 0, attendance_frozen: 1, processing: 2,
+    under_review: 3, pending_head_approval: 4, approved: 5,
+    payslip_generated: 6, bank_advice_generated: 7, published: 8, closed: 9,
+  };
+  const _dedupHome = {};
+  for (const _r of _rawRecentRuns) {
+    const _m = _r.month || (_r.pay_period_start ? new Date(_r.pay_period_start + 'T00:00:00').getMonth() + 1 : 0);
+    const _y = _r.year || (_r.pay_period_start ? new Date(_r.pay_period_start + 'T00:00:00').getFullYear() : 0);
+    const _k = `${_y}-${_m}`;
+    if (!_dedupHome[_k] || (_STATUS_RANK_HOME[_r.status] ?? -1) > (_STATUS_RANK_HOME[_dedupHome[_k].status] ?? -1)) {
+      _dedupHome[_k] = _r;
+    }
+  }
+  const recentRuns = Object.values(_dedupHome).sort((a, b) => {
+    const ay = a.year || 0, by2 = b.year || 0, am = a.month || 0, bm = b.month || 0;
+    return by2 !== ay ? by2 - ay : bm - am;
+  });
   const isReadOnly = run?.is_read_only;
 
   // ── Payroll Input Readiness computed values — Temporary payroll bridge ────
@@ -338,7 +408,15 @@ export default function FinanceHome() {
   const attReadyCount  = attSummary?.ready_count ?? 0;
   // Can freeze when every active employee has is_ready_for_payroll=true (attendance_overall='ready')
   const attCanFreeze   = attIsReady;
-  const attMonthLabel  = `${_MONTH_NAMES[CUR_PAYROLL_MONTH - 1]} ${CUR_PAYROLL_YEAR}`;
+  const attMonthLabel  = attSummary?.month_label
+    || (attMonth && attYear ? formatPayrollMonth(attMonth, attYear) : '…');
+
+  const attHasMismatch = (attSummary?.rows ?? []).some(
+    row => row.total_working_days != null && (
+      (row.present_days ?? 0) > row.total_working_days ||
+      (row.leave_days ?? 0) + (row.lop_days ?? 0) > row.total_working_days
+    )
+  );
 
   return (
     <div className="space-y-6">
@@ -354,12 +432,15 @@ export default function FinanceHome() {
       {rejectingId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6">
-            <h3 className="text-sm font-bold text-slate-800 mb-3">Reject Hike Request</h3>
+            <h3 className="text-sm font-bold text-slate-800 mb-1">Recommend Rejection to Finance Head</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              Your recommendation will be forwarded to Finance Head for final decision.
+            </p>
             <textarea
               value={rejectComment}
               onChange={e => setRejectComment(e.target.value)}
               rows={3}
-              placeholder="Reason for rejection (required)..."
+              placeholder="Reason for recommending rejection (required)..."
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-brand-400 resize-none"
             />
             <div className="flex justify-end gap-2 mt-4">
@@ -374,7 +455,7 @@ export default function FinanceHome() {
                 disabled={!rejectComment.trim() || reviewingId === rejectingId}
                 className="rounded-lg bg-rose-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-600 disabled:opacity-50"
               >
-                {reviewingId === rejectingId ? 'Rejecting…' : 'Confirm Reject'}
+                {reviewingId === rejectingId ? 'Submitting…' : 'Recommend Rejection'}
               </button>
             </div>
           </div>
@@ -385,49 +466,74 @@ export default function FinanceHome() {
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <h1 className="text-xl font-bold text-slate-800">
-            {(role || '').toLowerCase() === 'admin' ? 'Admin Payroll Dashboard' : 'Payroll Review'}
+            {r === 'admin' ? 'Admin Payroll Dashboard' : r === 'hr' ? 'HR Payroll Dashboard' : 'Payroll Review'}
           </h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            {run
+            {isAdminOrHr
+              ? attMonthLabel
+              : run
               ? `${isReadOnly ? '🔒 ' : ''}${run.month_label}${isReadOnly ? ' · Read-only' : ' · Active'}`
               : 'No active payroll run'}
           </p>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Payroll Run Selector */}
-          <select
-            value={selectedRunId || ''}
-            onChange={handleRunChange}
-            disabled={loading}
-            className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-brand-400"
-            style={{ minWidth: 200 }}
-          >
-            <option value="">— Select Payroll Run —</option>
-            {recentRuns.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.month_label} · {r.status.replace(/_/g, ' ')}
-              </option>
-            ))}
-          </select>
+          {/* Payroll Run Selector — Finance / Finance Head only */}
+          {['finance', 'finance_head'].includes((role || '').toLowerCase()) && (
+            <select
+              value={selectedRunId || ''}
+              onChange={handleRunChange}
+              disabled={loading}
+              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-brand-400"
+              style={{ minWidth: 200 }}
+            >
+              <option value="">— Select Payroll Run —</option>
+              {recentRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.month_label} · {r.status.replace(/_/g, ' ')}
+                </option>
+              ))}
+            </select>
+          )}
           {isReadOnly && (
             <span className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
               🔒 Closed — Read Only
             </span>
           )}
-          <button
-            onClick={() => navigate(`${FINANCE_BASE}/payroll-runs`)}
-            className="flex items-center gap-2 rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 transition"
-          >
-            <span>Manage Payroll Runs</span>
-            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
-          </button>
-          {(role || '').toLowerCase() === 'admin' && (
+          {(role || '').toLowerCase() !== 'admin' && (
+            <button
+              onClick={() => navigate(`${FINANCE_BASE}/payroll-runs`)}
+              className="flex items-center gap-2 rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 transition"
+            >
+              <span>Manage Payroll Runs</span>
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+          )}
+          {isAdminOrHr && (
             <button
               onClick={() => setShowHikeModal(true)}
               className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 transition"
             >
               <span>+</span>
               <span>Give Salary Hike</span>
+            </button>
+          )}
+          {isAdminOrHr && (
+            <button
+              onClick={() => navigate('/admin-dashboard/my-payroll', {
+                state: {
+                  fromPayrollDashboard: true,
+                  backTo: location.pathname + location.search,
+                  payrollDashboardState: { selectedRunId, attMonth, attYear },
+                },
+              })}
+              className="flex items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-700 transition"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="2" y="5" width="20" height="14" rx="2" />
+                <line x1="2" y1="10" x2="22" y2="10" />
+                <path d="M7 15h4" /><path d="M15 14h2" />
+              </svg>
+              <span>My Payroll</span>
             </button>
           )}
         </div>
@@ -464,7 +570,7 @@ export default function FinanceHome() {
             <p className="text-sm font-semibold text-blue-800">
               {pendingHikeCount} salary hike request{pendingHikeCount > 1 ? 's' : ''} pending your review
             </p>
-            <p className="text-xs text-blue-700 mt-0.5">Review and approve or reject below</p>
+            <p className="text-xs text-blue-700 mt-0.5">Review and recommend approval or rejection — Finance Head will give the final decision</p>
           </div>
         </div>
       )}
@@ -478,10 +584,10 @@ export default function FinanceHome() {
               {run.open_errors} unresolved payroll error{run.open_errors > 1 ? 's' : ''} require attention
             </p>
             <button
-              onClick={() => navigate(`${FINANCE_BASE}/errors`)}
+              onClick={() => navigate(`${FINANCE_BASE}/review`)}
               className="mt-1 text-xs text-amber-700 underline"
             >
-              Review errors →
+              Open Finance Review →
             </button>
           </div>
         </div>
@@ -504,26 +610,83 @@ export default function FinanceHome() {
         </div>
       )}
 
+      {run && runStatus === 'approved' && (
+        <div className="flex items-start gap-3 rounded-xl border border-teal-200 bg-teal-50 p-4">
+          <span className="text-teal-500 text-lg mt-0.5">📄</span>
+          <div>
+            <p className="text-sm font-semibold text-teal-800">
+              Finance Head has approved — Generate payslips to continue
+            </p>
+            <button
+              onClick={() => navigate(r === 'admin' ? `${FINANCE_BASE}/approval` : `${FINANCE_BASE}/head-approval`)}
+              className="mt-1 text-xs text-teal-700 underline"
+            >
+              Open Approval →
+            </button>
+          </div>
+        </div>
+      )}
+
+      {run && runStatus === 'payslip_generated' && (
+        <div className="flex items-start gap-3 rounded-xl border border-teal-200 bg-teal-50 p-4">
+          <span className="text-teal-500 text-lg mt-0.5">🚀</span>
+          <div>
+            <p className="text-sm font-semibold text-teal-800">
+              Payslips generated — Publish to ESS to complete the cycle
+            </p>
+            <button
+              onClick={() => navigate(r === 'admin' ? `${FINANCE_BASE}/approval` : `${FINANCE_BASE}/head-approval`)}
+              className="mt-1 text-xs text-teal-700 underline"
+            >
+              Open Approval →
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Payroll Input Readiness ─────────────────────────────────────────── */}
       {/* Temporary payroll bridge until Attendance/Timesheet modules integrate. */}
-      {(role || '').toLowerCase() === 'admin' && (
+      {isAdminOrHr && (
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-soft">
           {/* Card header */}
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
               Payroll Input Readiness — {attMonthLabel}
             </p>
-            <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-              attIsFrozen   ? 'bg-emerald-100 text-emerald-700'
-              : attNoSummary ? 'bg-rose-100   text-rose-700'
-              : attIsReady   ? 'bg-blue-100   text-blue-700'
-              :                'bg-amber-100  text-amber-700'
-            }`}>
-              {attIsFrozen   ? '🔒 Frozen'
-               : attNoSummary ? '⚠ Not Created'
-               : attIsReady   ? '✓ Ready'
-               :                '⚠ Partial'}
-            </span>
+            <div className="flex items-center gap-2">
+              {availableMonths.length > 1 && attMonth && attYear && (
+                <select
+                  value={`${attYear}-${attMonth}`}
+                  onChange={e => {
+                    const [y, m] = e.target.value.split('-').map(Number);
+                    setAttMonth(m);
+                    setAttYear(y);
+                    loadAttendanceSummary(m, y);
+                    // Reload workflow progress for the selected month.
+                    // Backend returns current_run=null when no run exists.
+                    load(null, m, y);
+                  }}
+                  className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-brand-400"
+                >
+                  {availableMonths.map(opt => (
+                    <option key={`${opt.year}-${opt.month}`} value={`${opt.year}-${opt.month}`}>
+                      {opt.month_label}{opt.is_fully_frozen ? ' · Frozen' : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                attIsFrozen   ? 'bg-emerald-100 text-emerald-700'
+                : attNoSummary ? 'bg-rose-100   text-rose-700'
+                : attIsReady   ? 'bg-blue-100   text-blue-700'
+                :                'bg-amber-100  text-amber-700'
+              }`}>
+                {attIsFrozen   ? '🔒 Frozen'
+                 : attNoSummary ? '⚠ Not Created'
+                 : attIsReady   ? '✓ Ready'
+                 :                '⚠ Partial'}
+              </span>
+            </div>
           </div>
 
           {/* Loading spinner */}
@@ -561,10 +724,13 @@ export default function FinanceHome() {
                 <div className="bg-slate-50 rounded-lg p-3">
                   <p className="text-xs text-slate-500">Issues</p>
                   <p className={`font-mono font-bold mt-0.5 ${
-                    (attDisplayIssues ?? 0) > 0 ? 'text-rose-600' : 'text-emerald-700'
+                    (attDisplayIssues ?? 0) > 0 || attHasMismatch ? 'text-rose-600' : 'text-emerald-700'
                   }`}>
                     {attDisplayIssues ?? '—'}
                   </p>
+                  {attHasMismatch && (
+                    <p className="mt-0.5 text-[10px] text-rose-500">+ day-count errors</p>
+                  )}
                 </div>
                 <div className="bg-slate-50 rounded-lg p-3 md:col-span-2">
                   <p className="text-xs text-slate-500">Status</p>
@@ -575,12 +741,143 @@ export default function FinanceHome() {
                     :                'text-amber-700'
                   }`}>
                     {attIsFrozen   ? 'Frozen for Payroll'
-                     : attIsReady   ? 'Ready for HR Freeze'
+                     : attIsReady   ? 'Ready for Input Freeze'
                      : attNoSummary ? 'Not Created'
                      :                'Partial — Validate Required'}
                   </p>
                 </div>
               </div>
+
+              {/* ── Payroll Input Details (read-only, pre-freeze) ─────────── */}
+              {!attNoSummary && attSummary?.rows?.length > 0 && (
+                <details className="group mb-4">
+                  <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-800">
+                    <span className="inline-block text-slate-400 transition-transform group-open:rotate-90">▶</span>
+                    Payroll Input Details — {attMonthLabel}
+                    <span className="ml-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+                      {attSummary.rows.length} employees
+                    </span>
+                  </summary>
+                  <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 bg-slate-50">
+                          <th className="whitespace-nowrap px-3 py-2 font-semibold text-slate-500">Emp Code</th>
+                          <th className="whitespace-nowrap px-3 py-2 font-semibold text-slate-500">Employee Name</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">Working Days</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">Present Days</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">Paid Leave Days</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">LOP Days</th>
+                          <th className="whitespace-nowrap px-3 py-2 font-semibold text-slate-500">LOP Source</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">LOP Status</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">Payable Days</th>
+                          <th className="whitespace-nowrap px-3 py-2 text-center font-semibold text-slate-500">Validation Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {attSummary.rows.map((row) => {
+                          const mismatch =
+                            row.total_working_days != null && (
+                              (row.present_days ?? 0) > row.total_working_days ||
+                              (row.leave_days ?? 0) + (row.lop_days ?? 0) > row.total_working_days
+                            );
+                          return (
+                            <tr
+                              key={row.employee_id}
+                              className={`transition ${mismatch ? 'bg-rose-50' : 'hover:bg-slate-50'}`}
+                            >
+                              <td className="whitespace-nowrap px-3 py-2 font-mono text-slate-600">
+                                {row.employee_code ?? '—'}
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2 font-medium text-slate-800">
+                                {row.employee_name}
+                                {mismatch && (
+                                  <span className="ml-1.5 text-[10px] text-rose-500">⚠ day count mismatch</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2 text-center font-mono text-slate-700">
+                                {row.total_working_days ?? '—'}
+                              </td>
+                              <td className="px-3 py-2 text-center font-mono text-slate-700">
+                                {row.present_days ?? '—'}
+                              </td>
+                              <td className="px-3 py-2 text-center font-mono text-slate-700">
+                                {row.leave_days ?? '—'}
+                              </td>
+                              <td className={`px-3 py-2 text-center font-mono font-semibold ${
+                                (row.lop_days ?? 0) > 0 ? 'text-rose-600' : 'text-slate-700'
+                              }`}>
+                                {row.lop_days ?? '—'}
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2 text-slate-700">
+                                {row.lop_source || 'Leave Management'}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${
+                                  (row.lop_status || 'ready') === 'ready'
+                                    ? 'bg-emerald-100 text-emerald-700'
+                                    : 'bg-amber-100 text-amber-700'
+                                }`}>
+                                  {(row.lop_status || 'ready').replace(/_/g, ' ')}
+                                </span>
+                                {row.lop_warning && (
+                                  <p className="mt-1 max-w-[220px] text-left text-[10px] font-medium text-amber-700">
+                                    {row.lop_warning}
+                                  </p>
+                                )}
+                              </td>
+                              <td className="px-3 py-2 text-center font-mono font-semibold text-slate-800">
+                                {row.payable_days ?? '—'}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${
+                                  row.validation_status === 'passed'  ? 'bg-emerald-100 text-emerald-700'
+                                  : row.validation_status === 'failed' ? 'bg-rose-100 text-rose-700'
+                                  :                                       'bg-amber-100 text-amber-700'
+                                }`}>
+                                  {row.validation_status ?? 'pending'}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {/* Totals row */}
+                        <tr className="border-t-2 border-slate-300 bg-slate-100 font-semibold">
+                          <td className="px-3 py-2" />
+                          <td className="whitespace-nowrap px-3 py-2 text-slate-600">Totals</td>
+                          <td className="px-3 py-2 text-center font-mono text-slate-800">
+                            {attSummary.rows.reduce((s, r) => s + (r.total_working_days ?? 0), 0)}
+                          </td>
+                          <td className="px-3 py-2 text-center font-mono text-slate-800">
+                            {attSummary.rows.reduce((s, r) => s + (r.present_days ?? 0), 0)}
+                          </td>
+                          <td className="px-3 py-2 text-center font-mono text-slate-800">
+                            {attSummary.rows.reduce((s, r) => s + (r.leave_days ?? 0), 0)}
+                          </td>
+                          <td className={`px-3 py-2 text-center font-mono font-semibold ${
+                            attSummary.rows.reduce((s, r) => s + (r.lop_days ?? 0), 0) > 0
+                              ? 'text-rose-600' : 'text-slate-800'
+                          }`}>
+                            {attSummary.rows.reduce((s, r) => s + (r.lop_days ?? 0), 0)}
+                          </td>
+                          <td className="px-3 py-2 text-slate-600">Leave Management</td>
+                          <td className="px-3 py-2 text-center text-slate-600">
+                            {attSummary.rows.some(r => r.lop_status === 'reopen_required') ? 'Review' : 'Ready'}
+                          </td>
+                          <td className="px-3 py-2 text-center font-mono text-slate-800">
+                            {attSummary.rows.reduce((s, r) => s + (r.payable_days ?? 0), 0).toFixed(1)}
+                          </td>
+                          <td className="px-3 py-2 text-center text-slate-600">
+                            {attSummary.rows.filter(r => r.validation_status === 'passed').length}
+                            {' / '}
+                            {attSummary.rows.length}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              )}
 
               {/* Inline notification */}
               {attNotification && (
@@ -598,15 +895,11 @@ export default function FinanceHome() {
 
               {/* Action buttons */}
               <div className="flex items-center gap-2 flex-wrap">
-                {/* No summary yet — show Create Dummy Summary */}
+                {/* No summary yet — wait for attendance/manual input; no dummy payroll input */}
                 {attNoSummary && (
-                  <button
-                    onClick={handleCreateDummy}
-                    disabled={!!attActionLoading}
-                    className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 transition disabled:opacity-50"
-                  >
-                    {attActionLoading === 'seed' ? 'Creating…' : 'Create Dummy Summary'}
-                  </button>
+                  <span className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2 text-sm font-medium text-slate-500">
+                    Attendance summary pending
+                  </span>
                 )}
 
                 {/* Summary exists, not frozen — Validate + Freeze */}
@@ -621,11 +914,15 @@ export default function FinanceHome() {
                     </button>
                     <button
                       onClick={handleFreezeAttendance}
-                      disabled={!!attActionLoading || !attCanFreeze}
+                      disabled={!!attActionLoading || !attCanFreeze || attHasMismatch}
                       className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 transition disabled:opacity-50"
-                      title={!attCanFreeze ? 'Run Validate Summary first to unlock freeze' : ''}
+                      title={
+                        attHasMismatch ? 'Fix attendance day-count mismatches before freezing'
+                        : !attCanFreeze ? 'Run Validate Summary first to unlock freeze'
+                        : ''
+                      }
                     >
-                      {attActionLoading === 'freeze' ? 'Freezing…' : 'Freeze Attendance'}
+                      {attActionLoading === 'freeze' ? 'Freezing…' : 'Freeze Payroll Input'}
                     </button>
                   </>
                 )}
@@ -635,7 +932,7 @@ export default function FinanceHome() {
                   <>
                     <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
                       <span>🔒</span>
-                      <span>Attendance frozen — payroll generation unlocked. Finance notified.</span>
+                      <span>Payroll input frozen — payroll generation unlocked. Finance notified.</span>
                     </span>
                     {/* ── DEV ONLY ──────────────────────────────────────────────────────────
                         TEMPORARY FOR PAYROLL TESTING.
@@ -647,7 +944,7 @@ export default function FinanceHome() {
                       className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100 transition disabled:opacity-50"
                       title="DEV ONLY — resets freeze for re-testing. Not available in production."
                     >
-                      {attActionLoading === 'reset' ? 'Resetting…' : '🔧 Reset Attendance Freeze'}
+                      {attActionLoading === 'reset' ? 'Resetting…' : '🔧 Reset Payroll Input Freeze'}
                     </button>
                     <span className="text-xs text-rose-400 font-medium">[DEV ONLY]</span>
                   </>
@@ -744,7 +1041,7 @@ export default function FinanceHome() {
                 <div className="bg-emerald-50 rounded-lg p-3 md:col-span-3 flex items-center gap-2">
                   <span className="text-emerald-600 text-base">🔒</span>
                   <p className="text-xs font-medium text-emerald-800">
-                    Attendance finalized for {attMonthLabel}. Payroll is ready for processing.
+                    Payroll input frozen for {attMonthLabel}. Payroll is ready for processing.
                   </p>
                 </div>
               )}
@@ -754,7 +1051,27 @@ export default function FinanceHome() {
       )}
 
       {/* Workflow Progress */}
-      {run && <WorkflowProgress status={runStatus} />}
+      {run
+        ? <WorkflowProgress status={runStatus} />
+        : (attMonth && attYear) && (
+          <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-soft">
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+              Payroll Workflow Progress
+            </p>
+            <div className="flex items-center gap-2 text-sm text-slate-400">
+              <span>📋</span>
+              No payroll run found for {attMonthLabel}. Finance can create one from{' '}
+              <button
+                onClick={() => navigate(`${FINANCE_BASE}/payroll-runs`)}
+                className="text-brand-500 underline hover:text-brand-700"
+              >
+                Manage Payroll Runs
+              </button>
+              .
+            </div>
+          </div>
+        )
+      }
 
       {/* KPI Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -863,10 +1180,11 @@ export default function FinanceHome() {
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
           {/* Admin actions (shared items scoped to admin so finance order is unaffected) */}
           {(role || '').toLowerCase() === 'admin' && [
-            { label: 'Manage Payroll Runs', path: 'payroll-runs',       icon: '▶',  color: 'bg-brand-500 text-white hover:bg-brand-600' },
-            { label: 'Reimbursements',      path: 'reimbursements',     icon: '💸', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
-            { label: 'Salary Structures',   path: 'salary-structures',  icon: '💼', color: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
-            { label: 'Salary Revisions',    path: 'salary-revisions',   icon: '📝', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
+            { label: 'Salary Revision',     path: 'salary-revision',    icon: '✏️', color: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
+            { label: 'Bonus Request',        path: 'bonus-requests',      icon: '🎁', color: 'bg-violet-50 text-violet-700 hover:bg-violet-100' },
+            { label: 'Off-Cycle Payments',   path: 'off-cycle-payments',  icon: '💳', color: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
+            { label: 'Salary Master',        path: 'salary-structures',   icon: '💼', color: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
+            { label: 'Reimbursements',       path: 'reimbursements',      icon: '💸', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
             { label: 'Final Settlement',    path: 'ff',                 icon: '📋', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
             { label: 'Payslips & ESS',      path: 'payslips',           icon: '📄', color: 'bg-teal-50 text-teal-700 hover:bg-teal-100' },
           ].map((a) => (
@@ -876,14 +1194,28 @@ export default function FinanceHome() {
             </button>
           ))}
 
+          {/* Admin: Demo Reset button */}
+          {(role || '').toLowerCase() === 'admin' && (
+            <button
+              onClick={handleDemoReset}
+              disabled={demoResetBusy}
+              className="flex items-center gap-2.5 rounded-lg px-4 py-3 text-sm font-medium transition bg-rose-50 text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+              title="Delete all payroll runs for May/June/July 2026 — demo cleanup"
+            >
+              <span>🔄</span>
+              <span>{demoResetBusy ? 'Resetting…' : 'Demo Reset'}</span>
+            </button>
+          )}
+
           {/* Finance-specific actions — ordered to match sidebar */}
           {(role || '').toLowerCase() !== 'admin' && [
-            { label: 'Salary Structures',  path: 'salary-structures', icon: '💼', color: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
-            { label: 'Manage Payroll Runs',path: 'payroll-runs',      icon: '▶',  color: 'bg-brand-500 text-white hover:bg-brand-600' },
-            { label: 'Error Review',       path: 'errors',            icon: '⚠️',  color: 'bg-rose-50 text-rose-700 hover:bg-rose-100' },
+            { label: 'Salary Master',      path: 'salary-structures', icon: '💼', color: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
+            { label: 'Salary Revision',    path: 'salary-revision',   icon: '✏️', color: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
+            { label: 'Bonus Request',        path: 'bonus-requests',      icon: '🎁', color: 'bg-violet-50 text-violet-700 hover:bg-violet-100' },
+            { label: 'Off-Cycle Payments',  path: 'off-cycle-payments',  icon: '💳', color: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
+            { label: 'Manage Payroll Runs', path: 'payroll-runs',        icon: '▶',  color: 'bg-brand-500 text-white hover:bg-brand-600' },
             { label: 'Finance Review',     path: 'review',            icon: '🔎', color: 'bg-purple-50 text-purple-700 hover:bg-purple-100' },
             { label: 'Payslips & Bank',    path: 'payslips',          icon: '🏦', color: 'bg-teal-50 text-teal-700 hover:bg-teal-100' },
-            { label: 'Salary Revisions',   path: 'salary-revisions',  icon: '📝', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
             { label: 'Payroll Summary',    path: 'summary',           icon: '📊', color: 'bg-blue-50 text-blue-700 hover:bg-blue-100' },
             { label: 'Analytics',          path: 'analytics',         icon: '📈', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
             { label: 'Reimbursements',     path: 'reimbursements',    icon: '💸', color: 'bg-slate-100 text-slate-700 hover:bg-slate-200' },
@@ -897,20 +1229,24 @@ export default function FinanceHome() {
         </div>
       </div>
 
+      {/* Demo reset result message */}
+      {demoResetMsg && (
+        <div className={`rounded-xl border p-4 text-sm ${demoResetMsg.startsWith('Reset failed') ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>
+          {demoResetMsg}
+        </div>
+      )}
+
       {/* Admin: HR-specific stats */}
       {(role || '').toLowerCase() === 'admin' && (
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-soft">
           <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">HR Setup Status</p>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
             <div className="bg-slate-50 rounded-lg p-3">
-              <p className="text-xs text-slate-500">Salary Structures</p>
+              <p className="text-xs text-slate-500">Salary Master</p>
               <p className="font-mono font-bold text-slate-800 mt-0.5">{stats?.salary_structure_count ?? '—'}</p>
-              {stats?.salary_structure_missing > 0 && (
-                <p className="text-xs text-rose-600 mt-1">⚠ {stats.salary_structure_missing} missing</p>
-              )}
             </div>
             <div className="bg-slate-50 rounded-lg p-3">
-              <p className="text-xs text-slate-500">Attendance Status</p>
+              <p className="text-xs text-slate-500">Payroll Input Status</p>
               <p className={`font-bold mt-0.5 ${run?.attendance_frozen ? 'text-emerald-600' : 'text-amber-600'}`}>
                 {run?.attendance_frozen ? '✓ Frozen' : 'Not Frozen'}
               </p>
@@ -928,12 +1264,6 @@ export default function FinanceHome() {
               </p>
             </div>
           </div>
-          {stats?.salary_structure_missing > 0 && (
-            <button onClick={() => navigate(`${FINANCE_BASE}/salary-structures`)}
-              className="mt-3 text-xs text-brand-600 font-medium hover:underline">
-              Set up missing salary structures →
-            </button>
-          )}
         </div>
       )}
 
@@ -950,10 +1280,10 @@ export default function FinanceHome() {
               )}
             </div>
             <button
-              onClick={() => navigate(`${FINANCE_BASE}/salary-revisions`)}
+              onClick={() => navigate(`${FINANCE_BASE}/salary-revision`)}
               className="text-xs text-brand-600 font-medium hover:underline"
             >
-              View revision history →
+              Manage salary revisions →
             </button>
           </div>
           <div className="divide-y divide-slate-50">
@@ -991,14 +1321,16 @@ export default function FinanceHome() {
                         onClick={() => handleApprove(req.id)}
                         disabled={reviewingId === req.id}
                         className="rounded bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 text-xs font-medium hover:bg-emerald-100 transition disabled:opacity-50"
+                        title="Recommend approval to Finance Head"
                       >
-                        {reviewingId === req.id ? '…' : 'Approve'}
+                        {reviewingId === req.id ? '…' : 'Recommend Approval'}
                       </button>
                       <button
                         onClick={() => { setRejectingId(req.id); setRejectComment(''); }}
                         className="rounded bg-rose-50 text-rose-700 border border-rose-200 px-2.5 py-1 text-xs font-medium hover:bg-rose-100 transition"
+                        title="Recommend rejection to Finance Head"
                       >
-                        Reject
+                        Recommend Rejection
                       </button>
                     </>
                   )}

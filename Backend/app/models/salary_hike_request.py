@@ -1,11 +1,18 @@
 """Salary Hike Request — pending approval workflow before applying a salary hike.
 
-Admin creates a hike request → Finance reviews (approve/reject) → on approval
-the salary revision is applied via payroll_service.create_salary_revision.
+Admin/HR creates a hike request → Finance reviews (recommend approval/rejection) →
+Finance Head gives final approval or rejection. Only Finance Head approval
+applies the salary revision via payroll_service.create_salary_revision.
 
 Status flow:
-    pending_finance_review → approved  (salary applied)
-                           → rejected  (salary unchanged)
+    pending_finance_review → pending_finance_head_approval  (salary unchanged;
+                             finance_recommendation = 'recommend_approval' or
+                             'recommend_rejection')
+    pending_finance_head_approval → approved                (salary applied)
+                                  → rejected                (salary unchanged)
+
+Finance cannot directly reject or approve. Both Finance actions forward to
+Finance Head with a recommendation stored in finance_recommendation.
 """
 from __future__ import annotations
 
@@ -37,7 +44,7 @@ class SalaryHikeRequest(Base):
 
     status: Mapped[str] = mapped_column(
         String(30), default="pending_finance_review", nullable=False, index=True
-    )  # pending_finance_review | approved | rejected
+    )  # pending_finance_review | pending_finance_head_approval | approved | rejected
 
     requested_by_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True,
@@ -48,8 +55,8 @@ class SalaryHikeRequest(Base):
     review_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Production-grade approval fields (v15) ────────────────────────────
-    # approved_by_id is set when Finance formally approves (status → approved).
-    # reviewed_by_id may be set earlier when Finance reviews without approving.
+    # reviewed_by_id is set when Finance reviews/forwards the request.
+    # approved_by_id is set only when Finance Head gives final approval.
     approved_by_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True,
     )
@@ -58,6 +65,11 @@ class SalaryHikeRequest(Base):
     # rejection_reason is mandatory when status = 'rejected'.
     # Stored separately from review_comment to make it findable in compliance audits.
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # finance_recommendation: set by Finance when forwarding to Finance Head.
+    # Values: 'recommend_approval' | 'recommend_rejection'
+    # Finance Head uses this as context when making the final decision.
+    finance_recommendation: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
     # Flag: the effective date was checked against closed payroll months at create time.
     effective_date_validated: Mapped[bool] = mapped_column(

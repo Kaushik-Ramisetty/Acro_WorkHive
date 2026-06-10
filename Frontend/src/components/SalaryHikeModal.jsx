@@ -11,10 +11,10 @@ function fmtL(n) {
   return `₹${(n / 100000).toFixed(2)}L`;
 }
 
-export default function SalaryHikeModal({ onClose, onSubmitted }) {
+export default function SalaryHikeModal({ onClose, onSubmitted, initialEmployeeId = '' }) {
   const [employees, setEmployees] = useState([]);
   const [empSearch, setEmpSearch] = useState('');
-  const [selectedEmpId, setSelectedEmpId] = useState('');
+  const [selectedEmpId, setSelectedEmpId] = useState(initialEmployeeId ? String(initialEmployeeId) : '');
   const [currentCtc, setCurrentCtc] = useState(null);
   const [currentBasic, setCurrentBasic] = useState(null);
   const [hikeType, setHikeType] = useState('percentage');
@@ -58,6 +58,12 @@ export default function SalaryHikeModal({ onClose, onSubmitted }) {
       setLoadingCtc(false);
     }
   };
+
+  useEffect(() => {
+    if (initialEmployeeId) {
+      handleEmpChange(String(initialEmployeeId));
+    }
+  }, [initialEmployeeId]);
 
   const hikeVal = parseFloat(hikeValue);
   const newCtc = useMemo(() => {

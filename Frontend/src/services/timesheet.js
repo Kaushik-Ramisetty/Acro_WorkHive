@@ -18,7 +18,7 @@ export const timesheet = {
     return api.get('/timesheet' + (qs.toString() ? `?${qs}` : ''));
   },
   get:      (id)                    => api.get(`/timesheet/${id}`),
-  create:   (payload)               => api.post('/timesheet', payload),
+  create:   (payload, opts)          => api.post('/timesheet', payload, opts),
   edit:     (id, payload)           => api.patch(`/timesheet/${id}`, payload),
   submit:   (id)                    => api.post(`/timesheet/${id}/submit`, {}),
   review:   (id, payload)           => api.post(`/timesheet/${id}/review`, payload),
@@ -30,6 +30,12 @@ export const timesheet = {
     get: () => api.get('/timesheet/monthly-report'),
     submit: (payload) => api.post('/timesheet/monthly-report', payload),
     detail: (id) => api.get(`/timesheet/${id}/monthly-detail`),
+  },
+
+  // Client manager approval page — public, no auth token needed
+  clientReview: {
+    info:   (token)   => api.get(`/timesheet/client-review?token=${encodeURIComponent(token)}`),
+    submit: (payload) => api.post('/timesheet/client-review', payload),
   },
 
   // HR Admin — client_site employees only

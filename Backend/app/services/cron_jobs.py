@@ -28,7 +28,7 @@ Isolation requirements:
 from __future__ import annotations
 
 import logging
-from datetime import date as date_t, datetime, timedelta
+from datetime import date as date_t, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,7 @@ from app.models import (
 from app.services.attendance_digest import generate_attendance_digest
 from app.services.attendance_engine import detect_exceptions_for_record, process_day
 from app.services.notification_service import notify, notify_many
+from utils.time_utils import now_utc
 
 logger = logging.getLogger("hrms.cron")
 
@@ -61,7 +62,7 @@ def _already_ran_today(db: Session, job_name: str) -> bool:
 
 
 def _log_job(db: Session, job_name: str, status: str, notes: str | None = None) -> None:
-    db.add(JobsLog(job_name=job_name, ran_at=datetime.now(), status=status, notes=notes))
+    db.add(JobsLog(job_name=job_name, ran_at=now_utc(), status=status, notes=notes))
     db.commit()
 
 
@@ -314,7 +315,7 @@ def run_timesheet_reminders() -> None:
             return
 
         reminded = 0
-        cutoff = datetime.now() - timedelta(days=2)
+        cutoff = now_utc() - timedelta(days=2)
 
         try:
             # Restrict to active client_site employees — no orphaned timesheets.

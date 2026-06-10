@@ -2,6 +2,30 @@ import { useCallback, useEffect, useState } from 'react';
 import { getWeekDates, getWeekId, getWeekStart } from '../utils/weekHelpers';
 import { WF } from '../components/Timesheets/workflow/statuses';
 
+// ── DB → hook entry converter ─────────────────────────────────────────────────
+
+const _DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * Convert a TimesheetEntryOut (from backend) to the shape the hook / table expects.
+ * Description is stored as "client - project - task" by the frontend.
+ * logged_hours is kept so HoursCell can use it as a fallback when no AttendanceRecord exists.
+ */
+function dbEntryToHookEntry(e) {
+  const parts   = (e.description || '').split(' - ');
+  const d       = new Date(e.entry_date + 'T00:00:00');
+  return {
+    id:           e.id,
+    day:          _DOW[d.getDay()],
+    date:         e.entry_date,
+    client:       e.client_name  || parts[0] || '',
+    project:      e.project_name || parts[1] || '',
+    task:         e.task_name    || parts[2] || '',
+    status:       'draft',
+    logged_hours: e.logged_hours || 0,
+  };
+}
+
 // ── Week-entry generator ──────────────────────────────────────────────────────
 
 /** Build one draft stub per Mon–Sun for the given week start (Date). */
@@ -139,6 +163,32 @@ export function useTimesheets() {
     saveWeek(weekId, state);
   }, [weekId, state]);
 
+  /** Wipe local localStorage draft and reset to blank stubs for the active week. */
+  const resetLocalDraft = useCallback(() => {
+    try { localStorage.removeItem(storageKey(weekId)); } catch { /* ignore */ }
+    setState({
+      entries: generateWeekEntries(activeWeekStart),
+      weekStatus: WF.DRAFT,
+      workflowHistory: [],
+    });
+  }, [weekId, activeWeekStart]);
+
+  /**
+   * Populate the week grid from backend TimesheetEntryOut rows.
+   * Days that have no DB entry keep blank stubs so the user can still fill them in.
+   * Persists to localStorage so navigating away and back preserves the data.
+   */
+  const hydrateFromDB = useCallback((dbEntries) => {
+    const byDate = new Map(dbEntries.map((e) => [e.entry_date, e]));
+    const merged = generateWeekEntries(activeWeekStart).map((stub) => {
+      const dbEntry = byDate.get(stub.date);
+      return dbEntry ? dbEntryToHookEntry(dbEntry) : stub;
+    });
+    const next = { entries: merged, weekStatus: WF.DRAFT, workflowHistory: [] };
+    saveWeek(weekId, next);
+    setState(next);
+  }, [weekId, activeWeekStart]);
+
   const navigateWeek = useCallback((delta) => {
     setActiveWeekStart((prev) => {
       const d = new Date(prev);
@@ -164,5 +214,7 @@ export function useTimesheets() {
     navigateWeek,
     goThisWeek,
     saveDraft,
+    resetLocalDraft,
+    hydrateFromDB,
   };
 }

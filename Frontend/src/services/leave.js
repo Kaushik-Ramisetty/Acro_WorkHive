@@ -18,6 +18,7 @@ export const leaveApi = {
   one:          (id)                        => api.get('/leave/' + id),
   apply:        (payload)                   => api.post('/leave/apply', payload),
   validate:     (payload)                   => api.post('/leave/validate', payload),
+  applyLop:     (payload)                   => api.post('/leave/apply-lop', payload),
 
   // Drafts — saved but not yet submitted. Validation runs only on submit.
   draftCreate:  (payload)                   => api.post('/leave/draft', payload),

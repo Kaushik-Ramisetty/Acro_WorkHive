@@ -174,7 +174,7 @@ export default function PayrollSummary() {
                 This is correct if all employees' annual gross salary is below ₹2,50,000 (Old Regime) or ₹3,00,000 (New Regime).
                 Current employees have annual gross between ₹{Math.round(Math.min(...employees.map(e => e.gross_earnings * 12))).toLocaleString('en-IN')} –
                 ₹{Math.round(Math.max(...employees.map(e => e.gross_earnings * 12))).toLocaleString('en-IN')}.
-                To enable TDS, go to <strong>Salary Structures → Tax Declarations</strong> and submit employee tax declarations.
+                To enable TDS, go to <strong>Salary Master → Tax Declarations</strong> and submit employee tax declarations.
               </p>
             </div>
           )}

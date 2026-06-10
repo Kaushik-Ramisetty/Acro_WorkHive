@@ -35,7 +35,7 @@ class EmployeeListItem(BaseModel):
 class EmployeeCreate(BaseModel):
     name: str = Field(min_length=1, description="Full name; split on first space into first/last")
     email: EmailStr
-    role: str = Field(pattern=r"^(admin|manager|employee)$")
+    role: str = Field(pattern=r"^(admin|manager|employee|finance|finance_head)$")
     department_id: Optional[str] = None
     designation_id: Optional[str] = None
     password: str = Field(min_length=4)
@@ -46,7 +46,7 @@ class EmployeeCreate(BaseModel):
 class EmployeeUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    role: Optional[str] = Field(default=None, pattern=r"^(admin|manager|employee)$")
+    role: Optional[str] = Field(default=None, pattern=r"^(admin|manager|employee|finance|finance_head)$")
     department_id: Optional[str] = None
     designation_id: Optional[str] = None
     phone: Optional[str] = None

@@ -78,6 +78,7 @@ class LeaveRequest(Base):
     # leave ends without partial cancellation). Drives partial-cancel math:
     # `cancellable = total_days - consumed_days`.
     consumed_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_lop: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Working-day refactor — half-day boundaries.
     # 'first'  → only the first half of start_date counts (afternoon off)

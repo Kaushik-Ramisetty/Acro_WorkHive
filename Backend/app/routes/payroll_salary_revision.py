@@ -39,6 +39,11 @@ router = APIRouter(
 
 _FinanceUser = Depends(role_required("finance", "admin"))
 
+SALARY_REVISION_WORKFLOW_REQUIRED = (
+    "Salary revisions must follow the HR request -> Finance review -> "
+    "Finance Head approval workflow. Direct salary revision writes are not allowed."
+)
+
 
 # ─── POST /payroll/salary-revisions ──────────────────────────────────────────
 
@@ -69,77 +74,9 @@ def create_salary_revision(
     modified.  Historical payroll for periods before the hike date continues to
     use the original salary via the effective_from date-range lookup.
     """
-    try:
-        new_struct = payroll_service.create_salary_revision(
-            db=db,
-            employee_id=body.employee_id,
-            new_ctc_annual=body.new_ctc_annual,
-            effective_from=body.effective_from,
-            assigned_by=actor,
-            revision_reason=body.revision_reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    # Fetch the most-recent SalaryRevisionLog for this employee to build response
-    revisions = payroll_service.list_salary_revisions(
-        db, employee_id=body.employee_id, limit=1
-    )
-    if revisions:
-        rev = revisions[0]
-        emp = new_struct.employee
-        revised_by = rev.revised_by
-        return SalaryRevisionOut(
-            id=rev.id,
-            employee_id=rev.employee_id,
-            employee_name=(
-                f"{emp.first_name} {emp.last_name or ''}".strip() if emp else None
-            ),
-            employee_code=(
-                (emp.employee_code or f"EMP{emp.id:04d}") if emp else None
-            ),
-            old_annual_ctc=rev.old_annual_ctc,
-            new_annual_ctc=rev.new_annual_ctc,
-            ctc_difference=rev.ctc_difference,
-            ctc_change_pct=rev.ctc_change_pct,
-            old_gross_monthly=rev.old_gross_monthly,
-            new_gross_monthly=rev.new_gross_monthly,
-            old_net_monthly=rev.old_net_monthly,
-            new_net_monthly=rev.new_net_monthly,
-            effective_from=rev.effective_from,
-            revision_reason=rev.revision_reason,
-            revised_by_id=rev.revised_by_id,
-            revised_by_name=(
-                f"{revised_by.first_name} {revised_by.last_name or ''}".strip()
-                if revised_by else None
-            ),
-            created_at=rev.created_at,
-        )
-
-    # Same-day correction path: no new revision log row, return structure info
-    emp = new_struct.employee
-    return SalaryRevisionOut(
-        id=new_struct.id,
-        employee_id=body.employee_id,
-        employee_name=(
-            f"{emp.first_name} {emp.last_name or ''}".strip() if emp else None
-        ),
-        employee_code=(
-            (emp.employee_code or f"EMP{emp.id:04d}") if emp else None
-        ),
-        old_annual_ctc=0.0,
-        new_annual_ctc=new_struct.annual_ctc,
-        ctc_difference=new_struct.annual_ctc,
-        ctc_change_pct=0.0,
-        old_gross_monthly=0.0,
-        new_gross_monthly=new_struct.gross_monthly,
-        old_net_monthly=0.0,
-        new_net_monthly=new_struct.net_monthly,
-        effective_from=new_struct.effective_from,
-        revision_reason=body.revision_reason,
-        revised_by_id=actor.id,
-        revised_by_name=f"{actor.first_name} {actor.last_name or ''}".strip(),
-        created_at=new_struct.created_at,
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=SALARY_REVISION_WORKFLOW_REQUIRED,
     )
 
 

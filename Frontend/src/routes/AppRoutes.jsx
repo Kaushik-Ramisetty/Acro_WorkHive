@@ -147,7 +147,7 @@ export default function AppRoutes() {
         {/* Force password change — shown after first login with a temp password */}
         <Route path="/change-password" element={<ChangePasswordPage />} />
 
-        <Route path="*" element={<NotFoundPages />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </AuthProvider>
   );

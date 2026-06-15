@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# Local DB
+*.db
+*.db-journal
+
+# Uploads (runtime data, not source)
+uploads/documents/
+uploads/offers/
+!uploads/.gitkeep
+
+# Backup files from earlier merges
+*.bak

@@ -1,0 +1,52 @@
+# Repository-root .gitignore.
+# Backend/.gitignore is the source of truth for backend artifacts; this file
+# duplicates the most security-sensitive entries so that any tool operating
+# from the repo root (or accidentally adding the parent folder to git) cannot
+# leak secrets / build artifacts.
+
+# Environment / secrets — never commit
+.env
+.env.*
+!.env.example
+!.env.development
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Local databases / SQLite journals
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Test / coverage
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Backup files
+*.bak
+
+# Runtime uploads (kept out of source tree)
+Backend/uploads/documents/
+Backend/uploads/offers/

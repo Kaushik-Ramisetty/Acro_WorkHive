@@ -1,0 +1,256 @@
+/* HR Admin dashboard — ported from the workhive-hrms ZIP and adapted to this project. */
+
+.hr-dash-root {
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+
+  --bg-main: #f8fafc;
+  --bg-card: #ffffff;
+
+  --border: #e2e8f0;
+
+  --blue-primary: #1e3a8a;
+  --blue-bright:  #1e3acb;
+  --blue-pale:    #eef2ff;
+
+  --accent-red: #ef4444;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  color: var(--text-primary);
+}
+
+.hr-dash-root .fade-in { animation: hr-dash-fade-in 0.25s ease-out; }
+@keyframes hr-dash-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.hr-dash-root .card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.hr-dash-root .badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.hr-dash-root .badge-green  { background: #d1fae5; color: #047857; }
+.hr-dash-root .badge-blue   { background: #dbeafe; color: #1d4ed8; }
+.hr-dash-root .badge-orange { background: #ffedd5; color: #c2410c; }
+
+.hr-dash-root .dashboard { display: flex; flex-direction: column; gap: 24px; }
+
+.hr-dash-root .dash-banner {
+  background: linear-gradient(135deg, #1e3a8a 0%, #2d4fc0 60%, #3b5bdb 100%);
+  border-radius: var(--radius-lg);
+  padding: 32px 36px;
+  color: #fff;
+  position: relative;
+  overflow: hidden;
+}
+.hr-dash-root .dash-banner::after {
+  content: '';
+  position: absolute;
+  right: -40px; top: -40px;
+  width: 220px; height: 220px;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.08) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hr-dash-root .dash-banner-title { font-size: 26px; font-weight: 700; letter-spacing: -0.4px; margin: 0 0 8px; }
+.hr-dash-root .dash-banner-sub   { font-size: 14px; color: rgba(255, 255, 255, 0.78); line-height: 1.6; max-width: 560px; margin: 0; }
+
+.hr-dash-root .dash-kpi-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+.hr-dash-root .dash-kpi-card { padding: 22px 22px 18px; }
+.hr-dash-root .dash-kpi-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.hr-dash-root .dash-kpi-icon { width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; }
+.hr-dash-root .dash-kpi-icon-blue   { background: #eef2ff; color: #3b5bdb; }
+.hr-dash-root .dash-kpi-icon-teal   { background: #ecfdf5; color: #059669; }
+.hr-dash-root .dash-kpi-icon-orange { background: #fff7ed; color: #d97706; }
+.hr-dash-root .dash-kpi-value { font-size: 30px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.8px; margin-bottom: 4px; }
+.hr-dash-root .dash-kpi-label { font-size: 13px; color: var(--text-secondary); }
+
+.hr-dash-root .dash-mid-row { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; align-items: start; }
+.hr-dash-root .dash-mid-card { padding: 20px; }
+.hr-dash-root .dash-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.hr-dash-root .dash-card-header h3 { font-size: 15px; font-weight: 600; color: var(--text-primary); margin: 0; }
+
+.hr-dash-root .btn-link { background: none; border: none; color: var(--blue-bright); font-size: 13px; font-weight: 500; cursor: pointer; padding: 0; }
+.hr-dash-root .btn-link:hover { text-decoration: underline; }
+
+.hr-dash-root .dash-notif-badge {
+  background: var(--accent-red); color: #fff;
+  width: 22px; height: 22px; border-radius: 50%;
+  font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.hr-dash-root .dash-job-list { display: flex; flex-direction: column; gap: 10px; }
+.hr-dash-root .dash-job-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-radius: var(--radius-sm);
+  background: var(--bg-main); border: 1px solid var(--border);
+  cursor: pointer; width: 100%; text-align: left;
+  transition: all 0.15s;
+}
+.hr-dash-root .dash-job-item:hover { border-color: var(--blue-bright); background: var(--blue-pale); }
+.hr-dash-root .dash-job-icon { width: 36px; height: 36px; border-radius: 8px; background: var(--blue-pale); color: var(--blue-bright); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.hr-dash-root .dash-job-info { flex: 1; min-width: 0; }
+.hr-dash-root .dash-job-title { display: block; font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+.hr-dash-root .dash-job-meta  { display: block; font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+.hr-dash-root .dash-claims-list { display: flex; flex-direction: column; gap: 12px; }
+.hr-dash-root .dash-claim-item { display: flex; align-items: center; gap: 10px; }
+.hr-dash-root .dash-claim-avatar {
+  width: 36px; height: 36px; border-radius: 50%;
+  color: #fff; font-size: 12px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.hr-dash-root .dash-claim-info { flex: 1; min-width: 0; }
+.hr-dash-root .dash-claim-name { display: block; font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+.hr-dash-root .dash-claim-type { display: block; font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.hr-dash-root .dash-review-btn {
+  padding: 5px 12px; border-radius: 6px;
+  border: 1.5px solid var(--border); background: #fff;
+  font-size: 12px; font-weight: 500; color: var(--text-secondary);
+  cursor: pointer; transition: all 0.15s;
+}
+.hr-dash-root .dash-review-btn:hover { border-color: var(--blue-bright); color: var(--blue-bright); }
+
+.hr-dash-root .dash-funnel { display: flex; flex-direction: column; gap: 10px; }
+.hr-dash-root .dash-funnel-bar { padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+.hr-dash-root .dash-funnel-note { font-size: 12px; color: var(--text-muted); margin-top: 12px; font-style: italic; }
+
+.hr-dash-root .dash-section-title { font-size: 16px; font-weight: 700; color: var(--text-primary); margin-bottom: 16px; }
+.hr-dash-root .dash-narrative-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+.hr-dash-root .dash-narrative-card {
+  background: var(--bg-card); border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  padding: 20px 20px 20px 24px;
+  position: relative;
+}
+.hr-dash-root .dash-narrative-dot { position: absolute; left: 18px; top: 22px; width: 8px; height: 8px; border-radius: 50%; }
+.hr-dash-root .dash-narrative-title { font-size: 14px; font-weight: 600; color: var(--text-primary); margin: 0 0 8px; padding-left: 16px; }
+.hr-dash-root .dash-narrative-desc  { font-size: 13px; color: var(--text-secondary); line-height: 1.6; margin: 0 0 12px; padding-left: 16px; }
+.hr-dash-root .dash-narrative-time  { font-size: 12px; color: var(--blue-bright); font-weight: 500; padding-left: 16px; }
+
+/* Inline (in-row) narrative list — stacks the items vertically inside the
+   System Narrative card that sits next to Upcoming Holidays. */
+.hr-dash-root .dash-narrative-list { display: flex; flex-direction: column; }
+.hr-dash-root .dash-narrative-item {
+  position: relative;
+  padding: 14px 4px 14px 20px;
+  border-top: 1px solid var(--border);
+}
+.hr-dash-root .dash-narrative-item:first-child { border-top: none; padding-top: 4px; }
+.hr-dash-root .dash-narrative-item:last-child { padding-bottom: 4px; }
+.hr-dash-root .dash-narrative-item .dash-narrative-dot { left: 4px; top: 20px; }
+.hr-dash-root .dash-narrative-item:first-child .dash-narrative-dot { top: 10px; }
+.hr-dash-root .dash-narrative-item .dash-narrative-title,
+.hr-dash-root .dash-narrative-item .dash-narrative-desc,
+.hr-dash-root .dash-narrative-item .dash-narrative-time { padding-left: 14px; }
+.hr-dash-root .dash-narrative-item .dash-narrative-desc { margin-bottom: 6px; }
+
+@media (max-width: 1024px) {
+  .hr-dash-root .dash-kpi-row,
+  .hr-dash-root .dash-mid-row,
+  .hr-dash-root .dash-narrative-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .hr-dash-root .dash-kpi-row,
+  .hr-dash-root .dash-mid-row,
+  .hr-dash-root .dash-narrative-grid { grid-template-columns: 1fr; }
+  .hr-dash-root .dash-banner { padding: 22px 22px; }
+  .hr-dash-root .dash-banner-title { font-size: 22px; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  Dark theme — admin dashboard
+ *  Overrides the CSS-variable palette that `.hr-dash-root` exposes so every
+ *  rule above (cards, KPIs, narrative items, jobs, claims, etc.) re-skins
+ *  automatically. Hardcoded surfaces/badges are remapped explicitly below.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+html.dark .hr-dash-root {
+  --text-primary:   #e6ecf5;
+  --text-secondary: #c5cee0;
+  --text-muted:     #94a3b8;
+
+  --bg-main:        #0f192f;   /* slightly darker than card → keeps hierarchy */
+  --bg-card:        #131c33;
+
+  --border:         #243049;
+
+  /* Brand accents: bump brightness so the indigo links/icons read against
+     the new dark surfaces while keeping the same hue family. */
+  --blue-primary:   #3b5bdb;
+  --blue-bright:    #8aa1ff;
+  --blue-pale:      rgba(99, 102, 241, 0.16);
+}
+
+/* Card shadow: light theme's hairline shadow disappears on dark — swap to
+   a deeper, low-opacity drop so cards still pop. */
+html.dark .hr-dash-root .card {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* Banner gradient: keep the indigo identity but darken the stops so it
+   looks integrated with the dark page surface rather than glowing. */
+html.dark .hr-dash-root .dash-banner {
+  background: linear-gradient(135deg, #1a2655 0%, #243a8f 60%, #2d4fc0 100%);
+}
+
+/* KPI icon tints — translucent so they pick up the dark background. */
+html.dark .hr-dash-root .dash-kpi-icon-blue   { background: rgba(99, 102, 241, 0.18); color: #a5b4fc; }
+html.dark .hr-dash-root .dash-kpi-icon-teal   { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
+html.dark .hr-dash-root .dash-kpi-icon-orange { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+
+/* Badge palette — soften the bright pastels so they remain readable. */
+html.dark .hr-dash-root .badge-green  { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
+html.dark .hr-dash-root .badge-blue   { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
+html.dark .hr-dash-root .badge-orange { background: rgba(249, 115, 22, 0.18); color: #fdba74; }
+
+/* Job item: light hover tint becomes a translucent indigo wash. */
+html.dark .hr-dash-root .dash-job-item {
+  background: var(--bg-main);
+  border-color: var(--border);
+}
+html.dark .hr-dash-root .dash-job-item:hover {
+  border-color: var(--blue-bright);
+  background: rgba(99, 102, 241, 0.14);
+}
+html.dark .hr-dash-root .dash-job-icon {
+  background: rgba(99, 102, 241, 0.18);
+  color: #a5b4fc;
+}
+
+/* Review button — was `background: #fff` literal. */
+html.dark .hr-dash-root .dash-review-btn {
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+html.dark .hr-dash-root .dash-review-btn:hover {
+  border-color: var(--blue-bright);
+  color: var(--blue-bright);
+}
+
+/* Funnel bars are colored via inline styles in JSX (light pastels). Darken
+   the lightest stops so text on them stays legible without changing JSX. */
+html.dark .hr-dash-root .dash-funnel-bar { filter: brightness(0.78) saturate(1.1); }
+
+/* Narrative time accent — the indigo link color was tuned for light bg;
+   the dark override of --blue-bright handles it automatically. */
+
+/* Notification badge ring + scrollbar are already inherited via vars. */

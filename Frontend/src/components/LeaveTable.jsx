@@ -41,7 +41,7 @@ function fmtDate(iso) {
   return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
-export default function LeaveTable({ rows = [], loading = false, onRowClick, onApprove, onReject }) {
+export default function LeaveTable({ rows = [], loading = false, onRowClick, onApprove, onReject, selfId }) {
   const [page, setPage] = useState(1);
 
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
@@ -92,7 +92,7 @@ export default function LeaveTable({ rows = [], loading = false, onRowClick, onA
                 <td className="px-4 py-3 text-slate-700">{r.days}</td>
                 <td className="px-4 py-3"><StatusPill status={r.status} /></td>
                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                  {r.status === 'pending' ? (
+                  {r.status === 'pending' && (!selfId || r.employee_id !== selfId) ? (
                     <div className="flex items-center gap-1">
                       <button
                         onClick={() => onApprove?.(r)}

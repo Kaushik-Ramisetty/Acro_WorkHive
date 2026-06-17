@@ -25,6 +25,7 @@ function toTableRow(r) {
     days: r.total_days,
     status: r.status,
     reason: r.reason,
+    employee_id: r.employee_id,
   };
 }
 
@@ -115,10 +116,10 @@ export default function LeaveManagementPage() {
     if (!selectedFull) return {};
     const isMine = selectedFull.employee_id === user?.id;
     return {
-      canApprove:       (role === 'admin' || role === 'manager') && selectedFull.status === 'pending',
-      canReject:        (role === 'admin' || role === 'manager') && selectedFull.status === 'pending',
+      canApprove:       !isMine && (role === 'admin' || role === 'manager') && selectedFull.status === 'pending',
+      canReject:        !isMine && (role === 'admin' || role === 'manager') && selectedFull.status === 'pending',
       canCancel:        (isMine || role === 'admin') && (selectedFull.status === 'pending' || selectedFull.status === 'approved'),
-      canApproveCancel: (role === 'admin' || role === 'manager') && selectedFull.status === 'cancel_pending',
+      canApproveCancel: !isMine && (role === 'admin' || role === 'manager') && selectedFull.status === 'cancel_pending',
     };
   }, [selectedFull, user, role]);
 
@@ -231,6 +232,7 @@ export default function LeaveManagementPage() {
         onRowClick={(r) => setSelected(requests.find((x) => x.id === r.id))}
         onApprove={(r) => onApprove(r)}
         onReject={(r) => onReject(r, '')}
+        selfId={user?.id}
       />
 
       <LeaveModal

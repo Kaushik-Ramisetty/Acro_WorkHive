@@ -226,7 +226,15 @@ def _can_approve_at_stage(actor: Employee, req: LeaveRequest, stage: str,
         specific employee is authorized regardless of role.
       - Active DelegateAssignment for the reporting manager — the delegate
         can approve the manager stage.
+
+    Invariant: a leave owner can never approve their own request, regardless
+    of role. This guard is the single backend source of truth — all approval
+    paths (approve_leave, reject_leave, approve_cancellation) pass through here.
     """
+    # Rule 1: Leave owner is never an approver.
+    if actor.id == req.employee_id:
+        return False
+
     role = _role_name(actor)
     if role == "admin":
         # Admin retains override authority across all stages — Phase 5A

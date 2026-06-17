@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useAuth } from '../../../context/AuthContext';
 import { useLeaveData } from '../../../hooks/useLeaveData';
 import { leaveApi } from '../../../services/leave';
 import { regularization } from '../../../services/attendance';
@@ -64,6 +65,7 @@ const TABS = [
 ];
 
 export default function AdminApprovalsPage() {
+  const { user } = useAuth();
   // Server-scoped: with admin's JWT, the backend returns leave requests where
   // next_approver_role === 'hr'. Same hook the manager page uses.
   const { requests, loading: leaveLoading, error: leaveErr,
@@ -106,7 +108,7 @@ export default function AdminApprovalsPage() {
 
   const items = useMemo(() => {
     const leaveItems = requests
-      .filter((r) => r.status === 'pending' || r.status === 'cancel_pending')
+      .filter((r) => (r.status === 'pending' || r.status === 'cancel_pending') && r.employee_id !== user?.id)
       .map((r) => ({
         kind: r.status === 'cancel_pending' ? 'cancel' : 'leave',
         key: 'L-' + r.id,

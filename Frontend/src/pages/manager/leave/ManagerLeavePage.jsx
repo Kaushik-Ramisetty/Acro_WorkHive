@@ -81,10 +81,11 @@ export default function ManagerLeavePage() {
   };
 
   const selectedFull = selected ? requests.find((x) => x.id === selected.id) || selected : null;
+  const isMineSelected = selectedFull ? selectedFull.employee_id === user?.id : false;
   const capabilities = selectedFull ? {
-    canApprove: selectedFull.status === 'pending',
-    canReject: selectedFull.status === 'pending',
-    canApproveCancel: selectedFull.status === 'cancel_pending',
+    canApprove: !isMineSelected && selectedFull.status === 'pending',
+    canReject: !isMineSelected && selectedFull.status === 'pending',
+    canApproveCancel: !isMineSelected && selectedFull.status === 'cancel_pending',
     canCancel: false,
   } : {};
 
